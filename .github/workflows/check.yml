@@ -1,0 +1,18 @@
+name: 开发底座检查
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  development:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: 启动开发容器
+        run: make up
+      - name: 验证类型、构建、数据库注释与连通性
+        run: make check
+      - name: 停止本次环境
+        if: always()
+        run: make stop

@@ -1,0 +1,62 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: interface_testing
+      POSTGRES_USER: interface_testing
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请先运行 make init}
+    volumes:
+      - database:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U interface_testing -d interface_testing"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  api:
+    build: ./apps/api
+    volumes:
+      - ./apps/api/app:/app/app:ro
+    environment:
+      PGHOST: db
+      PGDATABASE: interface_testing
+      PGUSER: interface_testing
+      PGPASSWORD: ${POSTGRES_PASSWORD:?请先运行 make init}
+    ports:
+      - "127.0.0.1:${API_PORT:-18080}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    develop:
+      watch:
+        - action: rebuild
+          path: ./apps/api/requirements.txt
+  web:
+    build: ./apps/web
+    volumes:
+      - ./apps/web/src:/app/src:ro
+      - ./apps/web/index.html:/app/index.html:ro
+      - ./apps/web/vite.config.ts:/app/vite.config.ts:ro
+      - ./apps/web/tsconfig.json:/app/tsconfig.json:ro
+    ports:
+      - "127.0.0.1:${WEB_PORT:-15173}:5173"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5173/api/health',{signal:AbortSignal.timeout(2000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    develop:
+      watch:
+        - action: rebuild
+          path: ./apps/web/package.json
+        - action: rebuild
+          path: ./apps/web/package-lock.json
+volumes:
+  database:
