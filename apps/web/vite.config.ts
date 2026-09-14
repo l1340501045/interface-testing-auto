@@ -7,7 +7,11 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     proxy: {
-      "/api": { target: "http://api:8000", rewrite: (path) => path.replace(/^\/api/, "") },
+      // 业务接口：后端本身挂在 /api/v1 下，代理不能再剥掉 /api，
+      // 否则 /api/v1/me 会变成 /v1/me 而全部 404。
+      "/api/v1": { target: "http://api:8000" },
+      // 开发底座既有契约：前端 /api/health 对应后端 /health，健康检查继续沿用。
+      "/api/health": { target: "http://api:8000", rewrite: (path) => path.replace(/^\/api/, "") },
     },
   },
 });

@@ -1,0 +1,18 @@
+# 后端静态检查配置：显式固定规则集，保证检查结果可复现。
+# src 固定为配置文件所在目录，否则宿主机与容器的导入分组会因目录布局不同而不一致。
+src = ["."]
+line-length = 100
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "PIE"]
+# B008：FastAPI 的依赖注入就是在默认参数里调用 Depends()，这是框架约定而非缺陷。
+ignore = ["B008", "E501"]
+
+[lint.isort]
+# 测试夹具与工具是本地模块，与第三方依赖分开排序，避免它们混进第三方导入块。
+known-first-party = ["app", "harness", "helpers"]
+
+[lint.per-file-ignores]
+# 迁移文件按 revision 顺序排列，导入顺序由 Alembic 约定决定。
+"migrations/**" = ["E402"]
