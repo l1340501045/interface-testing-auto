@@ -16,11 +16,37 @@ services:
     build: ./apps/api
     volumes:
       - ./apps/api/app:/app/app:ro
+      # 迁移脚本同样只读挂载：新写的迁移要能在容器里直接跑，否则只能靠重建镜像
+      # 才生效，而迁移属于源码而不是依赖清单。
+      - ./apps/api/migrations:/app/migrations:ro
+      - ./apps/api/alembic.ini:/app/alembic.ini:ro
     environment:
+      RUN_MIGRATIONS: "1"
       PGHOST: db
       PGDATABASE: interface_testing
-      PGUSER: interface_testing
-      PGPASSWORD: ${POSTGRES_PASSWORD:?请先运行 make init}
+      PGUSER: app_runtime
+      PGPASSWORD: ${APP_RUNTIME_PASSWORD:?请先运行 make init}
+      MIGRATOR_USER: interface_testing
+      MIGRATOR_PASSWORD: ${POSTGRES_PASSWORD:?请先运行 make init}
+      APP_RUNTIME_PASSWORD: ${APP_RUNTIME_PASSWORD:?请先运行 make init}
+      SECRET_KEY: ${SECRET_KEY:?请先运行 make init}
+      SECRET_KEY_PATH: /run/secrets/app_secret_key
+      CONTROLLED_TARGETS: ${CONTROLLED_TARGETS:-http://echo:8080,http://echo-alt:8080}
+      # 平台基础设施禁区：主机名基线之外，由部署配置追加，只增不减。
+      PLATFORM_FORBIDDEN_HOSTS: ${PLATFORM_FORBIDDEN_HOSTS:-}
+      PLATFORM_FORBIDDEN_ADDRESSES: ${PLATFORM_FORBIDDEN_ADDRESSES:-}
+      # 必须完整确认地址的来源：解析不出来的必需来源会让本次发送被拒。
+      # 基线是平台本体的 api／db 与容器到宿主机的入口（host.docker.internal，见下方
+      # extra_hosts）；本部署实际启用的名字由 .env 追加（运行执行器的部署要把 worker
+      # 加进去，执行器进程启动时会自查这条声明）。
+      PLATFORM_REQUIRED_HOSTS: ${PLATFORM_REQUIRED_HOSTS:-}
+    # 容器到**实际宿主机**的入口，由模板无条件提供：`host-gateway` 是 Compose 的保留
+    # 取值，在 Linux 与 Docker Desktop 上都解析到宿主自己，用户不需要自己去找宿主 IP。
+    # 守卫把这个名字当作**必需来源**（见 target_policy 的基线名单）：解析不出来就拒绝
+    # 发送，而不是像可选兼容别名那样跳过——宿主地址不进禁区，指向它的域名与 IP 直连
+    # 就没有地址层的拦截。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "127.0.0.1:${API_PORT:-18080}:8000"
     depends_on:
@@ -35,12 +61,77 @@ services:
       watch:
         - action: rebuild
           path: ./apps/api/requirements.txt
+  # 独立执行进程：与管理 API 同镜像、共用执行内核，只领取被授权的执行池。
+  # 未配置 WORKER_POOL_IDS 时 worker 会明确报错退出，不会静默空转或领取任意池。
+  worker:
+    build: ./apps/api
+    profiles: ["worker"]
+    volumes:
+      - ./apps/api/app:/app/app:ro
+    environment:
+      PGHOST: db
+      PGDATABASE: interface_testing
+      PGUSER: app_runtime
+      PGPASSWORD: ${APP_RUNTIME_PASSWORD:?请先运行 make init}
+      SECRET_KEY: ${SECRET_KEY:?请先运行 make init}
+      SECRET_KEY_PATH: /run/secrets/app_secret_key
+      WORKER_ID: ${WORKER_ID:-worker-1}
+      # 本服务在网络中的名字：执行器启动时用它核对部署是否声明了自己
+      # （.env 的 PLATFORM_REQUIRED_HOSTS 必须包含这个值，否则拒绝启动）。
+      # 与下面的服务名保持一致，改名时两者一起改。
+      WORKER_HOST: worker
+      WORKER_POOL_IDS: ${WORKER_POOL_IDS:-}
+      CONTROLLED_TARGETS: ${CONTROLLED_TARGETS:-http://echo:8080,http://echo-alt:8080}
+      # 发送前的地址层复核要用同一份禁区配置，两个调用点不能各带一套。
+      PLATFORM_FORBIDDEN_HOSTS: ${PLATFORM_FORBIDDEN_HOSTS:-}
+      PLATFORM_FORBIDDEN_ADDRESSES: ${PLATFORM_FORBIDDEN_ADDRESSES:-}
+      PLATFORM_REQUIRED_HOSTS: ${PLATFORM_REQUIRED_HOSTS:-}
+    # 与 api 同一份宿主入口：执行器是真正发请求的进程，启动时会确认这条必需来源
+    # 解析得到地址（不是等到第一条运行才拒绝）。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "-m", "app.worker"]
+  # 受控目标服务：确定行为的被测接口，只用于本机验收，仅供 worker 访问。
+  # 不给生产引擎放开任意 localhost／私网，白名单由 CONTROLLED_TARGETS 显式指定。
+  echo:
+    build: ./apps/target_service
+    volumes:
+      - ./apps/target_service/main.py:/app/main.py:ro
+    environment:
+      TARGET_EXPECTED_TOKEN: ${CONTROLLED_TARGET_TOKEN:-}
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  # 第二个受控目标：同一镜像的独立实例，供“一个用例、两个测试环境”的验收
+  # 真实发往各自服务。复用同一份镜像，只有实例名不同，不引入第二套被测行为。
+  echo-alt:
+    build: ./apps/target_service
+    volumes:
+      - ./apps/target_service/main.py:/app/main.py:ro
+    expose:
+      - "8080"
+    environment:
+      TARGET_SERVICE_NAME: controlled-target-alt
+      TARGET_EXPECTED_TOKEN: ${CONTROLLED_TARGET_TOKEN:-}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
   web:
     build: ./apps/web
     volumes:
       - ./apps/web/src:/app/src:ro
       - ./apps/web/index.html:/app/index.html:ro
       - ./apps/web/vite.config.ts:/app/vite.config.ts:ro
+      - ./apps/web/vitest.config.ts:/app/vitest.config.ts:ro
       - ./apps/web/tsconfig.json:/app/tsconfig.json:ro
     ports:
       - "127.0.0.1:${WEB_PORT:-15173}:5173"

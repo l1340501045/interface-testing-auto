@@ -1,4 +1,8 @@
-"""开发环境连通性入口；尚不包含接口测试业务功能。"""
+"""管理 API 入口。
+
+保留 `/health` 供开发容器健康检查；业务接口统一挂在 `/api/v1` 下。
+长耗时的被测请求不由本进程发送，本进程只负责鉴权、编排与持久化。
+"""
 import logging
 import os
 
@@ -6,9 +10,20 @@ import psycopg
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="接口测试平台开发环境")
+from .api.errors import install_error_handlers
+from .api.routes import auth, cases, credentials, projects, runs
+
+app = FastAPI(title="接口自动化测试与巡检平台", docs_url="/api/docs", openapi_url="/api/openapi.json")
 logger = logging.getLogger(__name__)
 DEVELOPMENT_MESSAGE = "后端开发服务已就绪"
+
+install_error_handlers(app)
+
+app.include_router(auth.router, prefix="/api/v1")
+app.include_router(projects.router, prefix="/api/v1")
+app.include_router(credentials.router, prefix="/api/v1")
+app.include_router(cases.router, prefix="/api/v1")
+app.include_router(runs.router, prefix="/api/v1")
 
 
 @app.get("/health")
