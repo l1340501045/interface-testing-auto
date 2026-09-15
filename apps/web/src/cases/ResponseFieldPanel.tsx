@@ -188,7 +188,14 @@ export function ResponseFieldPanel({
 
   const runBody = latestResponseBody(report);
   const usingRun = runBody !== null;
-  const tree = useFieldTree(workspaceId, projectId, usingRun ? runBody : sample);
+  /**
+   * 这份字段树的来源标识：哪条运行的响应，还是手工粘贴的样例。
+   *
+   * 同一个值同时给 `useFieldTree`（决定哪棵树可以交互）与字段面板（换代时清掉选中），
+   * 两处用同一个身份，才不会出现“树换了但选中还留着”的缝隙。
+   */
+  const treeSourceKey = usingRun ? `${report?.run.id ?? "no-run"}#run` : `manual#${sample}`;
+  const tree = useFieldTree(workspaceId, projectId, usingRun ? runBody : sample, treeSourceKey);
   const root = tree.tree?.root ?? null;
 
   const manualSelector = manualPath.trim() === "" ? [] : parsePathInput(manualPath);
@@ -257,6 +264,8 @@ export function ResponseFieldPanel({
       <FieldTreePanel
         title="响应正文字段"
         tree={tree}
+        // 来源换代标识：换运行或换样例时字段面板自行清掉选中节点。
+        sourceKey={treeSourceKey}
         targetSource="response.body"
         types={types}
         typesError={typesError}

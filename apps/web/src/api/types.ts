@@ -102,6 +102,14 @@ export interface RequestSpec {
   body_type: "none" | "json" | "text" | "form";
   body: string;
   imported_origin?: string;
+  /**
+   * 这份请求是否**必须**使用当前环境的登录态。
+   *
+   * 缺省与 false 同义：沿用既有的“跟随环境”行为（环境配了可用身份就注入，没有就按
+   * 公开请求发送）。导入识别到认证头／Cookie 时为 true，表示不能退回匿名发送。
+   * 它参与服务端摘要，因此缺省时必须整个键缺席，不能写成 false。
+   */
+  auth_required?: boolean;
 }
 
 export interface NameValuePair {
@@ -225,12 +233,68 @@ export interface AssertionResult {
   elapsed_ms: number | null;
 }
 
+/**
+ * 运行来源：服务端以受保护主密钥生成的**不透明**关联标记。
+ *
+ * 它不是内容摘要：两个标记由 HMAC-SHA256 算出，带独立用途域并绑定工作空间、项目与
+ * 发起主体。报告里的敏感字段值会被遮蔽，若这里换成裸摘要，读到报告的人就能拿低熵
+ * 候选离线比对，跨主体也会因为内容相同而得到同一标记。前端只做相等比较，不解析。
+ */
+export interface RunContext {
+  snapshot_fingerprint: string;
+  environment: {
+    id: string;
+    name: string;
+    kind: string;
+    base_url: string;
+  };
+  input_fingerprint: string;
+}
+
 export interface RunReport {
   run: RunSummary;
   steps: RunStep[];
   assertions: AssertionResult[];
   request: Record<string, unknown> | null;
   response: Record<string, unknown> | null;
+  /** 缺席与 null 同义：这条记录给不出“按哪份配置产生”的结论，只能当历史查看。 */
+  context: RunContext | null;
+}
+
+// —— 发送前预检 ——
+
+/** 预检给出的建议动作；界面按它决定提供哪个入口。 */
+export type PreflightAction =
+  | "edit_request"
+  | "select_environment"
+  | "manage_credentials"
+  | "authorize"
+  | "contact_admin"
+  | "configure_environment";
+
+export type PreflightAuthState =
+  | "none"
+  | "ready"
+  | "needs_authorization"
+  | "unavailable"
+  | "ambiguous";
+
+export interface PreflightIssue {
+  code: string;
+  message: string;
+  action: PreflightAction;
+}
+
+export interface DebugPreflight {
+  ready: boolean;
+  issues: PreflightIssue[];
+  can_authorize: boolean;
+  auth: {
+    required: boolean;
+    state: PreflightAuthState;
+    profile_id: string | null;
+  };
+  context: RunContext | null;
 }
 
 // —— 管理页契约：普通变量、执行池白名单与人工凭证 ——

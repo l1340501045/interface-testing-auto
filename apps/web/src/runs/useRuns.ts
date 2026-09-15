@@ -31,7 +31,9 @@ export function runOutcomeLabel(run: RunSummary): string {
     case "failed":
       return "断言失败";
     case "completed_unchecked":
-      return "入参校验通过，响应未校验";
+      // 中性文案：写“入参校验通过”等于替没跑过的检查下结论——完全没有断言、或只有
+      // 入参断言时，入参一条也没被核对过。原因由 `reason_category` 与步骤错误码补充。
+      return "响应未校验";
     case "canceled":
       return "已取消";
     case "interrupted":
@@ -49,11 +51,20 @@ export function runOutcomeLabel(run: RunSummary): string {
 
 /** 失败原因分类：配置错误与业务断言失败要分开看，前者说明断言本身写错了。 */
 export function runReasonLabel(run: RunSummary): string | null {
+  // 已取消的运行不附加原因。
+  //
+  // 取消接口把 `reason_category` 写成 `policy`（那是它的收尾方式），直接按分类映射就会
+  // 在“已取消”旁边再写一句“被安全策略阻止”——用户会以为这次运行是被策略拦下的，而
+  // 实际情况是有人点了取消。取消本身已经说明了一切，这里不给原因；也不去猜是用户还是
+  // 系统取消的，那没有依据。
+  if (run.outcome === "canceled") return null;
   switch (run.reason_category) {
     case "configuration":
       return "断言或请求配置有误";
     case "assertion":
       return "断言未通过";
+    case "authentication":
+      return "认证或凭证被拒绝";
     case "policy":
       return "被安全策略阻止";
     case "network":
@@ -62,6 +73,18 @@ export function runReasonLabel(run: RunSummary): string | null {
       return null;
     default:
       return run.reason_category;
+  }
+}
+
+/** `completed_unchecked` 的具体原因：不同原因对用户要说的话完全不同。 */
+export function uncheckedReasonLabel(errorCode: string | null): string {
+  switch (errorCode) {
+    case "assertion_not_evaluated":
+      return "有必需的断言条件没有执行，响应没有被完整校验。";
+    case null:
+      return "本次没有响应断言，或只有发送前断言，响应未被校验。";
+    default:
+      return `响应未被校验（${errorCode}）。`;
   }
 }
 

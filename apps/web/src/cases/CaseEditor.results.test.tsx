@@ -56,12 +56,24 @@ vi.mock("../runs/RunPanel", async () => {
   return {
     RunPanel: (props: {
       onReport: (report: import("../api/types").RunReport) => void;
+      onSelectRun: (runId: string) => void;
     }) => {
       const report = harness.report;
+      // 依赖数组与真实 RunPanel 一致（`[report.data, onReport]`）：报告身份变化或回调变化时
+      // 才上报。没有依赖数组等于每次渲染都上报，那会与被测组件的更新形成闭环（上报 → 新选择
+      // → 重渲染 → 上报），替身自己制造出真实组件不会有的死循环。
       useEffect(() => {
         if (report) props.onReport(report);
-      });
-      return <div data-testid="run-panel" />;
+      }, [report, props.onReport]);
+      // 版本报告的展示需要**显式选择**（R3 §5）：报告到达只更新缓存，不改变查看来源。
+      // 真实 RunPanel 的「查看报告」就是这个入口，替身提供同名按钮供用例点它。
+      return (
+        <div data-testid="run-panel">
+          <button type="button" onClick={() => report && props.onSelectRun(report.run.id)}>
+            查看报告
+          </button>
+        </div>
+      );
     },
   };
 });
@@ -164,6 +176,9 @@ function reportBody(snapshotHash: string, status: string, expected: string): Run
     ],
     request: null,
     response: null,
+    // 这条报告来自旧接口的形态：没有来源标记。匹配判据不依赖它（版本运行按快照摘要
+    // 与版本归属判断），这里如实反映“给不出来源证明”的记录。
+    context: null,
   };
 }
 
@@ -177,6 +192,29 @@ function routes(path: string): unknown {
   throw new Error(`测试未覆盖的请求：${path}`);
 }
 
+/**
+ * 切到「断言」标签。
+ *
+ * 固定响应断言原先常驻在请求区外面，现在归入断言标签（信息架构要求：参数／认证／
+ * 请求头／请求体／断言各自成组，不再把长表单堆在响应前面）。定位这些控件的用例
+ * 因此要先切标签——不是为了让测试通过而保留重复控件。
+ */
+function openAssertionTab(): void {
+  fireEvent.click(screen.getByRole("tab", { name: /^断言/ }));
+}
+
+/**
+ * 点选 RunPanel 替身里的历史运行。
+ *
+ * R3 之后版本报告的展示由**显式选择**驱动：报告到达只更新缓存，不改变查看来源。
+ * 这一步等价于用户在项目历史里点「查看报告」。
+ */
+async function selectHistoryRun(): Promise<void> {
+  const button = await screen.findByRole("button", { name: "查看报告" });
+  fireEvent.click(button);
+  await act(async () => {});
+}
+
 describe("配置变更后旧运行结论的时效性", () => {
   beforeEach(() => {
     apiSendMock.mockReset();
@@ -186,7 +224,10 @@ describe("配置变更后旧运行结论的时效性", () => {
     harness.report = null;
   });
 
-  it("内容与运行快照一致时，字段行显示那一轮的结论", async () => {
+  it("仅从历史点选的版本报告不贴当前通过：没有本次执行配置依据", async () => {
+    // R4 §2：历史列表里的报告只能说明“这条运行跑过”，不能证明它按**当前**配置跑过。
+    // 点选它仍然能看到完整报告（响应区照常显示 200 与结论标签），但字段行旁的“当前
+    // 结论”需要一份可证明的执行依据——那只能来自一次真实的本次受理。
     harness.report = reportBody(SNAPSHOT_HASH, "passed", "200");
     const { container } = render(
       <CaseEditor
@@ -213,11 +254,18 @@ describe("配置变更后旧运行结论的时效性", () => {
     await screen.findByLabelText("用例名称");
     await act(async () => {});
 
-    await waitFor(() => expect(screen.getAllByText("通过").length).toBeGreaterThan(0));
-    // 期望／实际也保留：那是这一轮的取值，不是别的条件的结论。
+    await selectHistoryRun();
+    openAssertionTab();
+    await waitFor(() => {
+      const block = container.querySelector(".assertion-column") as HTMLElement;
+      expect(block.textContent).toContain("未执行");
+    });
     const block = container.querySelector(".assertion-column") as HTMLElement;
-    expect(block.textContent).toContain("期望");
-    expect(block.textContent).toContain("实际");
+    expect(block.textContent).not.toContain("通过");
+    // 报告本身仍然完整可读：响应区照常显示那条运行的终态与结果标签。
+    const response = screen.getByRole("region", { name: "响应" });
+    expect(response.textContent).toContain("已结束");
+    expect(response.textContent).toContain("通过");
   });
 
   it("修改断言参数后不重新执行，字段行必须显示未执行而不是上一轮的通过", async () => {
@@ -247,7 +295,9 @@ describe("配置变更后旧运行结论的时效性", () => {
     );
     await screen.findByLabelText("用例名称");
     await act(async () => {});
+    await selectHistoryRun();
     await waitFor(() => expect(screen.getAllByText("通过").length).toBeGreaterThan(0));
+    openAssertionTab();
 
     const responseBlock = screen.getByText("状态码").closest(".response-field") as HTMLElement;
     const row = within(responseBlock).getAllByRole("listitem")[0];
@@ -296,6 +346,7 @@ describe("配置变更后旧运行结论的时效性", () => {
     );
     await screen.findByLabelText("用例名称");
     await act(async () => {});
+    await selectHistoryRun();
     await waitFor(() => expect(screen.getAllByText("通过").length).toBeGreaterThan(0));
   });
 
@@ -328,8 +379,11 @@ describe("配置变更后旧运行结论的时效性", () => {
     );
     await screen.findByLabelText("用例名称");
     await act(async () => {});
+    // 用户仍然打开了那条历史运行——结论必须显示为“未执行”，而不是把它的通过贴上来。
+    await selectHistoryRun();
 
     await waitFor(() => {
+      openAssertionTab();
       const block = screen.getByText("状态码").closest(".response-field") as HTMLElement;
       expect(block.textContent).toContain("未执行");
       expect(block.textContent).not.toContain("通过");

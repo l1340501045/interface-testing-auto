@@ -417,6 +417,11 @@ def curl_preview(
             request["imported_origin"] = normalize_origin(f"{draft.scheme}://{draft.host}")
         except TargetPolicyError:
             pass
+    if draft.auth_hint is not None:
+        # 导入时识别到认证头或 Cookie：这份请求确实需要登录态，而值已经被丢弃、不会
+        # 进入请求定义。把“必须使用环境身份”写成请求自己的约束并随草稿保存，执行时
+        # 才拦得住“身份后来没了就退回匿名发送”。提示（auth_hint）本身不进入请求。
+        request["auth_required"] = True
     try:
         request = request_spec.validate_request(request)
     except request_spec.RequestSpecError as error:

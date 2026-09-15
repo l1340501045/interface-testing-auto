@@ -226,6 +226,9 @@ type CurrentCase = { caseId: string; versionId: string | null } | null;
  * 单独拿出来是为了让用例能**换一份 `currentCase` 重新渲染**：编辑器发布成功后，
  * 外壳就是这样把“当前打开的用例改成了哪一版”告诉面板的。
  */
+/** 执行配置变更通知的 spy：绑定集合保存成功必须走它。 */
+const onExecutionConfigChanged = vi.fn();
+
 function panelTree(currentCase: CurrentCase = null) {
   return (
     <LeaveGuardProvider>
@@ -236,6 +239,7 @@ function panelTree(currentCase: CurrentCase = null) {
         canAdmin
         currentUser={{ user_id: USER_ID, display_name: "演示账号" }}
         currentCase={currentCase}
+        onExecutionConfigChanged={onExecutionConfigChanged}
       />
     </LeaveGuardProvider>
   );

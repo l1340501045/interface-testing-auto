@@ -87,6 +87,9 @@ const EMPTY_CREDENTIALS = {
   [`GET ${url("/cases")}`]: [],
 };
 
+/** 执行配置变更通知的 spy：面板自己决定哪些动作算“成功变更”，App 负责推进时钟。 */
+const onExecutionConfigChanged = vi.fn();
+
 function renderPanel(role: string) {
   return render(
     <AdminPanel
@@ -96,6 +99,7 @@ function renderPanel(role: string) {
       environments={environments}
       currentUser={{ user_id: CURRENT_USER_ID, display_name: "演示账号" }}
       currentCase={null}
+      onExecutionConfigChanged={onExecutionConfigChanged}
     />,
   );
 }
@@ -305,6 +309,7 @@ describe("管理页面", () => {
         environments={[otherEnvironment]}
         currentUser={{ user_id: CURRENT_USER_ID, display_name: "演示账号" }}
         currentCase={null}
+          onExecutionConfigChanged={onExecutionConfigChanged}
       />,
     );
     fireEvent.change(screen.getByLabelText("身份名称"), { target: { value: "闭环验收身份" } });

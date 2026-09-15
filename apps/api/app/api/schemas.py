@@ -322,12 +322,84 @@ class AssertionResultOut(ApiModel):
     elapsed_ms: int | None
 
 
+class RunSourceEnvironment(ApiModel):
+    """运行来源环境：来自冻结快照的脱敏描述，不含变量值。"""
+
+    id: uuid.UUID
+    name: str
+    kind: str
+    base_url: str
+
+
+class RunContextOut(ApiModel):
+    """运行来源：服务端以受保护主密钥生成的**不透明**关联标记。
+
+    两个标记是 HMAC-SHA256（独立用途域、绑定 workspace／project／发起主体），不是
+    内容摘要：报告会遮蔽敏感字段的值，若这里换成裸摘要，任何能读到报告的人都可以拿
+    低熵候选离线撞出“是不是这一条”，跨主体比对也会因为同一份内容得到同一摘要而成立。
+    标记不含认证注入值或密文，也不是授权凭证——它只用来把结果和输入关联起来。
+    """
+
+    snapshot_fingerprint: str
+    environment: RunSourceEnvironment
+    input_fingerprint: str
+
+
 class RunReportOut(ApiModel):
     run: RunOut
     steps: list[RunStepOut]
     assertions: list[AssertionResultOut]
     request: dict[str, Any] | None
     response: dict[str, Any] | None
+    # 可证明的运行来源。缺席与 null 同义：这条记录给不出“按哪份配置产生”的结论，
+    # 仍可查看原始证据，但不能把它当作当前草稿已通过的证明。
+    context: RunContextOut | None = None
+
+
+# —— 发送前预检 ——
+#
+# 只报告当前主体此刻的准入状态：不解密秘密、不消费授权、不创建运行、不访问目标
+# HTTP。它不是执行凭证，真正发送前仍按权威规则重新检查一次。
+
+PreflightAction = Literal[
+    "edit_request",
+    "select_environment",
+    "manage_credentials",
+    "authorize",
+    "contact_admin",
+    "configure_environment",
+]
+
+PreflightAuthState = Literal["none", "ready", "needs_authorization", "unavailable", "ambiguous"]
+
+
+class DebugPreflightRequest(ApiModel):
+    environment_id: uuid.UUID
+    debug_snapshot: DebugSnapshot
+
+
+class PreflightIssueOut(ApiModel):
+    """一条可操作的准入问题：稳定错误码、中文说明与建议动作。"""
+
+    code: str
+    message: str
+    action: PreflightAction
+
+
+class PreflightAuthOut(ApiModel):
+    """当前环境的认证状态；profile_id 只对可管理身份者返回。"""
+
+    required: bool
+    state: PreflightAuthState
+    profile_id: uuid.UUID | None = None
+
+
+class DebugPreflightOut(ApiModel):
+    ready: bool
+    issues: list[PreflightIssueOut] = Field(default_factory=list)
+    can_authorize: bool
+    auth: PreflightAuthOut
+    context: RunContextOut | None = None
 
 
 # —— 身份凭证 ——

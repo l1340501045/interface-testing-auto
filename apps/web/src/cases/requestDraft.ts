@@ -21,6 +21,8 @@ export interface RawRequest {
   body_type: RequestSpec["body_type"];
   body: string;
   imported_origin?: string;
+  /** 必须使用当前环境登录态；见 RequestSpec.auth_required。缺省即“跟随环境”。 */
+  auth_required?: boolean;
 }
 
 export function ltrimPath(value: string): string {
@@ -48,6 +50,8 @@ export function requestToRaw(spec: RequestSpec): RawRequest {
     body: spec.body,
   };
   if (spec.imported_origin) raw.imported_origin = spec.imported_origin;
+  // 只在为 true 时带上：写一个 false 会让服务端摘要与既有版本、既有授权都不同。
+  if (spec.auth_required === true) raw.auth_required = true;
   return raw;
 }
 
@@ -67,6 +71,7 @@ export function rawToSpec(raw: RawRequest): RequestSpec {
     body_type: raw.body_type,
     body: raw.body_type === "none" ? "" : raw.body,
     ...(raw.imported_origin ? { imported_origin: raw.imported_origin } : {}),
+    ...(raw.auth_required === true ? { auth_required: true } : {}),
   };
   // 复用与响应相同的运行时校验，避免界面拼出后端不接受的结构。
   return toRequestSpec(spec);

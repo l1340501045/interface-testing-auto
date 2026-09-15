@@ -73,6 +73,7 @@ from .credentials import (
     recheck_grant_authority,
     resolve_injection,
 )
+from .debug_context import stamp_guard_semantics
 from .permissions import can
 from .variable_inputs import frozen_snapshot_digest
 
@@ -119,6 +120,13 @@ class StepEvidence:
 
     request: dict = field(default_factory=dict)
     response: dict | None = None
+    # 本轮环境冻结与必需认证保护是否**真的被这次尝试执行过**。
+    #
+    # 报告里的来源证明只能由“确实跑过保护”的尝试给出。同一段代码在恢复分支、截止时间
+    # 分支、环境缺失分支上也会写尝试记录，但那些路径根本没有走到保护逻辑——给它们盖章
+    # 会让一条“旧执行器留下未完成发送意图、新执行器直接判 interrupted、请求从未受本轮
+    # 约束”的记录看起来像受过保护，报告于是给出一个它并没有依据的结论。
+    guards_evaluated: bool = False
 
 
 @dataclass(frozen=True)
@@ -219,6 +227,19 @@ def describe_selector(selector: list[dict]) -> str:
 
 def _elapsed_ms(started: float) -> int:
     return int((time.perf_counter() - started) * 1000)
+
+
+def _request_evidence(evidence: StepEvidence) -> dict:
+    """入库前的请求证据：只有**确实执行过本轮保护**的尝试才盖语义标记。
+
+    标记是报告给出“这份结果按哪份配置产生”的唯一依据。恢复分支、截止时间分支、
+    环境缺失分支同样会写尝试记录，但它们没有走到环境冻结与必需认证的判定，因此
+    一律不盖章——旧执行器留下的未完成发送意图被新执行器判为 interrupted 时，请求
+    从未受本轮约束，报告必须返回 context=null 而不是给出一个没有依据的结论。
+    """
+    if not evidence.guards_evaluated:
+        return evidence.request
+    return stamp_guard_semantics(evidence.request)
 
 
 def _build_request_roots(prepared: PreparedRequest, request: dict) -> SourceRoots:
@@ -504,6 +525,47 @@ def _recheck_pool_authority(
         return settings.target_guard(allowed)
     except TargetPolicyError as error:
         raise SendFailure("pool_config_invalid", str(error), "policy", False) from error
+
+
+def _recheck_frozen_environment(run: Run, environment: Environment, snapshot: dict) -> None:
+    """冻结的环境配置与当前配置不一致时拒绝发送。
+
+    创建运行时把环境 id、类型与地址冻进了快照，但请求构造一直用的是**当前**环境：
+    排队期间改一次 base_url，请求就会发到另一个主机／基础路径，而报告里的来源仍然
+    是入队时那个环境。用户以为自己在调试 A，实际上打到了 B，且没有任何提示。
+
+    最保守的处理是差异拒绝：请求确实没有发出，用户确认新配置后重新发送即可。按旧
+    快照构造、用当前权限放行这类折中会让“策略检查的目标”与“实际发送的目标”再次
+    分家，正是这里要消除的那个问题。
+    """
+    frozen = snapshot.get("environment")
+    if not isinstance(frozen, dict) or not frozen:
+        # 早期记录可能没有冻结环境：保持既有行为，不因缺少字段而新增拒绝。
+        return
+    if str(frozen.get("id") or "") != str(environment.id):
+        raise SendFailure(
+            "environment_changed",
+            "本次运行绑定的环境已变更，已阻止执行。请重新选择环境后再发送。",
+            "configuration",
+            False,
+        )
+    fields = {
+        "kind": (frozen.get("kind"), environment.kind),
+        "base_url": (frozen.get("base_url"), environment.base_url),
+    }
+    drifted = [
+        name
+        for name, (frozen_value, current_value) in fields.items()
+        if str(frozen_value or "").rstrip("/") != str(current_value or "").rstrip("/")
+    ]
+    if drifted:
+        raise SendFailure(
+            "environment_changed",
+            "环境配置在本运行入队之后被改动（类型或地址已不同），本次请求不会发往新"
+            "目标。请确认新配置后重新发送。",
+            "configuration",
+            False,
+        )
 
 
 def _authorized_target(guard: TargetGuard, environment: Environment, request: dict):
@@ -834,7 +896,7 @@ def _persist_attempt(
         started_at=started_at,
         finished_at=finished_at,
         elapsed_ms=elapsed_ms,
-        request=evidence.request,
+        request=_request_evidence(evidence),
         response=evidence.response,
         error_code=error_code,
     )
@@ -964,7 +1026,7 @@ def _finalize(
         attempt.started_at = started_at
         attempt.finished_at = now
         attempt.elapsed_ms = elapsed_ms
-        attempt.request = evidence.request
+        attempt.request = _request_evidence(evidence)
         attempt.response = evidence.response
         session.flush()
         resolved_id = attempt.id
@@ -1154,6 +1216,10 @@ def _execute(session: Session, settings: Settings, claim: JobClaim) -> str:
         request = validate_request(snapshot.get("request") or {})
         assertions = validate_assertions(snapshot.get("assertions") or [])
         target = _authorized_target(guard, environment, request)
+        # 环境冻结的差异检查放在策略检查**之后**：改成生产、改到白名单之外这类拒绝
+        # 比“配置和提交时不一样”具体得多，用户按提示要做的处理也不同。两者都不发
+        # 请求，但报错只有一次机会，应当报最贴近原因的那一个。
+        _recheck_frozen_environment(run, environment, snapshot)
         pinned = guard.pinned_address(target)
     except (RequestSpecError, AssertionSpecError) as error:
         return _fail_without_send(session, claim, worker_id, "configuration", "case_invalid", str(error))
@@ -1186,6 +1252,9 @@ def _execute(session: Session, settings: Settings, claim: JobClaim) -> str:
             debug_snapshot_hash=snapshot.get("debug_snapshot_hash"),
             target_origin=target.origin,
             frozen_input_digest=frozen_input_digest,
+            # 必须使用当前环境登录态的请求（导入时识别到认证头／Cookie）在快照里带
+            # auth_required；没有可用身份时在这里失败，不退回匿名发送。
+            auth_required=bool(request.get("auth_required")),
             # 一次性授权只能由仍持有本次领取的执行者消费。
             lease_guard=LeaseGuard(
                 job_id=claim.job_id,
@@ -1210,7 +1279,8 @@ def _execute(session: Session, settings: Settings, claim: JobClaim) -> str:
             session.rollback()
             return "stale"
         return _fail_without_send(
-            session, claim, worker_id, "authentication", error.code, error.message, secrets
+            session, claim, worker_id, "authentication", error.code, error.message, secrets,
+            guards_evaluated=True,
         )
     except (RequestSpecError, VariableResolutionError) as error:
         return _fail_without_send(
@@ -1221,6 +1291,7 @@ def _execute(session: Session, settings: Settings, claim: JobClaim) -> str:
             "request_invalid",
             str(error),
             secrets,
+            guards_evaluated=True,
         )
     session.commit()
 
@@ -1252,7 +1323,7 @@ def _execute(session: Session, settings: Settings, claim: JobClaim) -> str:
             reason_category="assertion" if blocked.outcome.status == "failed" else "configuration",
             attempt_state="skipped",
             attempt_outcome=blocked.outcome.status,
-            evidence=StepEvidence(request=request_evidence),
+            evidence=StepEvidence(request=request_evidence, guards_evaluated=True),
             error_code="pre_request_assertion_failed",
             send_intent_at=None,
             started_at=None,
@@ -1269,7 +1340,7 @@ def _execute(session: Session, settings: Settings, claim: JobClaim) -> str:
         claim,
         state="sending",
         outcome=None,
-        evidence=StepEvidence(request=request_evidence),
+        evidence=StepEvidence(request=request_evidence, guards_evaluated=True),
         error_code=None,
         send_intent_at=intent_at,
         started_at=intent_at,
@@ -1296,8 +1367,6 @@ def _execute(session: Session, settings: Settings, claim: JobClaim) -> str:
             injection,
             environment=environment,
             principal_id=run.created_by,
-            case_version_id=run.case_version_id,
-            debug_snapshot_hash=snapshot.get("debug_snapshot_hash"),
             target_origin=send_target.origin,
             frozen_input_digest=frozen_input_digest,
         )
@@ -1394,7 +1463,9 @@ def _execute(session: Session, settings: Settings, claim: JobClaim) -> str:
         reason_category=reason,
         attempt_state="finished",
         attempt_outcome=attempt_outcome,
-        evidence=StepEvidence(request=request_evidence, response=response_evidence),
+        evidence=StepEvidence(
+            request=request_evidence, response=response_evidence, guards_evaluated=True
+        ),
         error_code=error_code,
         send_intent_at=intent_at,
         started_at=intent_at,
@@ -1421,11 +1492,15 @@ def _fail_without_send(
     code: str,
     message: str,
     secrets: list[str] | None = None,
+    guards_evaluated: bool = False,
 ) -> str:
     """发送前的拒绝：不写发送意图，不产生任何目标副作用。
 
     `message` 会原样进报告与数据库，因此按出口统一脱敏：认证注入解析出来之后
     才失败的路径（请求准备、入参断言）都可能把秘密带进异常文本。
+
+    `guards_evaluated` 标记本轮环境冻结与必需认证保护是否已经执行过：保护的检查块
+    内部失败时它仍是 False，报告因此不会给这条记录一个它没有依据的来源证明。
     """
     _finalize(
         session,
@@ -1436,7 +1511,8 @@ def _fail_without_send(
         attempt_state="skipped",
         attempt_outcome="error",
         evidence=StepEvidence(
-            request={"rejected": code, "message": _sanitize(message, secrets or [])}
+            request={"rejected": code, "message": _sanitize(message, secrets or [])},
+            guards_evaluated=guards_evaluated,
         ),
         error_code=code,
         send_intent_at=None,
@@ -1472,7 +1548,10 @@ def _block_after_intent(
         reason_category=category,
         attempt_state="skipped",
         attempt_outcome="error",
-        evidence=StepEvidence(request=_sanitize_evidence(request_evidence, secrets or [])),
+        evidence=StepEvidence(
+            request=_sanitize_evidence(request_evidence, secrets or []),
+            guards_evaluated=True,
+        ),
         error_code=code,
         send_intent_at=intent_at,
         started_at=None,
@@ -1508,6 +1587,7 @@ def _handle_send_failure(
         evidence=StepEvidence(
             request=request_evidence,
             response={"error": redact_text(failure.message, secrets)},
+            guards_evaluated=True,
         ),
         error_code=error_code,
         send_intent_at=intent_at,

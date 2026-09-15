@@ -19,6 +19,8 @@ export function AdminPanel({
   environments,
   currentUser,
   currentCase,
+  anchorId,
+  onExecutionConfigChanged,
 }: {
   workspaceId: string;
   projectId: string;
@@ -26,13 +28,31 @@ export function AdminPanel({
   environments: Environment[];
   currentUser: { user_id: string; display_name: string };
   currentCase: { caseId: string; versionId: string | null } | null;
+  /**
+   * 锚点 id：工作台的“环境与凭证管理”入口据此把用户送到这里。
+   *
+   * 只是滚动与聚焦，不改变可见性——原有管理能力必须始终可达，不能靠 CSS 藏起来。
+   */
+  anchorId?: string;
+  /**
+   * 执行配置**成功变更**的通知（环境／变量／身份）。
+   *
+   * 必填：漏接一次，用户在管理面板里改完配置之后，工作台仍然按旧配置给结论——而这不会
+   * 报任何错。它只是转发，面板自己决定哪些动作算“成功变更”。
+   */
+  onExecutionConfigChanged: () => void;
 }) {
   const canEdit = role === "admin" || role === "editor";
   const canAdmin = role === "admin";
 
   return (
-    <div className="admin-stack">
-      <VariablesPanel workspaceId={workspaceId} projectId={projectId} canEdit={canEdit} />
+    <div className="admin-stack" id={anchorId} tabIndex={anchorId ? -1 : undefined}>
+      <VariablesPanel
+        workspaceId={workspaceId}
+        projectId={projectId}
+        canEdit={canEdit}
+        onExecutionConfigChanged={onExecutionConfigChanged}
+      />
       <PoolTargetsPanel workspaceId={workspaceId} projectId={projectId} canAdmin={canAdmin} />
       <CredentialsPanel
         workspaceId={workspaceId}
@@ -41,6 +61,7 @@ export function AdminPanel({
         canAdmin={canAdmin}
         currentUser={currentUser}
         currentCase={currentCase}
+        onExecutionConfigChanged={onExecutionConfigChanged}
       />
     </div>
   );
