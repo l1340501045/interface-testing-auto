@@ -94,9 +94,71 @@ class CurlDraft:
         return urlunsplit((self.scheme, self.host, self.path, "", ""))
 
 
+def _strip_line_continuations(text: str) -> str:
+    r"""删掉外层 shell 续行（反斜杠＋换行），其余字符原样保留。
+
+    浏览器复制出来的 cURL 每行以反斜杠续接，而 `shlex` 的 posix 模式把反斜杠当作
+    转义字符：`\`＋换行会变成 token 里的一个字面换行，含换行的那一段就被当成另一个
+    请求地址，整条多行命令导入失败。这里只补上 shlex 不建模的续行，不做整段替换、
+    也不过滤空白 token，交给 shlex 的仍是它本来就处理的结构：
+
+    - 单引号内反斜杠是字面量，其中的 `\`＋换行属于数据，必须保留；
+    - 双引号内 `\"` 仍转义（不结束字符串），但 `\`＋换行在 shell 里就是续行，要删；
+    - 反斜杠按奇偶配对：偶数个后面跟换行不是续行，换行留在原处当分隔符；
+    - 只认两种换行：LF，或粘贴自 Windows 的完整 CRLF；裸 CR 不是换行，属于正文。
+
+    续行后的缩进只在引号外当分隔符；引号内的缩进是正文，照原样保留。
+
+    只建模这一层：不执行 shell，不做命令替换、变量展开，也不处理 PowerShell／cmd
+    的续行写法。
+    """
+    out: list[str] = []
+    quote: str | None = None
+    index = 0
+    size = len(text)
+    while index < size:
+        char = text[index]
+
+        # 单引号内没有转义，下一个单引号就是结束；里面的反斜杠一律是字面量。
+        if quote == "'":
+            if char == "'":
+                quote = None
+            out.append(char)
+            index += 1
+            continue
+
+        if char == "\\":
+            # 逐对消费，不回头重扫反斜杠段：当前位置的反斜杠紧邻换行（LF，或完整
+            # CRLF）才是续行，与它一起删掉并回到引号状态判断；否则把反斜杠和它转义
+            # 的下一个字符原样搬走（`\"` 因此不会在这里被误判成字符串结束）。
+            # 非续行走两个字符、续行走两个或三个，扫描因此是线性的一次遍历。
+            tail = text[index + 1 : index + 2]
+            if tail == "\n":
+                index += 2
+                continue
+            if tail == "\r" and text[index + 2 : index + 3] == "\n":
+                index += 3
+                continue
+            out.append(char)
+            index += 1
+            if index < size:
+                out.append(text[index])
+                index += 1
+            continue
+
+        if quote == '"':
+            if char == '"':
+                quote = None
+        elif char in ("'", '"'):
+            quote = char
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
 def _split(text: str) -> list[str]:
     try:
-        return shlex.split(text, posix=True)
+        return shlex.split(_strip_line_continuations(text), posix=True)
     except ValueError as error:
         raise CurlParseError(f"cURL 文本引号不完整：{error}") from error
 
