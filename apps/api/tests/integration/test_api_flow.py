@@ -541,6 +541,102 @@ def test_case_folder_membership_is_explicit_and_filterable(
 # —— SC-02 / SC-04 / SC-05：导入、断言与用例版本 ——
 
 
+def test_curl_import_previews_multiline_browser_command(
+    client: TestClient, account: dict, project: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """浏览器复制的多行 cURL 经真实预览接口返回可发送草稿，且预览一个请求都不发。
+
+    用户从浏览器复制出来的命令每行以反斜杠续接：LF 与从 Windows 粘贴的 CRLF 两种
+    形状都要与等价单行得到同一份请求定义。认证值（Authorization 与 -b 的 Cookie）
+    随运行生成、与命令文本分开构造，只用于证明它们不会落进完整响应。
+
+    探针按对象属性安装，不用字符串路径：字符串形式若在 executor 尚未导入时被解析，
+    会先触发它的首次导入，把当时装好的替身冻结成 `executor.build_client` 别名；撤销
+    只还原模块属性，这个别名会留到后续用例，把真实发送一起拦掉。先导入模块再替换
+    发送入口（`_send` 是唯一调用 build_client 的地方），撤销时才能正常恢复。
+    """
+    from app.services import executor
+
+    def forbid_send(*_args, **_kwargs) -> None:
+        raise AssertionError("cURL 预览属于导入步骤，不得发出被测 HTTP 请求")
+
+    monkeypatch.setattr(executor, "_send", forbid_send)
+
+    base = _base(account, project)
+    token = f"it-curlimp-{uuid.uuid4().hex}"
+    session = uuid.uuid4().hex
+    url = "https://example.test/api/orders?page=1&size=20&sort=desc&filter=open"
+    # 十一个普通浏览器请求头，加一个 Authorization 与一个 -b Cookie（用户样例的形状）。
+    ordinary_headers = [
+        "Accept: application/json",
+        "Accept-Encoding: gzip, deflate, br, zstd",
+        "Accept-Language: zh-CN,zh;q=0.9",
+        "Connection: keep-alive",
+        "Origin: https://example.test",
+        "Referer: https://example.test/orders/list",
+        "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        'sec-ch-ua: "Chromium";v="140", "Not=A?Brand";v="24"',
+        "sec-ch-ua-mobile: ?0",
+        'sec-ch-ua-platform: "macOS"',
+        "sec-fetch-site: same-origin",
+    ]
+    options = [*(f"-H '{header}'" for header in ordinary_headers)]
+    options.append(f"-H 'Authorization: Bearer {token}'")
+    options.append(f"-b 'it_session={session}; it_locale=zh-CN'")
+    single = " ".join([f"curl '{url}'", *options])
+
+    def continued(newline: str) -> str:
+        lines = [f"curl '{url}'", *(f"      {option}" for option in options)]
+        return (" \\" + newline).join(lines)
+
+    def preview(text: str):
+        response = client.post(f"{base}/imports/curl/preview", json={"text": text})
+        assert response.status_code == 200, response.text
+        return response
+
+    shapes = {
+        "单行": preview(single),
+        "LF": preview(continued("\n")),
+        "CRLF": preview(continued("\r\n")),
+    }
+    baseline = shapes["单行"].json()
+
+    for name, response in shapes.items():
+        body = response.json()
+        assert body["draft"] == baseline["draft"], f"{name} 应与等价单行得到同一份请求定义"
+        assert body["sendable"] is True, name
+        assert token not in response.text, f"{name}：Authorization 值不得出现在预览响应中"
+        assert session not in response.text, f"{name}：Cookie 值不得出现在预览响应中"
+        assert not any(
+            header["name"].lower() in ("authorization", "cookie")
+            for header in body["draft"]["headers"]
+        ), f"{name}：认证头不得作为普通请求头落进草稿"
+
+    assert baseline["draft"]["method"] == "GET"
+    assert baseline["draft"]["path"] == "/api/orders"
+    assert [(p["name"], p["value"]) for p in baseline["draft"]["query_params"]] == [
+        ("page", "1"),
+        ("size", "20"),
+        ("sort", "desc"),
+        ("filter", "open"),
+    ]
+    assert [h["name"] for h in baseline["draft"]["headers"]] == [
+        "Accept",
+        "Accept-Encoding",
+        "Accept-Language",
+        "Connection",
+        "Origin",
+        "Referer",
+        "User-Agent",
+        "sec-ch-ua",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-platform",
+        "sec-fetch-site",
+    ]
+    assert baseline["draft"]["headers"][7]["value"] == '"Chromium";v="140", "Not=A?Brand";v="24"'
+    assert baseline["auth_hint"]["pending"] is True
+
+
 def test_curl_import_preview_never_sends_and_preserves_values(
     client: TestClient, account: dict, project: dict
 ) -> None:

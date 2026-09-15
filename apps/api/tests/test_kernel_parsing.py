@@ -141,6 +141,178 @@ def test_cookie_option_not_stored_as_plaintext() -> None:
     assert draft.auth_hint is not None
 
 
+# —— 多行 cURL 续行：浏览器复制出来的命令按反斜杠＋换行续接 ——
+#
+# 单行与多行是同一个命令的两种写法，必须得到同一份请求定义。等价单行由同一组
+# token 连接而成，断言整份草稿相等，避免只对比个别字段而漏掉被续行破坏的部分。
+
+
+def _browser_header_lines(token: str, session: str) -> list[str]:
+    """脱敏的浏览器请求头：普通头与认证头混排在真实顺序里。
+
+    认证值随运行生成、与命令文本分开构造，源码里不留固定凭据形状。
+    """
+    return [
+        "Accept: application/json",
+        "Accept-Language: zh-CN,zh;q=0.9",
+        "Origin: https://example.test",
+        "Referer: https://example.test/orders/list",
+        "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        'sec-ch-ua: "Chromium";v="140", "Not=A?Brand";v="24"',
+        "sec-fetch-site: same-origin",
+        f"Authorization: Bearer {token}",
+        f"Cookie: it_session={session}; it_locale=zh-CN",
+    ]
+
+
+def _single_line_curl(url: str, headers: list[str]) -> str:
+    return " ".join([f"curl '{url}'", *(f"-H '{header}'" for header in headers)])
+
+
+def _multiline_curl(url: str, headers: list[str], newline: str = "\n") -> str:
+    """每行以反斜杠续接、下一行带缩进，与浏览器复制出来的形状一致。"""
+    lines = [f"curl '{url}'"]
+    lines.extend(f"      -H '{header}'" for header in headers)
+    return (" \\" + newline).join(lines)
+
+
+def _browser_curl_sample(newline: str = "\n") -> tuple[str, str, str]:
+    """返回 (等价的单行、多行、认证 token)。"""
+    token = f"it-curlparse-{uuid.uuid4().hex}"
+    session = uuid.uuid4().hex
+    url = "https://example.test/api/orders?page=1&size=20&sort=desc&filter=open"
+    headers = _browser_header_lines(token, session)
+    return _single_line_curl(url, headers), _multiline_curl(url, headers, newline), token
+
+
+def test_multiline_lf_curl_matches_the_single_line_equivalent() -> None:
+    single, multiline, _token = _browser_curl_sample()
+    assert parse(multiline).to_dict() == parse(single).to_dict()
+
+
+def test_multiline_crlf_curl_matches_the_single_line_equivalent() -> None:
+    """粘贴到 Windows 换行的文本同样要能导入，结果与单行一致。"""
+    single, multiline, _token = _browser_curl_sample(newline="\r\n")
+    assert parse(multiline).to_dict() == parse(single).to_dict()
+
+
+def test_multiline_curl_keeps_query_params_headers_and_auth_hint() -> None:
+    _single, multiline, token = _browser_curl_sample()
+    draft = parse(multiline)
+    assert draft.method == "GET"
+    assert draft.path == "/api/orders"
+    assert [(q["name"], q["value"]) for q in draft.query_params] == [
+        ("page", "1"),
+        ("size", "20"),
+        ("sort", "desc"),
+        ("filter", "open"),
+    ]
+    # 九个请求头里两个是认证头：它们不落普通草稿，其余七个按原顺序保留。
+    assert [h["name"] for h in draft.headers] == [
+        "Accept",
+        "Accept-Language",
+        "Origin",
+        "Referer",
+        "User-Agent",
+        "sec-ch-ua",
+        "sec-fetch-site",
+    ]
+    assert draft.headers[5]["value"] == '"Chromium";v="140", "Not=A?Brand";v="24"'
+    assert draft.auth_hint is not None
+    assert token not in str(draft.to_dict())
+
+
+def test_line_continuation_inside_a_word_joins_without_inserting_whitespace() -> None:
+    """词中续行是拼接，不是插入：换行不能变成请求头里的一个字符。
+
+    用请求头取值断言，而不是 URL：urlsplit 会自行剥掉换行，拿 URL 断言会让
+    “换行被留下”这种错误看上去通过。
+    """
+    draft = parse("\n".join(['curl https://example.test/x -H "X-Trace: ab\\', 'cd"']))
+    assert draft.headers == [{"name": "X-Trace", "value": "abcd"}]
+
+
+def test_line_continuation_inside_double_quotes_still_joins() -> None:
+    draft = parse("\n".join(['curl https://example.test/x -d "a\\', 'b"']))
+    assert draft.body == "ab"
+
+
+def test_indentation_after_a_continuation_inside_quotes_is_kept() -> None:
+    """双引号内续行只删掉反斜杠与换行；下一行的缩进是正文，char 不能一起吃掉。"""
+    draft = parse("\n".join(['curl https://example.test/x -d "a\\', '    b"']))
+    assert draft.body == "a    b"
+
+
+def test_bare_carriage_return_is_not_a_line_continuation() -> None:
+    """裸 CR 不是换行：反斜杠与 CR 都属于正文，不能被当成续行删掉。
+
+    旧 shlex 对 `"a\\<CR>b"` 的正文是反斜杠＋CR＋b；只兼容 LF 与完整 CRLF 时，
+    这个既有数据语义必须原样保留。
+    """
+    draft = parse('curl https://example.test/x --data-raw "a\\\rb"')
+    assert draft.body == "a\\\rb"
+
+
+@pytest.mark.parametrize("count", [1, 2, 3, 4, 5, 16001])
+def test_long_backslash_runs_inside_double_quotes(count: int) -> None:
+    r"""长反斜杠段（奇数／偶数，续行／非续行）的正文必须与 shell 语义一致。
+
+    奇数个反斜杠后的换行是续行：(count-1)/2 个反斜杠，两侧直接拼接；偶数个不是
+    续行：count/2 个反斜杠，换行本身留在正文。非续行时与旧 shlex 的结果一致。
+
+    段长取到 16001，超过接口 20000 字符上限内的合理规模：这不是毫秒级性能断言，
+    而是让“逐对消费”的扫描在长段上仍给出正确正文（此前的重复扫描是 O(n²)）。
+    """
+    backslashes = "\\" * count
+    odd = count % 2 == 1
+    halved = "\\" * (count // 2)
+
+    for newline in ("\n", "\r\n"):
+        draft = parse(
+            f'curl https://example.test/x --data-raw "A{backslashes}{newline}B"'
+        )
+        expected = f"A{halved}B" if odd else f"A{halved}{newline}B"
+        assert draft.body == expected, (count, repr(newline))
+
+    # 非续行：段后直接是普通文本。shlex 在双引号内把每对反斜杠折半，奇数段末尾那个
+    # 反斜杠后面不是特殊字符，原样保留，因此余下的反斜杠数是 (count + 1) // 2。
+    literal = parse(f'curl https://example.test/x --data-raw "A{backslashes}B"')
+    assert literal.body == f"A{'\\' * ((count + 1) // 2)}B"
+
+
+def test_backslash_newline_inside_single_quotes_stays_literal() -> None:
+    """单引号内反斜杠是字面量，`\\`＋换行在这里不是续行，不能删。"""
+    draft = parse("\n".join(["curl https://example.test/x -d 'a\\", "b'"]))
+    assert draft.body == "a\\\nb"
+
+
+def test_double_backslash_before_newline_is_not_a_continuation() -> None:
+    """偶数个反斜杠把换行留给外层：换行仍是分隔符，不能被当成续行吞掉。
+
+    单行里 `\\\\b` 是转义后的字面反斜杠，拼进同一个词；多行里换行必须把两行分开，
+    因此同样的片段在续行位置只能得到非法结果，而不是悄悄并进 URL。
+    """
+    assert parse("curl https://example.test/a\\\\b").path == "/a\\b"
+    with pytest.raises(CurlParseError):
+        parse("curl https://example.test/a\\\\\nb")
+
+
+def test_real_newline_inside_a_quoted_body_is_preserved() -> None:
+    draft = parse("\n".join(["curl https://example.test/x -d '{\"a\":", "1}'"]))
+    assert "\n" in draft.body
+    assert draft.body_type == "json"
+
+
+def test_escaped_quote_does_not_end_its_string() -> None:
+    draft = parse('curl https://example.test/x -H "X-Q: a\\"b"')
+    assert draft.headers == [{"name": "X-Q", "value": 'a"b'}]
+
+
+def test_unterminated_quote_is_still_rejected_after_continuation_handling() -> None:
+    with pytest.raises(CurlParseError):
+        parse("curl https://example.test/x -H 'X: 1")
+
+
 def test_variable_resolution() -> None:
     resolver = VariableResolver({"id": ValueLiteral(type="number", text="9007199254740993")})
     assert resolver.resolve_text("order-{{id}}") == "order-9007199254740993"
