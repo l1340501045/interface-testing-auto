@@ -16,6 +16,13 @@ from sqlalchemy.orm import Session
 from ...config import Settings
 from ...db import get_db
 from ...models import AssertionResult, Run, RunStepAttempt
+from ...services.debug_context import (
+    binding_is_current,
+    has_guard_semantics,
+    read_context_binding,
+    strip_guard_semantics,
+)
+from ...services.debug_preflight import preflight
 from ...services.run_coordinator import (
     RunRejected,
     RunRequest,
@@ -26,11 +33,17 @@ from .. import deps
 from ..errors import bad_request, conflict, forbidden, not_found
 from ..schemas import (
     AssertionResultOut,
+    DebugPreflightOut,
+    DebugPreflightRequest,
     DebugSnapshot,
     DebugSnapshotDigestOut,
+    PreflightAuthOut,
+    PreflightIssueOut,
+    RunContextOut,
     RunCreate,
     RunOut,
     RunReportOut,
+    RunSourceEnvironment,
     RunStepOut,
 )
 
@@ -129,6 +142,47 @@ def debug_snapshot_digest(
     return DebugSnapshotDigestOut(hash=digest)
 
 
+@router.post(
+    "/workspaces/{workspace_id}/projects/{project_id}/debug-preflight",
+    response_model=DebugPreflightOut,
+)
+def debug_preflight(
+    payload: DebugPreflightRequest,
+    scope: deps.ProjectScope = _EXECUTE_SCOPE,
+    settings: Settings = Depends(deps.get_settings_dep),
+    session: Session = Depends(get_db),
+) -> DebugPreflightOut:
+    """发送前预检：只报告当前主体此刻的准入状态，不创建运行、不消费授权。
+
+    权限为 execute（能执行的人才能问“我能不能执行”），而不是凭证管理的
+    `manage_secrets`：普通编辑者拿不到 `GET credentials/*`，页面因此无法给出
+    “到底缺什么”。这里返回脱敏结论与建议动作，真正发送前仍按权威规则重新检查。
+    """
+    result = preflight(
+        session,
+        settings,
+        project_id=scope.project_id,
+        principal_id=scope.principal.user_id,
+        role=scope.role,
+        environment_id=payload.environment_id,
+        snapshot=payload.debug_snapshot.model_dump(),
+    )
+    return DebugPreflightOut(
+        ready=result.ready,
+        issues=[
+            PreflightIssueOut(code=item.code, message=item.message, action=item.action)
+            for item in result.issues
+        ],
+        can_authorize=result.can_authorize,
+        auth=PreflightAuthOut(
+            required=result.auth_required,
+            state=result.auth_state,
+            profile_id=result.profile_id,
+        ),
+        context=RunContextOut(**result.context) if result.context is not None else None,
+    )
+
+
 @router.get(
     "/workspaces/{workspace_id}/projects/{project_id}/runs",
     response_model=list[RunOut],
@@ -189,6 +243,53 @@ def list_steps(
     ]
 
 
+def _report_context(
+    run: Run, attempt: RunStepAttempt | None, settings: Settings
+) -> RunContextOut | None:
+    """从冻结快照生成可证明的运行来源；给不出结论时返回 None。
+
+    只认执行器写在步骤证据里的语义标记：旧记录、旧执行器的产物、乃至“入队成功但
+    执行保护从未跑过”的记录都拿不到标记，因此不给结论。不能凭创建 API 写下的版本
+    标记倒推保护已执行——受理请求与真正执行保护是两件事。
+
+    内容全部取自冻结快照，不重新读当前环境：环境可能已被改动，重新读出来的是另一
+    份配置，用它标注历史结果会把“曾经记录的配置”当成“实际执行依据”。关联标记以
+    **Run 的创建者**为绑定主体，与预检（当前登录主体）生成的是同一套算法。
+    """
+    if attempt is None or not has_guard_semantics(attempt.request):
+        return None
+    snapshot = run.snapshot or {}
+    frozen = snapshot.get("environment")
+    if not isinstance(frozen, dict) or not frozen.get("id"):
+        return None
+    try:
+        environment_id = uuid.UUID(str(frozen["id"]))
+    except ValueError:
+        return None
+    binding = read_context_binding(snapshot)
+    if binding is None:
+        return None
+    try:
+        key = settings.load_secret_key()
+    except RuntimeError:
+        # 主密钥读不出来时无法判断标记是否仍然有效，按历史处理，不猜。
+        return None
+    if not binding_is_current(binding, key):
+        # 主密钥已轮换：旧标记不再可能匹配当前密钥下的任何输入。降为历史显示，
+        # 不重算一个当前密钥下的值贴到旧记录上——那是替旧记录编造依据。
+        return None
+    return RunContextOut(
+        snapshot_fingerprint=binding.snapshot_fingerprint,
+        environment=RunSourceEnvironment(
+            id=environment_id,
+            name=str(frozen.get("name") or ""),
+            kind=str(frozen.get("kind") or ""),
+            base_url=str(frozen.get("base_url") or ""),
+        ),
+        input_fingerprint=binding.input_fingerprint,
+    )
+
+
 @router.get(
     "/workspaces/{workspace_id}/projects/{project_id}/runs/{run_id}/report",
     response_model=RunReportOut,
@@ -196,6 +297,7 @@ def list_steps(
 def get_report(
     run_id: uuid.UUID,
     scope: deps.ProjectScope = _VIEW_SCOPE,
+    settings: Settings = Depends(deps.get_settings_dep),
     session: Session = Depends(get_db),
 ) -> RunReportOut:
     """脱敏报告：请求与响应证据来自最后一次尝试，秘密已被遮蔽。"""
@@ -246,8 +348,9 @@ def get_report(
             )
             for item in results
         ],
-        request=latest.request if latest is not None else None,
+        request=strip_guard_semantics(latest.request) if latest is not None else None,
         response=latest.response if latest is not None else None,
+        context=_report_context(run, latest, settings),
     )
 
 

@@ -27,6 +27,7 @@ from ..models import (
     RunnerPool,
     RunnerPoolProjectGrant,
 )
+from .debug_context import build_context_binding
 from .permissions import require
 from .variable_inputs import merged_variables
 
@@ -144,7 +145,7 @@ def _merged_variables(session: Session, environment: Environment) -> dict:
     return merged_variables(session, environment)
 
 
-def _resolve_target(
+def resolve_target(
     request: dict, environment: Environment, guard: TargetGuard
 ) -> tuple[dict, str]:
     """校验环境类型与目标来源，返回（已校验请求, 目标 origin）。
@@ -255,7 +256,7 @@ def create_run(
 
     resolved = resolve_pool(session, settings, environment)
     target_type, case_version_id, request, assertions = _load_source(session, project_id, payload)
-    _, target_origin = _resolve_target(request, environment, resolved.guard)
+    _, target_origin = resolve_target(request, environment, resolved.guard)
 
     # 调试快照没有版本号可固定，只能靠内容摘要绑定授权；摘要必须在创建事务里
     # 冻结进运行快照，执行时按同一份内容复核，避免执行阶段重新计算得到不同结果。
@@ -265,6 +266,18 @@ def create_run(
 
     now = datetime.now(UTC)
     business_deadline = now + timedelta(seconds=settings.business_deadline_seconds)
+    frozen_variables = _merged_variables(session, environment)
+    # 来源关联标记与运行快照同事务冻结：报告按它回答“这份结果是按哪份内容与输入
+    # 产生的”。标记用受保护主密钥做 HMAC，不落内容摘要，详见 debug_context。
+    context_binding = build_context_binding(
+        settings.load_secret_key(),
+        workspace_id=workspace_id,
+        project_id=project_id,
+        principal_id=principal_id,
+        request=request,
+        assertions=assertions,
+        variables=frozen_variables,
+    )
     run = Run(
         workspace_id=workspace_id,
         project_id=project_id,
@@ -290,9 +303,10 @@ def create_run(
             "target_origin": target_origin,
             "pool": {"id": str(resolved.pool.id), "name": resolved.pool.name},
             "request": request,
-            "variables": _merged_variables(session, environment),
+            "variables": frozen_variables,
             "assertions": assertions,
             "debug_snapshot_hash": snapshot_digest,
+            "context_binding": context_binding.as_dict(),
         },
     )
     session.add(run)

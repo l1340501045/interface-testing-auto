@@ -32,6 +32,13 @@ from .variable_inputs import environment_input_digest
 
 _SLOT_KINDS = {"header", "query"}
 
+# 本轮新增的凭证错误码集中定义：预检、执行器与界面提示共用同一组字符串，各处手写
+# 会让同一个原因出现两个码，前端也只能靠猜来匹配。
+# 请求明确要求使用环境登录态，但该环境没有可用身份。
+CREDENTIAL_REQUIRED = "credential_required"
+# 环境存在多份可用身份，本次发送无法确定使用哪一份。
+CREDENTIAL_AMBIGUOUS = "credential_ambiguous"
+
 
 class CredentialError(Exception):
     """凭证配置或授权问题，附带稳定错误码。"""
@@ -58,6 +65,10 @@ class Injection:
     profile_version_id: uuid.UUID | None = None
     credential_set_id: uuid.UUID | None = None
     credential_epoch: int = 0
+    # 本次实际选中的授权。发送前复核必须核对**同一条**，不能重新挑一次：同一份内容
+    # 先后签发过两份授权时，重新挑选会落到另一份上（比如新签发的那份还没被消费），
+    # 复核因此通过，而真正被消费掉的那一条是否仍然有效就没人检查了。
+    grant_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -314,13 +325,55 @@ def revoke_use_grant(session: Session, grant: CredentialUseGrant) -> None:
     session.flush()
 
 
+def available_profiles(session: Session, environment_id: uuid.UUID) -> list[CredentialProfile]:
+    """环境的可用身份，按稳定顺序返回（创建时间、id）。
+
+    顺序稳定只是为了让报告与测试可复现，**不是选择依据**：多份可用身份意味着“这次
+    用的是哪一份”没有答案，不能靠排序任取一条来把歧义掩盖成确定性。
+    """
+    return list(
+        session.scalars(
+            select(CredentialProfile)
+            .where(
+                CredentialProfile.environment_id == environment_id,
+                CredentialProfile.status == "available",
+            )
+            .order_by(CredentialProfile.created_at, CredentialProfile.id)
+        )
+    )
+
+
+def resolve_environment_profile(
+    session: Session, environment_id: uuid.UUID
+) -> CredentialProfile | None:
+    """确定这次运行使用哪份环境身份：没有可用身份返回 None，有多份直接拒绝。
+
+    原先的查询没有排序，环境里存在两份可用身份时“用哪一份”由数据库的返回顺序决定；
+    用户与管理员都无法通过配置控制结果，报告也不会说明。这种不确定性不能留在执行
+    路径上：宁可明确拒绝并要求管理员保留一份可用身份，也不能假装选出了一个。
+    """
+    profiles = available_profiles(session, environment_id)
+    if not profiles:
+        return None
+    if len(profiles) > 1:
+        raise CredentialError(
+            CREDENTIAL_AMBIGUOUS,
+            f"该环境配置了 {len(profiles)} 份可用身份，本次发送无法确定使用哪一份。"
+            "请联系身份管理员只保留一份可用身份，停用多余身份后重试。",
+        )
+    return profiles[0]
+
+
 def _find_grant(
     session: Session,
     profile: CredentialProfile,
-    environment_id: uuid.UUID,
+    environment: Environment,
     principal_id: uuid.UUID,
     case_version_id: uuid.UUID | None,
     debug_snapshot_hash: str | None,
+    target_origin: str,
+    required_slots: set[str],
+    frozen_input_digest: str | None = None,
 ) -> CredentialUseGrant:
     """按运行的**目标类型**逐项匹配授权，不做“等于传入值”的宽松比较。
 
@@ -329,38 +382,158 @@ def _find_grant(
     NULL` 的已发布版本授权，等于让任意调试请求借用为固定版本签发的凭证；反过来
     缺少 grant_type 过滤，任意一条空摘要授权也能被命中。因此这里先按目标类型选
     分支，再在该分支内比较自己那一列。
+
+    **选择范围必须包含本次真正要用的目标与槽位。** 授权除了绑定内容，还可能把范围
+    收得比身份更窄（只允许某个目标、或只允许某几个槽位）。同一份内容先前签过一份
+    “只允许目标 A”的授权、后来又签了一份“只允许目标 B”的，若只看内容就任取一条，
+    可能取到根本不允许本次目标的那条：执行期才报目标不匹配，而预检按同一条规则算却
+    说“可以发送”——两边用的是同一次选择，错也错得一致，用户在点击后才发现。
+
+    匹配到多条时**先挑能用的那一条**，而不是让数据库任取：同一份内容可以被先后
+    授权多次，前一份用过之后管理员再签一份是正常操作；若取到已消费的那条，用户
+    看到的是“刚授权却仍报已使用”，换一份新授权也修不好。优先级为“在范围内、未消费、
+    未过期且输入匹配 > 在范围内、未消费、未过期（据此报输入问题）> 已过期 > 已消费”。
     """
+    conditions = _grant_target_conditions(debug_snapshot_hash, case_version_id)
+    candidates = list(
+        session.scalars(
+            select(CredentialUseGrant)
+            .where(
+                CredentialUseGrant.profile_id == profile.id,
+                CredentialUseGrant.environment_id == environment.id,
+                *conditions,
+                CredentialUseGrant.principal_id == principal_id,
+                CredentialUseGrant.status == "active",
+            )
+            .order_by(CredentialUseGrant.created_at.desc(), CredentialUseGrant.id.desc())
+        )
+    )
+    if not candidates:
+        raise CredentialError("credential_not_granted", "当前身份未获授权使用该环境的凭证。")
+
+    admitted = [grant for grant in candidates if _grant_admits(grant, target_origin, required_slots)]
+    if not admitted:
+        # 有授权，但没有一条覆盖本次目标或槽位：这是范围问题，不是“没授权”。报出具体
+        # 是哪一项被排除，管理员才知道该放宽哪条授权。
+        if any(
+            grant.allowed_targets and target_origin not in set(grant.allowed_targets)
+            for grant in candidates
+        ):
+            raise CredentialError(
+                "credential_target_mismatch", "凭证授权的允许目标不包含本次目标。"
+            )
+        raise CredentialError(
+            "credential_slot_not_allowed", "凭证授权未覆盖本次需要注入的认证槽位。"
+        )
+
     now = datetime.now(UTC)
+    usable = [
+        grant
+        for grant in admitted
+        if grant.used_at is None and (grant.expires_at is None or grant.expires_at > now)
+    ]
+    for grant in usable:
+        if _inputs_match(grant, frozen_input_digest, environment_input_digest(session, environment)):
+            return grant
+    if usable:
+        # 有尚未消费、尚未过期的授权，唯一的问题是输入绑定：交给唯一的输入校验入口
+        # 报出准确原因（未绑定／与冻结输入不符／与当前变量不符），这里不再判一次。
+        _require_bound_inputs(session, usable[0], environment, frozen_input_digest)
+    if any(grant.used_at is None for grant in admitted):
+        raise CredentialError("credential_grant_expired", "凭证用途授权已过期，请重新授权后再执行。")
+    raise CredentialError("credential_grant_used", "一次性凭证授权已使用，请重新授权后再执行。")
+
+
+def _grant_admits(
+    grant: CredentialUseGrant, target_origin: str, required_slots: set[str]
+) -> bool:
+    """这条授权的范围是否覆盖本次运行的目标与槽位。
+
+    空列表表示“不额外收窄”，跟随身份声明的范围，而不是“什么都不允许”：
+    授权记录里的空数组来自“签发时没有额外限制”，把它当成空集会让所有既有授权一夜
+    之间失效。
+    """
+    allowed_targets = set(grant.allowed_targets or [])
+    if allowed_targets and target_origin not in allowed_targets:
+        return False
+    allowed_slots = set(grant.allowed_auth_slots or [])
+    if allowed_slots and not required_slots <= allowed_slots:
+        return False
+    return True
+
+
+def set_auth_slots(session: Session, credential_set: CredentialSet) -> set[str]:
+    """一份凭证集合里实际会注入的槽位；空集合表示这次没有注入任何凭证。"""
+    return set(
+        session.scalars(
+            select(CredentialSetSecretVersion.auth_slot).where(
+                CredentialSetSecretVersion.credential_set_id == credential_set.id
+            )
+        )
+    )
+
+
+def _grant_target_conditions(
+    debug_snapshot_hash: str | None, case_version_id: uuid.UUID | None
+) -> tuple:
     if case_version_id is not None:
-        conditions = (
+        return (
             CredentialUseGrant.grant_type == "case_version",
             CredentialUseGrant.case_version_id == case_version_id,
         )
-    elif debug_snapshot_hash is not None:
-        conditions = (
+    if debug_snapshot_hash is not None:
+        return (
             CredentialUseGrant.grant_type == "debug_snapshot",
             CredentialUseGrant.debug_snapshot_hash == debug_snapshot_hash,
         )
-    else:
-        # 调试运行没有可核对的快照摘要（例如冻结摘要之前入队的旧记录）。这不能
-        # 退化成“匹配任意空摘要授权”，只能按未授权处理。
-        raise CredentialError(
-            "credential_not_granted", "本次运行没有可核对的凭证授权目标，已拒绝使用凭证。"
-        )
-    grant = session.scalar(
-        select(CredentialUseGrant).where(
-            CredentialUseGrant.profile_id == profile.id,
-            CredentialUseGrant.environment_id == environment_id,
-            *conditions,
-            CredentialUseGrant.principal_id == principal_id,
-            CredentialUseGrant.status == "active",
-        )
+    # 调试运行没有可核对的快照摘要（例如冻结摘要之前入队的旧记录）。这不能
+    # 退化成“匹配任意空摘要授权”，只能按未授权处理。
+    raise CredentialError(
+        "credential_not_granted", "本次运行没有可核对的凭证授权目标，已拒绝使用凭证。"
     )
-    if grant is None:
-        raise CredentialError("credential_not_granted", "当前身份未获授权使用该环境的凭证。")
-    if grant.expires_at is not None and grant.expires_at <= now:
-        raise CredentialError("credential_grant_expired", "凭证用途授权已过期。")
-    return grant
+
+
+def _inputs_match(
+    grant: CredentialUseGrant, frozen_input_digest: str | None, current_input_digest: str
+) -> bool:
+    """这条授权的输入绑定是否同时满足本次运行的冻结输入与当前生效输入。"""
+    if grant.input_digest is None or grant.input_digest != current_input_digest:
+        return False
+    return frozen_input_digest is None or grant.input_digest == frozen_input_digest
+
+
+def check_usable_grant(
+    session: Session,
+    profile: CredentialProfile,
+    environment: Environment,
+    *,
+    principal_id: uuid.UUID,
+    case_version_id: uuid.UUID | None,
+    debug_snapshot_hash: str | None,
+    target_origin: str,
+    required_slots: set[str],
+    frozen_input_digest: str | None = None,
+) -> CredentialUseGrant:
+    """只读判断本次主体是否有可用于该目标与槽位的授权。
+
+    发送前预检与执行期必须走同一条匹配规则，否则页面提示“可以发送”而真正发送时
+    被拒。这里**不消费授权、不解密秘密、不创建运行**，只是把 `_find_grant` 的选择
+    结论以只读方式暴露出来；结论只代表这一时刻的状态，不构成执行凭证。
+
+    目标与槽位必须由调用方传入，而且必须是**本次真正要用的**那一个：少了它们，
+    预检会选中一条实际不允许本次目标的授权并报“可以发送”，与实际执行不一致。
+    """
+    return _find_grant(
+        session,
+        profile,
+        environment,
+        principal_id,
+        case_version_id,
+        debug_snapshot_hash,
+        target_origin,
+        required_slots,
+        frozen_input_digest,
+    )
 
 
 def _require_bound_inputs(
@@ -504,31 +677,33 @@ def resolve_injection(
     target_origin: str,
     frozen_input_digest: str | None = None,
     lease_guard: LeaseGuard | None = None,
+    auth_required: bool = False,
 ) -> Injection:
     """按环境解析认证注入；没有配置身份时返回空注入，而不是报错。
 
     `frozen_input_digest` 是本次运行快照里那批变量的摘要（准备请求实际用的输入）。
     授权绑定校验以它为准，见 `_require_bound_inputs`。
+
+    `auth_required` 来自请求定义（导入时识别到认证头／Cookie）。为真表示这次请求
+    **必须**使用当前环境的登录态：没有可用身份时直接失败，绝不退回匿名发送。这个
+    约束随请求进入版本、调试摘要与运行快照，页面上的标记拦不住队列期间的配置变化，
+    真正的判据只能是这里。
     """
-    profile = session.scalar(
-        select(CredentialProfile).where(
-            CredentialProfile.environment_id == environment.id,
-            CredentialProfile.status == "available",
-        )
-    )
+    profile = resolve_environment_profile(session, environment.id)
     if profile is None:
+        if auth_required:
+            raise CredentialError(
+                CREDENTIAL_REQUIRED,
+                "本次请求要求使用当前环境的登录态，但该环境还没有可用身份。"
+                "请让身份管理员为当前环境配置身份并完成登录，或明确取消该请求的认证要求。",
+            )
         return Injection()
 
     if profile.allowed_targets and target_origin not in set(profile.allowed_targets):
         raise CredentialError("credential_target_mismatch", "该身份的允许目标不包含本次目标。")
 
-    grant = _find_grant(
-        session, profile, environment.id, principal_id, case_version_id, debug_snapshot_hash
-    )
-    _require_bound_inputs(session, grant, environment, frozen_input_digest)
-    if grant.allowed_targets and target_origin not in set(grant.allowed_targets):
-        raise CredentialError("credential_target_mismatch", "凭证授权的允许目标不包含本次目标。")
-
+    # 凭证集合先解析：它决定“本次实际会注入哪些槽位”，而槽位是选择授权时必须纳入的
+    # 条件之一。放在授权之前只是因为选择需要它，错误语义不变——集合不可用同样阻止执行。
     if profile.current_set_id is None:
         raise CredentialError("credential_unconfigured", "该身份尚未配置凭证集合。")
     credential_set = session.get(CredentialSet, profile.current_set_id)
@@ -537,6 +712,24 @@ def resolve_injection(
     now = datetime.now(UTC)
     if credential_set.expires_at is not None and credential_set.expires_at <= now:
         raise CredentialError("credential_expired", "当前凭证集合已过期，请更新。")
+
+    required_slots = set_auth_slots(session, credential_set)
+    grant = _find_grant(
+        session,
+        profile,
+        environment,
+        principal_id,
+        case_version_id,
+        debug_snapshot_hash,
+        target_origin,
+        required_slots,
+        frozen_input_digest,
+    )
+    _require_bound_inputs(session, grant, environment, frozen_input_digest)
+    # 选中之后再核对一次，与选择用的是同一组判据。选择负责“在多条有效授权里挑一条”，
+    # 这里负责“绝不带着超出范围的授权继续执行”：选择若被改坏，拦截仍然成立。
+    if grant.allowed_targets and target_origin not in set(grant.allowed_targets):
+        raise CredentialError("credential_target_mismatch", "凭证授权的允许目标不包含本次目标。")
 
     # 授权只能在身份声明范围内收窄，不能扩大。
     allowed_slots = set(profile.allowed_auth_slots or [])
@@ -555,6 +748,7 @@ def resolve_injection(
         profile_version_id=version.id if version is not None else None,
         credential_set_id=credential_set.id,
         credential_epoch=credential_set.epoch,
+        grant_id=grant.id,
     )
     bindings = session.scalars(
         select(CredentialSetSecretVersion).where(
@@ -595,8 +789,6 @@ def recheck_grant_authority(
     *,
     environment,
     principal_id: uuid.UUID,
-    case_version_id: uuid.UUID | None,
-    debug_snapshot_hash: str | None,
     target_origin: str,
     frozen_input_digest: str | None = None,
 ) -> None:
@@ -608,24 +800,35 @@ def recheck_grant_authority(
 
     `frozen_input_digest` 是运行快照里那批变量的摘要：绑定校验必须落在“本次真正会
     发送的输入”上，而不是碰巧等于签发值的当前变量。
+
+    复核落在**注入时选中的那一条授权**上（`injection.grant_id`），不重新挑一次。
+    同一份内容可以先后签发多份授权，重新挑选会落到另一条上——新签发的那条本来就没
+    被消费，复核当然通过，而真正被本次消费掉的那一条是否已被撤销、是否已过期就无人
+    检查。这条授权按设计在本次运行里已经消费，因此**只读复核，不看 used_at**，也不
+    再消费一次：重新消费会把同一份授权算两次，把还能用的授权判成已用。
     """
     if injection.profile_version_id is None:
         return
 
-    profile = session.scalar(
-        select(CredentialProfile).where(
-            CredentialProfile.environment_id == environment.id,
-            CredentialProfile.status == "available",
-        )
-    )
+    profile = resolve_environment_profile(session, environment.id)
     if profile is None:
         raise CredentialError("credential_unavailable", "身份配置已不可用，已阻止执行。")
     if profile.allowed_targets and target_origin not in set(profile.allowed_targets):
         raise CredentialError("credential_target_mismatch", "该身份的允许目标不包含本次目标。")
 
-    grant = _find_grant(
-        session, profile, environment.id, principal_id, case_version_id, debug_snapshot_hash
-    )
+    grant = session.get(CredentialUseGrant, injection.grant_id) if injection.grant_id else None
+    if (
+        grant is None
+        or grant.status != "active"
+        or grant.profile_id != profile.id
+        or grant.environment_id != environment.id
+        or grant.principal_id != principal_id
+    ):
+        raise CredentialError(
+            "credential_not_granted", "本次运行使用的凭证授权已失效，已阻止执行。"
+        )
+    if grant.expires_at is not None and grant.expires_at <= datetime.now(UTC):
+        raise CredentialError("credential_grant_expired", "凭证用途授权已过期，已阻止执行。")
     _require_bound_inputs(session, grant, environment, frozen_input_digest)
     if grant.allowed_targets and target_origin not in set(grant.allowed_targets):
         raise CredentialError("credential_target_mismatch", "凭证授权的允许目标不包含本次目标。")

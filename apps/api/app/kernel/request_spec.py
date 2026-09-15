@@ -157,7 +157,17 @@ def validate_request(spec: dict[str, Any]) -> dict[str, Any]:
     """校验并规范化请求定义；不接受绝对地址或未知字段。"""
     if not isinstance(spec, dict):
         raise RequestSpecError("请求定义必须是对象")
-    allowed = {"method", "path", "query_params", "headers", "body_type", "body", "imported_origin"}
+    allowed = {
+        "method",
+        "path",
+        "query_params",
+        "headers",
+        "body_type",
+        "body",
+        "imported_origin",
+        "auth_required",
+    }
+
     extra = set(spec) - allowed
     if extra:
         raise RequestSpecError(f"请求定义包含未知字段：{'、'.join(sorted(extra))}")
@@ -202,7 +212,30 @@ def validate_request(spec: dict[str, Any]) -> dict[str, Any]:
     imported = spec.get("imported_origin")
     if imported is not None:
         normalized["imported_origin"] = _text(imported, "imported_origin")
+    if _auth_required(spec) is True:
+        normalized["auth_required"] = True
     return normalized
+
+
+def _auth_required(spec: dict[str, Any]) -> bool:
+    """请求是否必须使用当前环境的登录态；**只接受真正的布尔值**。
+
+    缺省与 false 都表示沿用既有的“跟随环境”行为：环境配置了可用身份就注入，没有
+    就按公开请求发送。只有显式 true 才把“必须带身份”变成硬约束。
+
+    不能按 truthy 收下非布尔值：`"false"`、`"0"`、`0` 都是非空／非零的真值，把它们
+    当成 true 会让一份本该匿名可用的请求在没有任何可用身份时被拒绝，而用户写下的
+    内容明明是“不需要认证”。类型不符是配置错误，直接报出来。
+    """
+    value = spec.get("auth_required")
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise RequestSpecError(
+            "auth_required 只能是布尔值 true 或 false；不接受文本或数字，"
+            "以免把 \"false\" 这类真值当成需要认证。"
+        )
+    return value
 
 
 def _resolve_pairs(
