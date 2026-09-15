@@ -4,7 +4,7 @@
  * 范围（工作空间、项目、环境）只保存在组件状态里，任何一次范围切换都会清空
  * 下游选择，避免把上一个项目的用例或环境带到当前项目显示。
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type SyntheticEvent } from "react";
 
 import { ApiError, apiSend } from "./api/client";
 import type { SessionInfo } from "./api/types";
@@ -178,6 +178,34 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   /** 能不能建项目看工作空间角色：查看者连入口都不显示。 */
   const canCreateProject = canEdit(currentWorkspace?.role ?? null);
 
+  /**
+   * 打开侧栏的环境与凭证管理。
+   *
+   * 工作台的认证提示要能把用户送到真正能改配置的地方，否则“去配置凭证”只是一句
+   * 空话。这里滚动并聚焦侧栏里已经存在的面板——不新建第二套管理界面，也不隐藏原有
+   * 入口，整理布局不改变任何权限。
+   */
+  const [adminOpen, setAdminOpen] = useState(false);
+  const openAdminPanel = useCallback(() => {
+    // 先展开再滚动：折叠的 details 里滚动不到任何内容，点了“环境与凭证管理”却停在
+    // 一个空标题上，比没有入口更让人困惑。
+    setAdminOpen(true);
+    window.requestAnimationFrame(() => {
+      const panel = document.getElementById("admin-panel");
+      if (panel === null) return;
+      // `scrollIntoView` 不是所有宿主都实现（测试用的 jsdom、部分嵌入式 webview）。
+      // 缺失时跳过滚动但保留聚焦：入口的目的是“把用户送到那块配置上”，滚动只是手段，
+      // 不能因为手段不可用就让点击整个失败。
+      if (typeof panel.scrollIntoView === "function") {
+        panel.scrollIntoView({ block: "start" });
+      }
+      panel.focus();
+    });
+  }, []);
+  const onAdminToggle = useCallback((event: SyntheticEvent<HTMLDetailsElement>) => {
+    setAdminOpen((event.target as HTMLDetailsElement).open);
+  }, []);
+
   // 切换工作空间会作废项目及其下游选择；不保留上一个工作空间的 id。
   // 编辑器上报的当前用例也一并清空：编辑器卸载时会上报一次 null，但那时范围已经
   // 换成新的，晚到的上报会被范围守卫丢弃——留着它，新项目的凭证授权表单就会预选
@@ -210,11 +238,6 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   useEffect(() => {
     if (environmentId === null && environmentList.length > 0) setEnvironmentId(environmentList[0].id);
   }, [environmentList, environmentId]);
-
-  const selectedEnvironmentName = useMemo(
-    () => environmentList.find((item) => item.id === environmentId)?.name ?? null,
-    [environmentList, environmentId],
-  );
 
   const openCase = useCallback((caseId: string | null, folderId: string | null = null) => {
     setEditor((current) => ({ id: caseId, folderId, nonce: (current?.nonce ?? 0) + 1 }));
@@ -320,10 +343,46 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
     [scope],
   );
 
+  /**
+   * 执行配置时钟：环境、项目变量或身份配置**成功变更**时推进。
+   *
+   * 它回答的是“屏幕上的请求将以什么身份、发到哪里”——这三类修改都会改变结论，所以已经
+   * 算出的预检、以及基于旧配置的“当前通过”都要立即失效（R3 §3）。
+   *
+   * 时钟按**范围 + 主体**记账：切项目或换登录主体后是另一套配置，旧范围的完成回调不许
+   * 推进新范围的时钟（否则新范围会凭空作废一份刚算好的结论）。
+   *
+   * `ref` 与 `state` 表示同一个时钟：异步回调在 `await` 之后、下一次渲染之前就要能读到
+   * 已经成功提交的变化，只读 state 会读到旧值，于是失效来得比用户看到的晚一拍。
+   */
+  const configOwner = `${scope}/${session.user.user_id}`;
+  const configClock = useRef({ owner: configOwner, epoch: 0 });
+  if (configClock.current.owner !== configOwner) {
+    configClock.current = { owner: configOwner, epoch: 0 };
+  }
+  const [configStamp, setConfigStamp] = useState(configClock.current);
+  const configEpoch = configStamp.owner === configOwner ? configStamp.epoch : 0;
+
+  const onExecutionConfigChanged = useCallback(() => {
+    if (configClock.current.owner !== configOwner) return; // 旧范围的完成回调
+    const next = { owner: configOwner, epoch: configClock.current.epoch + 1 };
+    configClock.current = next;
+    setConfigStamp(next);
+  }, [configOwner]);
+
+  const getConfigEpoch = useCallback(
+    () => (configClock.current.owner === configOwner ? configClock.current.epoch : null),
+    [configOwner],
+  );
+
+  const reloadEnvironments = environments.reload;
   const onEnvironmentsChanged = useCallback(() => {
     if (liveScope.current !== scope) return;
-    void environments.reload();
-  }, [environments, scope]);
+    // 先失效，再重拉：等列表读回来才让旧结论过期，中间那段时间用户会看到基于旧配置的
+    // “可以发送／已通过”。
+    onExecutionConfigChanged();
+    reloadEnvironments();
+  }, [scope, onExecutionConfigChanged, reloadEnvironments]);
 
   /**
    * 目录被新建或归档后重拉目录清单。
@@ -474,9 +533,6 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
               {projectCreateOpen ? "收起新建项目" : "＋新建项目"}
             </button>
           ) : null}
-          <span className="current-env" aria-live="polite">
-            执行环境：{selectedEnvironmentName ?? "未选择"}
-          </span>
         </div>
 
         <div className="who">
@@ -535,19 +591,13 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
       ) : (
         <div className="workspace">
           <div className="sidebar">
-            {/* 环境编辑表单同样按范围重挂载，否则上一个项目的编辑草稿会留在新项目里。 */}
-            <EnvironmentPanel
-              key={`environment:${scope}`}
-              workspaceId={workspaceId}
-              projectId={projectId ?? ""}
-              environments={environmentList}
-              loading={environments.loading}
-              error={environments.error ? environments.error.message : null}
-              selectedId={environmentId}
-              onSelect={setEnvironmentId}
-              canEdit={canEdit(currentProject?.role ?? null)}
-              onChanged={onEnvironmentsChanged}
-            />
+            {/*
+              左侧以**目录与用例**为主：这是日常动线。环境、变量、执行池与凭证是配置
+              类操作，收进下面明确的次级入口，不再常驻占满侧栏——它们把用例列表挤到
+              需要滚动才能看见，而列表才是每次都要用的那一个。
+
+              全部原功能仍然可达（同一个组件、同一个权限判断），只是默认折叠。
+            */}
             {/*
               浏览器的目录范围同样是**这个范围的**状态：它的目录过滤与「＋新建用例」的
               归属都取自已选中的目录。不按范围重挂载，在 A 项目选了目录之后再切到 B，
@@ -568,20 +618,42 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
               onFoldersChanged={onFoldersChanged}
               refreshToken={caseRefresh}
             />
+
             {/*
               管理表单按范围重挂载：范围变了就是另一套资源，凭证表单里的秘密输入、
               变量草稿、白名单草稿都不能沿用上一个项目的状态——留着它，用户在 A 项目
               输入的秘密会显示在 B 项目，并且按 B 项目的路径提交出去。
             */}
-            <AdminPanel
-              key={`admin:${scope}`}
-              workspaceId={workspaceId}
-              projectId={projectId ?? ""}
-              role={currentProject?.role ?? null}
-              environments={environmentList}
-              currentUser={{ user_id: session.user.user_id, display_name: session.user.display_name }}
-              currentCase={editorVersion}
-            />
+            <details className="block sidebar-admin" open={adminOpen} onToggle={onAdminToggle}>
+              <summary>环境与凭证管理</summary>
+              {/* 环境编辑表单同样按范围重挂载，否则上一个项目的编辑草稿会留在新项目里。 */}
+              <EnvironmentPanel
+                key={`environment:${scope}`}
+                workspaceId={workspaceId}
+                projectId={projectId ?? ""}
+                environments={environmentList}
+                loading={environments.loading}
+                error={environments.error ? environments.error.message : null}
+                selectedId={environmentId}
+                onSelect={setEnvironmentId}
+                canEdit={canEdit(currentProject?.role ?? null)}
+                onChanged={onEnvironmentsChanged}
+              />
+              <AdminPanel
+                key={`admin:${scope}`}
+                onExecutionConfigChanged={onExecutionConfigChanged}
+                workspaceId={workspaceId}
+                projectId={projectId ?? ""}
+                role={currentProject?.role ?? null}
+                environments={environmentList}
+                currentUser={{
+                  user_id: session.user.user_id,
+                  display_name: session.user.display_name,
+                }}
+                currentCase={editorVersion}
+                anchorId="admin-panel"
+              />
+            </details>
           </div>
 
           <div className="main-pane">
@@ -603,6 +675,11 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
                 folders={folders.data ?? []}
                 foldersLoading={folders.loading}
                 initialFolderId={editor.folderId}
+                projectRole={currentProject?.role ?? null}
+                currentUserId={session.user.user_id}
+                onOpenAdmin={openAdminPanel}
+                configEpoch={configEpoch}
+                getConfigEpoch={getConfigEpoch}
               />
             )}
           </div>

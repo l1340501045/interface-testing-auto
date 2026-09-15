@@ -1,8 +1,14 @@
 /**
- * 用例编辑：请求编辑、字段断言、cURL 导入、保存与发布、发起执行。
+ * 用例编辑：请求编辑、字段断言、cURL 导入、保存与发布、调试发送与响应。
  *
  * 草稿保存在服务端并用 ETag 做乐观锁：他人已修改时提示刷新，不静默覆盖。
  * 只有保存成功后才允许发布；发布产生不可变版本，执行固定在该版本上。
+ *
+ * 调试与保存／发布是**两条分开的路**：地址行旁的「发送」提交当前编辑内容的临时快照，
+ * 不落用例、不产生版本，也不要求先保存；「保存并执行」仍是次级操作，固定已发布版本。
+ *
+ * 这个组件是**草稿与保存编排层**：请求工具栏、标签、响应、断言编辑与发送生命周期
+ * 都由独立组件／Hook 承担，这里只负责把它们接起来（design 第 5 节的组件边界）。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -21,20 +27,75 @@ import type {
 import { ErrorText, Hint, Loading, Notice } from "../components/Feedback";
 import { useLeaveReport } from "../hooks/leaveGuard";
 import { useResource } from "../hooks/useResource";
-import { AssertionColumn } from "./AssertionColumn";
-import { fieldAssertions, groupByField, removeAssertion, upsertAssertion } from "./assertionGroups";
-import { FieldTreePanel } from "./FieldTreePanel";
-import { BodyEditor, KeyValueRows, MethodAndPath } from "./RequestParts";
+import { ResponsePanel } from "../runs/ResponsePanel";
+import { AuthTab, SendBar, type SendStage } from "../runs/SendBar";
+import { isTerminal } from "../runs/useRuns";
+import { submissionKey, useDebugRun, type DebugSubmission } from "../runs/useDebugRun";
+import { AssertionTab } from "./AssertionTab";
+import { CurlImport } from "./CurlImport";
+import { CaseHeading } from "./CaseHeading";
+import { unknownFolderLabel } from "./folderLabels";
+import { BodyEditor, KeyValueRows } from "./RequestParts";
+import { RequestTabs } from "./RequestTabs";
 import { ResponseFieldPanel } from "./ResponseFieldPanel";
-import { RunPanel } from "../runs/RunPanel";
+import { RunPanel, type RunProvenance } from "../runs/RunPanel";
 import { emptyRequest, rawToSpec, requestToRaw, sameRequest, type RawRequest } from "./requestDraft";
 import { useFieldTree } from "./useFieldTree";
 
-/** 固定的响应断言行：状态码与耗时。 */
-const RESPONSE_FIELDS = [
-  { label: "状态码", target: "response.status" as const, selector: [], fieldType: "integer" },
-  { label: "耗时（毫秒）", target: "response.elapsed" as const, selector: [], fieldType: "integer" },
-];
+/** 正文类型的短标签，用在请求体标签上；不写“有”这种没有信息量的词。 */
+const BODY_TYPE_LABEL: Record<string, string> = {
+  json: "JSON",
+  text: "文本",
+  form: "表单",
+};
+
+/**
+ * 当前查看的运行：来源 + run_id。
+ *
+ * 同一个 run_id 在不同来源下代表不同的证据链（调试快照 vs 已发布版本），因此来源必须
+ * 与 id 一起记录，不能只记 id 再回头猜它属于哪一类。
+ */
+interface RunSelection {
+  /**
+   * 读取入口：本次调试记录，还是项目／环境历史。
+   *
+   * 按**入口**而不是按执行目标类型命名：历史列表里既可能有版本运行，也可能有别的
+   * 调试运行。真正的执行目标类型仍以 `report.run.target_type` 为准。
+   */
+  source: "debug" | "history";
+  runId: string;
+}
+
+/** 编辑实例标识：随机、与用例 id 无关，挂载时生成一次。 */
+function newEditorInstance(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** 与后端 `permissions.py` 的 `edit` 动作一致：管理员与编辑者可以改，查看者不行。 */
+function canEditRole(role: string): boolean {
+  return role === "admin" || role === "editor";
+}
+
+/**
+ * 断言标签上的提示。
+ *
+ * 只在“有需要注意的状态”时出现文字，不用颜色单独表达：认证缺配置不写出来，用户就
+ * 得逐个标签点开才发现，而发送失败时也说不清是内容问题还是凭证问题。
+ */
+function authBadge(
+  request: RawRequest,
+  preflight: { auth: { required: boolean; state: string } } | null,
+): string | null {
+  if (request.auth_required === true) return "必须认证";
+  if (preflight === null) return null;
+  if (preflight.auth.state === "needs_authorization") return "待授权";
+  if (preflight.auth.state === "ambiguous") return "身份歧义";
+  if (preflight.auth.state === "unavailable") return "身份不可用";
+  return null;
+}
 
 /** 新建用例尚未保存时的基线：只要用户动过任何一处，就算有未保存修改。 */
 const BLANK_DRAFT = {
@@ -42,19 +103,6 @@ const BLANK_DRAFT = {
   request: emptyRequest(),
   assertions: JSON.stringify([]),
 };
-
-/** 未分组在界面上的文案：它不是一个目录，而是“不属于任何目录”这个明确状态。 */
-const UNFILED_LABEL = "未分组";
-
-/**
- * 当前值指向的目录不在可选清单里时，选择器里那条占位选项的文案。
- *
- * 不能把这个状态显示成「未分组」：那等于在界面上宣布一个用户没做过的改动，
- * 用户一保存就真的被移出原目录。目录被归档、被删、或属于别的项目都会走到这里。
- */
-function unknownFolderLabel(folderId: string): string {
-  return `已失效或已归档的目录（${folderId.slice(0, 8)}…）`;
-}
 
 export function CaseEditor({
   workspaceId,
@@ -70,6 +118,11 @@ export function CaseEditor({
   folders = [],
   foldersLoading = false,
   initialFolderId = null,
+  projectRole = null,
+  currentUserId = null,
+  onOpenAdmin,
+  configEpoch = 0,
+  getConfigEpoch,
 }: {
   workspaceId: string;
   projectId: string;
@@ -101,6 +154,31 @@ export function CaseEditor({
   foldersLoading?: boolean;
   /** 新建用例时要落进的目录：从哪个目录点的「＋新建用例」就继承哪一个。 */
   initialFolderId?: string | null;
+  /**
+   * 当前项目内的角色。
+   *
+   * 只读角色（查看者）不获得新建、保存、授权或发送能力。前端据此收起入口并说明原因，
+   * 但它不是权限边界——服务端仍按角色独立拒绝；这里只是不让用户对着必然失败的按钮。
+   */
+  projectRole?: string | null;
+  /** 当前登录用户 id：就地授权要指定被授权人，只能是自己。 */
+  currentUserId?: string | null;
+  /** 打开侧栏的环境与凭证管理入口；界面整理不改变原有功能的可达性。 */
+  onOpenAdmin?: () => void;
+  /**
+   * 配置世代：环境、项目变量或身份配置成功变更时由外壳递增。
+   *
+   * 这些变更都会改变“这份内容将以什么身份、发到哪里”，因此已经算出的预检结论与正在
+   * 进行的发送都不再有效。只覆盖本页面能观察到的变更，不臆测外部改动。
+   */
+  configEpoch?: number;
+  /**
+   * 读取**当前**配置世代。
+   *
+   * 供异步回调在 `await` 之后、下一次渲染之前核对"配置是否已经被改过"。只读 props 里的
+   * `configEpoch` 会读到发起时的旧值，于是失效比用户看到的晚一拍。
+   */
+  getConfigEpoch?: () => number | null;
 }) {
   // 新建的用例在保存后才有 id。这里自己记住它，避免“创建成功但再保存又建一条”。
   const [currentId, setCurrentId] = useState<string | null>(caseSummaryId);
@@ -149,9 +227,6 @@ export function CaseEditor({
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [curlText, setCurlText] = useState("");
-  const [curlError, setCurlError] = useState<string | null>(null);
-  const [curlWarnings, setCurlWarnings] = useState<string[]>([]);
   const [versions, setVersions] = useState<CaseVersion[]>([]);
   /**
    * 版本列表的读取世代。
@@ -164,8 +239,55 @@ export function CaseEditor({
   const versionsEpochRef = useRef(0);
   /** 服务端算出的当前草稿快照摘要；“已发布版本是否仍代表屏幕内容”以它为准。 */
   const [draftSnapshotHash, setDraftSnapshotHash] = useState<string | null>(null);
-  const [report, setReport] = useState<RunReport | null>(null);
+  /** 已发布版本运行的报告；调试报告由 useDebugRun 持有。 */
+  const [versionReport, setVersionReport] = useState<RunReport | null>(null);
+  /**
+   * 当前查看的运行：**来源 + run_id**，正文、字段结论、断言与取消都由它驱动。
+   *
+   * 用一个显式选择而不是“最近到达的报告”：报告是异步到达的，任何一次迟到都可能把
+   * 界面从一种来源切到另一种，出现“正文是调试 B、字段区却是版本 A”这种自相矛盾的画面。
+   */
+  const [selection, setSelection] = useState<RunSelection | null>(null);
+  /**
+   * 版本运行的**执行配置依据**：受理那一刻的 run_id、环境与配置世代。
+   *
+   * 历史列表里的报告只能说明“这条运行跑过”，不能证明它按**当前**配置跑过。因此“当前
+   * 字段结论”必须要求这份依据存在且与当前配置一致；仅凭点选历史不能凭空造出它。
+   *
+   * 由 `onRunSubmitted`（真实受理）写入，`handleHistoryReport` 绝不写入——后者只知道
+   * “收到了一份旧报告”，不知道它当时用的是哪份配置。
+   */
+  const [versionProvenance, setVersionProvenance] = useState<{
+    runId: string;
+    environmentId: string | null;
+    configEpoch: number;
+  } | null>(null);
   const [creating, setCreating] = useState(false);
+  /** 请求标签；默认停在参数上，首屏即可看到地址、环境与发送。 */
+  const [activeTab, setActiveTab] = useState("params");
+  const [sendError, setSendError] = useState<string | null>(null);
+
+  /**
+   * 只读由**明确的角色**决定，不由“没传角色”推断。
+   *
+   * 缺省当成无权会让所有未传角色的调用方（测试、以及将来别的宿主）看到一个按钮齐全
+   * 却全部失效的界面，而真正该收起入口的是服务端已经判定为查看者的那一种。未知角色
+   * 不在这里收紧：权限判据在服务端，前端只能如实呈现它拿到的角色。
+   */
+  const readOnly = projectRole !== null && projectRole !== undefined && !canEditRole(projectRole);
+  const readOnlyReason = readOnly
+    ? "当前项目角色是查看者：可以查看请求、断言与历史报告，但不能新建、保存、授权或发送。"
+    : null;
+
+  /**
+   * 编辑实例标识：**挂载时生成一次**，切换用例由外壳按 nonce 重挂载来换值。
+   *
+   * 刻意不用 `currentId` 参与：新建用例首次保存会让它从 `null` 变成 id，但那是**同一次
+   * 编辑、同一份内容**——换标识会把本次调试历史与正在受理的运行一起清空，而用户什么都
+   * 没有切换。真正该失效的只有换用例／换项目／换主体／卸载。
+   */
+  const [editorKey] = useState(() => newEditorInstance());
+  const debugReadOnly = readOnly;
 
   /**
    * 刚刚由本页写入的那一份详情。
@@ -232,7 +354,8 @@ export function CaseEditor({
     setNotice(null);
     setError(null);
     setDraftSnapshotHash(data.snapshot_hash);
-    setReport(null);
+    setVersionReport(null);
+    setSelection(null);
   }, [effectiveDetail, currentId, detailKey, appliedStamp]);
 
   /**
@@ -357,9 +480,6 @@ export function CaseEditor({
       appliedStamp.key === detailKey &&
       appliedStamp.rev === effectiveDetail.rev);
 
-  // 上报离开状态：范围切换与关闭由外壳统一拦一次，避免每个入口各写一份判断。
-  useLeaveReport(`case:${workspaceId}/${projectId}/${currentId ?? "new"}`, { dirty, busy });
-
   /**
    * 屏幕上这条用例对应的已发布版本：摘要与服务端草稿摘要相同的那一版。
    *
@@ -404,47 +524,324 @@ export function CaseEditor({
   }, [currentId, currentVersionId, onCurrentVersion]);
 
   const bodyText = request.body_type === "json" ? request.body : "";
-  const bodyTree = useFieldTree(workspaceId, projectId, bodyText);
-
-  const groups = useMemo(() => groupByField(assertions), [assertions]);
+  // 请求正文树的来源标识就是正文本身：正文一变就是另一份数据。
+  const bodyTree = useFieldTree(workspaceId, projectId, bodyText, bodyText);
 
   /**
-   * 运行结果能不能贴回字段行。
+   * 当前表单对应的请求定义；不合法时给出原因而不抛到渲染里。
    *
-   * 结果按断言标识回填，而修改一条断言不会换标识：改完不重新执行，字段行旁边仍然挂着
-   * 上一轮的通过，用户会以为新条件也通过了。所以必须核对运行快照——本次运行的目标环境
-   * 就是当前环境，且它执行的版本快照与屏幕上这份内容一致。
+   * 发送与预检都必须基于**同一份**规范化结果：预检按它算摘要，发送按它提交快照，
+   * 两边各拼一次就会出现“预检说可以、发送说内容变了”。
+   */
+  const currentSpec = useMemo(() => {
+    try {
+      return { spec: rawToSpec(request), error: null as string | null };
+    } catch (cause) {
+      return {
+        spec: null,
+        error: cause instanceof Error ? cause.message : "请求定义不合法",
+      };
+    }
+  }, [request]);
+
+  const currentSubmission = useMemo<DebugSubmission | null>(() => {
+    if (selectedEnvironmentId === null || currentSpec.spec === null || debugReadOnly) return null;
+    return {
+      environmentId: selectedEnvironmentId,
+      request: currentSpec.spec,
+      assertions,
+    };
+  }, [selectedEnvironmentId, currentSpec.spec, assertions, debugReadOnly]);
+
+  /**
+   * 当前内容的稳定键。
    *
-   * 有未保存修改时（`dirty`）屏幕内容已经不等于那个摘要，一律按未执行处理。版本列表
-   * 还没加载出来时同样不猜：宁可让用户重新执行一次，也不能把别的条件的结论显示成
-   * 这条条件的结论。
+   * 它与预检结论记录的键同源（都是 `submissionKey`），因此“两个键相等”就等于“那份
+   * 结论针对的正是现在屏幕上这份内容”。用户改一个字符，这个键立即变化，旧结论当场失去
+   * 效力——不用等 400ms 防抖重检，也就不会读到一段假的“通过”。
+   */
+  const currentSnapshotKey = currentSubmission === null ? null : submissionKey(currentSubmission);
+
+  /**
+   * 受理一条运行成功时切到它的来源。
+   *
+   * 这是**允许改变查看选择**的两个事件之一（另一个是用户点选历史记录）。稳定引用：
+   * Hook 把它用在已发出的提交闭包里，每次渲染换新函数没有意义。
+   */
+  const onDebugRunAccepted = useCallback((runId: string) => {
+    setSelection({ source: "debug", runId });
+  }, []);
+
+  /**
+   * 一次发送的完整生命周期。
+   *
+   * 传入当前内容键：Hook 据此判断“预检结论／未提交操作是否还对应屏幕上的内容”，
+   * 因此内容一变旧提示当场失效，不用等防抖重检。
+   */
+  const debug = useDebugRun(
+    workspaceId,
+    projectId,
+    editorKey,
+    configEpoch,
+    currentUserId ?? "",
+    currentSnapshotKey,
+    onDebugRunAccepted,
+    getConfigEpoch,
+  );
+
+  // 上报离开状态：范围切换与关闭由外壳统一拦一次，避免每个入口各写一份判断。
+  // **未结束的调试操作同样计入 busy**：离开发送中的链路会让用户既看不到受理结果，也
+  // 不会知道它是否已经产生副作用；unknown 也属于未结束，不能因为阶段名里没有“运行”
+  // 就当成空闲。
+  useLeaveReport(`case:${workspaceId}/${projectId}/${editorKey}`, {
+    dirty,
+    busy: busy || debug.operationActive,
+  });
+
+  /**
+   * 内容或环境变化后自动预检一次（防抖）。
+   *
+   * 预检是只读的：不解密秘密、不消费授权、不创建运行。它存在的意义是让按钮旁边能写出
+   * “缺什么、该做什么”，而不是只给一个不可点击的按钮。真正发送时还会再检查一次，
+   * 因此这里的结论过期不会导致越权发送。
+   */
+  useEffect(() => {
+    if (currentSubmission === null) return;
+    const timer = window.setTimeout(() => {
+      void debug.runPreflight(currentSubmission);
+    }, 400);
+    return () => window.clearTimeout(timer);
+    // debug.runPreflight 是稳定回调；把它放进依赖会让每次渲染都重排一次防抖。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentSnapshotKey, editorKey, configEpoch]);
+
+  /**
+   * 发送当前编辑内容。
+   *
+   * 整条链（预检 → 可能的授权 → 提交受理）由 `debug.start` 按**一个**操作上下文管理：
+   * 内容在这里冻结，锁在点击的那一帧就锁住。因此双击不会建出两条链，授权期间的编辑也
+   * 不会改变已经提交的内容。
+   */
+  async function sendDebug() {
+    setSendError(null);
+    if (selectedEnvironmentId === null) {
+      setSendError("请先选择执行环境。");
+      return;
+    }
+    if (currentSubmission === null) {
+      setSendError(currentSpec.error ?? "请求定义不合法");
+      return;
+    }
+    const environment = environments.find((item) => item.id === selectedEnvironmentId) ?? null;
+    await debug.start(currentSubmission, environment?.name ?? selectedEnvironmentId);
+  }
+
+  /** 用户确认授权并发送；摘要与签发都由服务端完成，用户不接触内部摘要。 */
+  async function confirmAuthorization() {
+    setSendError(null);
+    await debug.confirmAuthorization();
+  }
+
+  /** 取消授权确认：只丢弃本地操作，不创建运行。 */
+  function cancelAuthorization() {
+    setSendError(null);
+    debug.cancelOperation();
+  }
+
+  /**
+   * 这份预检结论是不是针对**当前内容**算的。
+   *
+   * 编辑会让 `currentSnapshotKey` 立即变化，而 `debug.preflightFor` 仍是上一次预检的键，
+   * 两者不等即当场失效——不等防抖重检，也就不会在那 400ms 里把旧结论当成新内容的通过。
+   */
+  const preflightIsCurrent =
+    debug.preflightFor !== null && debug.preflightFor === currentSnapshotKey;
+
+  /**
+   * 当前查看的运行对应的报告。
+   *
+   * **只按 `(source, run_id)` 取**：先按当前选择的来源确定候选来源，再要求候选报告的
+   * `run.id` 与所选 id 完全一致。不匹配时返回 null——旧报告可以留在缓存里供以后查看，
+   * 但绝不作为当前正文、状态或终态判据。绕开这道校验的旁路（直接拿“最近一份报告”）
+   * 正是“正文显示调试 B、字段区却是版本 A”以及“r2 报告读失败却显示 r1 的 200”的来源。
+   */
+  const displayedReport: RunReport | null = useMemo(() => {
+    if (selection === null) return null;
+    const candidate = selection.source === "debug" ? debug.reports[selection.runId] : versionReport;
+    if (candidate === undefined || candidate === null) return null;
+    return candidate.run.id === selection.runId ? candidate : null;
+  }, [selection, debug.reports, versionReport]);
+
+  const displayedReportError =
+    selection === null
+      ? null
+      : selection.source === "debug"
+        ? debug.reportErrors[selection.runId] ?? null
+        : null;
+
+  /**
+   * 这份报告与当前编辑内容是否同源。
+   *
+   * 判据来自**服务端**：预检按当前内容算出 context，报告带着生成时冻结的 context。
+   * 两个标记相等，说明“这份报告就是按现在屏幕上这份内容产生的”。前端没有能力自己算这个
+   * 标记（也不该有——那会变成又一个可以离线比对的内容摘要入口）。
+   *
+   * 另外两项：报告必须属于当前选中的那条运行；调试运行还要求环境一致——切了环境之后旧
+   * 报告仍可查看，但不把它的通过贴到别的内容上。
+   */
+  /**
+   * 当前查看的那条调试运行**当时**提交到的环境。
+   *
+   * 按选择的 run_id 查，而不是读“活动运行”的登记：运行到达终态后活动锁会释放，
+   * 那时的活动运行是空的。用它做判据会让一份刚刚真正跑完、环境也没变的报告在结束的
+   * 瞬间被判成过期——而这与用户看到的事实相反。环境是**那条运行**的属性。
+   */
+  const selectedDebugRecord = useMemo(
+    () => debug.records.find((item) => item.runId === selection?.runId) ?? null,
+    [debug.records, selection],
+  );
+
+  const debugMatchesCurrent =
+    displayedReport !== null &&
+    selection?.source === "debug" &&
+    displayedReport.run.target_type === "debug_snapshot" &&
+    selectedDebugRecord?.environmentId === selectedEnvironmentId &&
+    displayedReport.context !== null &&
+    preflightIsCurrent &&
+    debug.preflight?.context != null &&
+    // 两个标记都要比：snapshot 覆盖请求与断言，input 覆盖普通变量；环境除了 id 还要比
+    // 地址——同一条环境记录被改了 base_url，运行就不再是打到同一个目标。
+    displayedReport.context.snapshot_fingerprint === debug.preflight.context.snapshot_fingerprint &&
+    displayedReport.context.input_fingerprint === debug.preflight.context.input_fingerprint &&
+    displayedReport.context.environment.id === debug.preflight.context.environment.id &&
+    displayedReport.context.environment.base_url === debug.preflight.context.environment.base_url;
+
+  /**
+   * 已发布版本运行的匹配判断。
+   *
+   * 要求：报告确实属于当前选择的那条运行、同环境、无未保存改动，且它执行的版本快照与
+   * 当前草稿摘要一致。名称与目录不属于执行内容，因此只改目录不会被算成“内容变了”。
    */
   const reportedVersion = useMemo(
-    () => versions.find((item) => item.id === report?.run.case_version_id) ?? null,
-    [versions, report],
+    () => versions.find((item) => item.id === versionReport?.run.case_version_id) ?? null,
+    [versions, versionReport],
   );
-  const resultsMatchRun =
-    report !== null &&
-    report.run.environment_id === selectedEnvironmentId &&
+  const versionProvenanceMatches =
+    versionProvenance !== null &&
+    versionProvenance.runId === displayedReport?.run.id &&
+    versionProvenance.environmentId === selectedEnvironmentId &&
+    // 配置世代一致：环境、项目变量或身份配置被改过之后，旧运行就不再能代表当前配置。
+    versionProvenance.configEpoch === configEpoch;
+
+  const versionRunMatches =
+    displayedReport !== null &&
+    selection?.source === "history" &&
+    displayedReport.run.target_type === "case_version" &&
+    displayedReport.run.environment_id === selectedEnvironmentId &&
+    versionProvenanceMatches &&
     !dirty &&
     draftSnapshotHash !== null &&
     reportedVersion !== null &&
     reportedVersion.snapshot_hash === draftSnapshotHash;
 
+  /**
+   * 项目／环境历史上报的运行报告。
+   *
+   * 它**只更新缓存**，不改变查看选择：选择只由显式事件驱动（受理成功、用户点选），因此
+   * 后台报告到达不会把界面从一种来源切到另一种。
+   *
+   * 两件事写在这里：
+   *
+   * 1. **稳定引用。** RunPanel 的上报 effect 依赖这个回调（见 `RunPanel` 的
+   *    `[report.data, onReport]`）；每次渲染换一个新函数会让它在上报条件成立时重新执行。
+   * 2. **更新必须幂等。** 值没变时必须原样返回 `current`：状态更新函数返回新对象会被 React
+   *    当作“有变化”，从而继续重渲染；若上报方在 effect 里依赖这次渲染的结果，就成了
+   *    “上报 → 新对象 → 重渲染 → 上报”的闭环，界面会卡死。
+   */
+  const handleHistoryReport = useCallback((next: RunReport) => {
+    setVersionReport(next);
+  }, []);
+
+  /**
+   * 捕获本次版本提交的执行配置依据。
+   *
+   * 由 RunPanel 在**发起 POST 之前**调用，因此读到的是“这次提交实际用的配置”。受理响应
+   * 要等一次网络往返，期间配置可能已被改（管理面板刚保存成功）：等响应回来再读时钟，就会
+   * 把一条按旧配置跑的运行记成按新配置跑的，旧结论于是又匹配上当前。
+   *
+   * 同步时钟不可用时返回 null——那说明范围已经失效，调用方据此不发起写请求。
+   *
+   * **两种“没有值”必须分开**：getter 不存在（外层没接时钟）时回退到 props 里的世代；
+   * getter 存在但返回 `null`（范围已失效）时必须**原样传出 null**。用 `?.() ?? configEpoch`
+   * 会把后者换成旧世代，于是一条已经失效的提交照样发出运行请求，并被登记成“当前配置的
+   * 依据”——正是这条分支要防的事。
+   */
+  const captureRunProvenance = useCallback((): RunProvenance | null => {
+    const epoch = getConfigEpoch === undefined ? configEpoch : getConfigEpoch();
+    if (epoch === null) return null;
+    if (selectedEnvironmentId === null) return null;
+    return { environmentId: selectedEnvironmentId, configEpoch: epoch };
+  }, [getConfigEpoch, configEpoch, selectedEnvironmentId]);
+
+  /**
+   * 版本运行被受理：原样登记提交前捕获的那份依据。
+   *
+   * **不在此刻读取时钟**：到这里时配置可能已经变了，而这次运行用的仍是提交时的配置。
+   */
+  const handleRunSubmitted = useCallback((runId: string, provenance: RunProvenance) => {
+    setVersionProvenance({ runId, ...provenance });
+  }, []);
+
+  /** 用户点选项目／环境历史里的某条运行：这是**显式**的来源切换。 */
+  const selectHistoryRun = useCallback((runId: string) => {
+    setSelection((current) =>
+      current !== null && current.source === "history" && current.runId === runId
+        ? current
+        : { source: "history", runId },
+    );
+  }, []);
+
+  /**
+   * 字段行旁的结论能不能贴回当前条件。
+   *
+   * 调试运行与版本运行走**两套**匹配判据，不能共用：调试没有 `case_version_id`，而
+   * “有未保存改动”恰恰是调试的常态——把调试也算进 `dirty` 判断，刚真跑通过的结果会
+   * 立刻被标成未执行；反过来直接去掉 `dirty` 判断，改一条断言就会借用旧通过。
+   */
+  const activeMatches = selection?.source === "history" ? versionRunMatches : debugMatchesCurrent;
+
+  /**
+   * 发送入口呈现哪个阶段。
+   *
+   * 由权威阶段推导。需要撤掉普通发送入口的是三个阶段：**等待授权确认**（改由确认面板
+   * 承担）、**受理结果不明**（只能确认旧受理）、以及**运行中**（锁要持有到该运行的终态，
+   * 否则排队期间又能用新键发一份新内容）。
+   */
+  const sendStage: SendStage =
+    debug.phase === "acceptance_unknown"
+      ? "acceptance_unknown"
+      : debug.phase === "awaiting_authorization"
+        ? "awaiting_authorization"
+        : debug.phase === "idle"
+          ? "idle"
+          : debug.phase === "running"
+            ? "running"
+            : "pending";
+
   const results = useMemo(() => {
     const map = new Map<string, AssertionResult>();
-    for (const item of report?.assertions ?? []) {
+    for (const item of displayedReport?.assertions ?? []) {
       // 与本次执行对不上的旧结论统一标成未执行，并且不保留期望／实际：那是上一轮的
-      // 取值，不是当前条件的证据。原始报告仍在“执行与历史”里完整可查。
+      // 取值，不是当前条件的证据。原始报告仍在“本次记录”与“项目／环境历史”里完整可查。
       map.set(
         item.assertion_id,
-        resultsMatchRun
+        activeMatches
           ? item
           : { ...item, status: "skipped", expected: null, actual: null, reason_code: "stale_run" },
       );
     }
     return map;
-  }, [report, resultsMatchRun]);
+  }, [displayedReport, activeMatches]);
 
   async function save(): Promise<CaseDetail | null> {
     setError(null);
@@ -627,32 +1024,41 @@ export function CaseEditor({
     }
   }
 
-  async function importCurl() {
-    setCurlError(null);
-    setCurlWarnings([]);
-    if (!curlText.trim()) {
-      setCurlError("请先粘贴 cURL 命令文本。");
-      return;
+  /**
+   * 解析一条 cURL 并填入编辑器。
+   *
+   * 返回错误与警告给导入组件自己展示：它就在工具栏里，就地给出反馈比让用户去别处找
+   * 提示更直接。**不发送任何被测请求**，也不在失败时改动草稿（INV-06）。
+   */
+  async function importCurl(text: string): Promise<{ error: string | null; warnings: string[] }> {
+    if (!text.trim()) {
+      return { error: "请先粘贴 cURL 命令文本。", warnings: [] };
     }
     setBusy(true);
     try {
       const preview = await apiSend(
         projectPath(workspaceId, projectId, "/imports/curl/preview"),
         "POST",
-        { text: curlText },
+        { text },
         toCurlPreview,
       );
       if (!preview.sendable) {
         // 无法保证等价导入的命令不写入草稿，避免产生一条看起来能发送的错误请求。
-        setCurlError("这条命令含有暂不支持的能力，已拒绝导入；请手工编辑请求。");
-        setCurlWarnings([...preview.warnings, ...preview.unsupported]);
-        return;
+        return {
+          error: "这条命令含有暂不支持的能力，已拒绝导入；请手工编辑请求。",
+          warnings: [...preview.warnings, ...preview.unsupported],
+        };
       }
-      setRequest((current) => ({ ...requestToRaw(preview.draft), method: preview.draft.method || current.method }));
-      setCurlWarnings(preview.warnings);
-      setNotice("已导入到编辑器；导入过程不访问目标，也未执行任何命令。");
+      setRequest((current) => ({
+        ...requestToRaw(preview.draft),
+        method: preview.draft.method || current.method,
+      }));
+      return { error: null, warnings: preview.warnings };
     } catch (cause) {
-      setCurlError(cause instanceof Error ? cause.message : "导入失败");
+      return {
+        error: cause instanceof Error ? cause.message : "导入失败",
+        warnings: [],
+      };
     } finally {
       setBusy(false);
     }
@@ -681,56 +1087,27 @@ export function CaseEditor({
   }
 
   return (
-    <section className="pane">
-      <header className="pane-head">
-        <span className="param grow">
-          <label htmlFor="case-name">用例名称</label>
-          <input id="case-name" value={name} onChange={(event) => setName(event.target.value)} />
-        </span>
-        <span className="param">
-          <label htmlFor="case-folder">所属目录</label>
-          {/*
-            按**名称**选择，不让用户去填目录 UUID：目录清单与左侧目录树是同一份，
-            选项里不会出现别的项目或已归档的目录，跨项目目录因此还有后端那一层拒绝兜底。
-          */}
-          <select
-            id="case-folder"
-            value={folderId ?? ""}
-            onChange={(event) => setFolderId(event.target.value === "" ? null : event.target.value)}
-          >
-            <option value="">{UNFILED_LABEL}</option>
-            {/*
-              当前归属不在可选清单里时补一条占位选项，只为把真实状态显示出来。
-              没有它，`value` 匹配不到任何选项，浏览器会显示第一项「未分组」——正好是
-              这个改动最不该造成的误解：用户没动过目录，界面却看起来已经改成未分组了。
-            */}
-            {folderUnavailable && folderId !== null ? (
-              <option value={folderId}>{unknownFolderLabel(folderId)}</option>
-            ) : null}
-            {folders.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.name}
-              </option>
-            ))}
-          </select>
-        </span>
-        <span className="param">
-          <label htmlFor="case-environment">执行环境</label>
-          <select
-            id="case-environment"
-            value={selectedEnvironmentId ?? ""}
-            onChange={(event) => onSelectEnvironment(event.target.value)}
-          >
-            <option value="">请选择环境</option>
-            {environments.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.name}（{item.kind === "production" ? "生产" : "测试"}）
-              </option>
-            ))}
-          </select>
-        </span>
-        {dirty ? <span className="tag tag-warn">有未保存修改</span> : null}
-      </header>
+    <section className="pane workbench">
+      <CaseHeading
+        name={name}
+        onNameChange={setName}
+        folderId={folderId}
+        onFolderChange={setFolderId}
+        folders={folders}
+        folderUnavailable={folderUnavailable}
+        folderPlaceholder={
+          foldersLoading ? "正在加载目录…" : unknownFolderLabel(folderId ?? "")
+        }
+        dirty={dirty}
+        busy={busy}
+        readOnly={readOnly}
+        creating={creating}
+        isNew={currentId === null}
+        versionCount={versions.length}
+        onSave={() => void save()}
+        onPublish={() => void saveThenPublish()}
+        onClose={onClose}
+      />
 
       {folderUnavailable ? (
         <Hint>
@@ -742,145 +1119,244 @@ export function CaseEditor({
       {notice ? <Notice tone="info" title={notice} /> : null}
       {error ? <ErrorText message={error} /> : null}
 
-      <details className="block">
-        <summary>导入 cURL（只解析文本，不发送请求）</summary>
-        <textarea
-          rows={3}
-          value={curlText}
-          placeholder="curl -X POST 'https://example.test/orders?tag=a&tag=b' -H 'Content-Type: application/json' -d '{...}'"
-          onChange={(event) => setCurlText(event.target.value)}
-        />
-        <div className="actions">
-          <button type="button" onClick={() => void importCurl()} disabled={busy}>
-            解析并填入编辑器
-          </button>
-        </div>
-        {curlError ? <ErrorText message={curlError} /> : null}
-        {curlWarnings.length > 0 ? (
-          <ul className="caption">
-            {curlWarnings.map((item) => (
-              <li key={item}>{item}</li>
-            ))}
-          </ul>
-        ) : null}
-      </details>
+      {/*
+        地址行：唯一一组方法／路径／环境输入，加上常驻的蓝色「发送」。
+        首屏第一眼就能找到它——这是本轮的核心改动，不再藏在长表单底部。
+      */}
+      <SendBar
+        request={request}
+        environments={environments}
+        selectedEnvironmentId={selectedEnvironmentId}
+        onSelectEnvironment={onSelectEnvironment}
+        onPatch={patchRequest}
+        onSend={() => void sendDebug()}
+        onStopWaiting={debug.stopWaiting}
+        onRetryAcceptance={() => void debug.retryAcceptance()}
+        onResumeWaiting={debug.resumeWaiting}
+        paused={debug.paused}
+        stage={sendStage}
+        readOnly={readOnly}
+        readOnlyReason={readOnlyReason}
+        preflight={debug.preflight}
+        preflightError={debug.preflightError}
+        preflighting={debug.preflighting}
+        onOpenAdmin={() => onOpenAdmin?.()}
+        canAuthorize={debug.preflight?.can_authorize ?? false}
+        onSubmitAuthorization={() => void confirmAuthorization()}
+        onCancelAuthorization={cancelAuthorization}
+        tools={<CurlImport onImport={importCurl} disabled={readOnly} loading={busy} />}
+        authorization={debug.authorizationView}
+      />
+      {sendError ? <ErrorText message={sendError} /> : null}
+      {debug.error ? <ErrorText message={debug.error} /> : null}
+      {debug.notice ? <Notice tone="info" title={debug.notice} /> : null}
 
       <div className="block">
-        <h2>请求</h2>
-        <MethodAndPath request={request} readOnly={false} onChange={patchRequest} />
-        {request.imported_origin ? (
-          <Hint>
-            导入来源为 {request.imported_origin}，但实际目标由所选环境决定；请确认环境地址与预期一致。
-          </Hint>
-        ) : null}
-        <div className="split">
-          <div>
-            <h3>查询参数（可重复）</h3>
-            <KeyValueRows
-              rows={request.query_params}
-              label="查询参数"
-              addLabel="＋添加查询参数"
-              readOnly={false}
-              onChange={(rows) => patchRequest({ query_params: rows })}
-            />
-            <h3>请求头（可重复）</h3>
-            <KeyValueRows
-              rows={request.headers}
-              label="请求头"
-              addLabel="＋添加请求头"
-              readOnly={false}
-              onChange={(rows) => patchRequest({ headers: rows })}
-            />
-          </div>
-          <div>
-            <h3>正文</h3>
-            <BodyEditor request={request} readOnly={false} onChange={(body) => patchRequest({ body })} />
-          </div>
-        </div>
+        {/*
+          标签只切换可见性，不卸载面板：切走再回来时输入框、光标与未提交的编辑都还在。
+          断言、样例与预期字段都在标签内，不再常驻在请求区外面把响应挤到首屏之外。
+        */}
+        <RequestTabs
+          activeId={activeTab}
+          onChange={setActiveTab}
+          tabs={[
+            {
+              id: "params",
+              label: "参数",
+              summary: request.query_params.filter((row) => row.name.trim()).length || null,
+              content: (
+                <>
+                  <h3>查询参数（可重复）</h3>
+                  <p className="caption">重复键按原样保留顺序与出现次数。</p>
+                  <KeyValueRows
+                    rows={request.query_params}
+                    label="查询参数"
+                    addLabel="＋添加查询参数"
+                    readOnly={readOnly}
+                    onChange={(rows) => patchRequest({ query_params: rows })}
+                  />
+                </>
+              ),
+            },
+            {
+              id: "auth",
+              label: "认证",
+              badge: authBadge(request, debug.preflight),
+              content: (
+                <AuthTab
+                  preflight={debug.preflight}
+                  preflightError={debug.preflightError}
+                  environmentName={
+                    environments.find((item) => item.id === selectedEnvironmentId)?.name ?? null
+                  }
+                  authRequired={request.auth_required === true}
+                  readOnly={readOnly}
+                  onToggleRequired={(next) => patchRequest({ auth_required: next ? true : undefined })}
+                  onOpenAdmin={() => onOpenAdmin?.()}
+                />
+              ),
+            },
+            {
+              id: "headers",
+              label: "请求头",
+              summary: request.headers.filter((row) => row.name.trim()).length || null,
+              content: (
+                <>
+                  <h3>请求头（可重复）</h3>
+                  <p className="caption">
+                    认证头请通过环境的身份配置注入，不要写在这里：写在请求头里的凭证会被
+                    当作普通内容保存与展示。
+                  </p>
+                  <KeyValueRows
+                    rows={request.headers}
+                    label="请求头"
+                    addLabel="＋添加请求头"
+                    readOnly={readOnly}
+                    onChange={(rows) => patchRequest({ headers: rows })}
+                  />
+                </>
+              ),
+            },
+            {
+              id: "body",
+              label: "请求体",
+              badge: request.body_type === "none" ? null : BODY_TYPE_LABEL[request.body_type],
+              content: (
+                <>
+                  <BodyEditor
+                    request={request}
+                    readOnly={readOnly}
+                    onChange={(body) => patchRequest({ body })}
+                    onTypeChange={(body_type) => patchRequest({ body_type })}
+                  />
+                  <p className="caption">正文字段断言在「断言」标签里按字段配置。</p>
+                </>
+              ),
+            },
+            {
+              id: "assertions",
+              label: "断言",
+              summary: assertions.length || null,
+              content: (
+                <AssertionTab
+                  workspaceId={workspaceId}
+                  projectId={projectId}
+                  types={types.data ?? []}
+                  typesError={types.error ? types.error.message : null}
+                  assertions={assertions}
+                  results={results}
+                  readOnly={readOnly}
+                  onChange={setAssertions}
+                  bodyTree={bodyTree}
+                  bodySourceKey={bodyText}
+                  bodyHint={
+                    request.body_type === "json"
+                      ? "正文为空或不是合法 JSON，暂时无法展开字段。"
+                      : "选择 JSON 正文类型后，可在这里按字段配置断言。"
+                  }
+                />
+              ),
+            },
+          ]}
+        />
       </div>
 
-      {report && !resultsMatchRun ? (
+      {/*
+        只在**确有终态结果**且与当前输入不同源时提示“字段行标为未执行”。
+        排队中的运行还没有结论：那时说“字段行旁显示的是最近一次运行的结论”是一句空话，
+        真实情况是“还没有可展示的结果”。来源未确定不等于已有旧结果。
+      */}
+      {displayedReport !== null && isTerminal(displayedReport.run) && !activeMatches ? (
         <Hint>
           字段行旁显示的是最近一次运行的结论，但当前内容或执行环境已与那次运行不同，因此统一标为“未执行”；
-          那次运行的完整报告仍在下方“执行与历史”里。
+          那次运行的完整报告仍在下方“本次记录”与“项目／环境历史”里。
         </Hint>
       ) : null}
 
-      <div className="block">
-        <h2>固定响应断言</h2>
-        <p className="caption">状态码与耗时无需样例即可配置，执行时按本次响应核对。</p>
-        {RESPONSE_FIELDS.map((field) => (
-          <div className="response-field" key={field.target}>
-            <div className="response-field-head">
-              <strong>{field.label}</strong>
-              <span className="field-type">{field.fieldType}</span>
-            </div>
-            <AssertionColumn
-              types={types.data ?? []}
-              typesError={types.error ? types.error.message : null}
-              workspaceId={workspaceId}
-              projectId={projectId}
-              field={{ targetSource: field.target, selector: field.selector, fieldType: field.fieldType }}
-              own={fieldAssertions(groups, field.target, field.selector)}
-              sample={null}
-              results={results}
-              readOnly={false}
-              onUpsert={(next) => setAssertions(upsertAssertion(assertions, next))}
-              onRemove={(id) => setAssertions(removeAssertion(assertions, id))}
-            />
-          </div>
-        ))}
-      </div>
-
-      <ResponseFieldPanel
-        workspaceId={workspaceId}
-        projectId={projectId}
-        report={report}
-        types={types.data ?? []}
-        typesError={types.error ? types.error.message : null}
-        assertions={assertions}
-        results={results}
-        readOnly={false}
-        onChange={setAssertions}
+      {/*
+        响应区紧跟在请求区下方：标题常驻，1366×768 首屏即可看到。出参样例与预期字段
+        随响应一起，因为它们要对着**本次真实响应**配置。
+      */}
+      <ResponsePanel
+        report={displayedReport}
+        reportError={displayedReportError}
+        loading={debug.phase === "submitting"}
+        matchesCurrent={activeMatches}
+        selectedRunId={selection?.runId ?? null}
+        onCancel={(runId) => void debug.cancel(runId)}
+        canCancel={!readOnly}
+        fieldsTab={
+          <ResponseFieldPanel
+            workspaceId={workspaceId}
+            projectId={projectId}
+            report={displayedReport}
+            types={types.data ?? []}
+            typesError={types.error ? types.error.message : null}
+            assertions={assertions}
+            results={results}
+            readOnly={readOnly}
+            onChange={setAssertions}
+          />
+        }
       />
 
-      <div className="block">
-        <h2>请求字段断言</h2>
-        <p className="caption">发送前检查；失败时不会发出 HTTP 请求。</p>
-        <FieldTreePanel
-          title="请求正文字段"
-          tree={bodyTree}
-          targetSource="request.body"
-          types={types.data ?? []}
-          typesError={types.error ? types.error.message : null}
+      <details className="block">
+        <summary>
+          本次记录{debug.records.length > 0 ? `（${debug.records.length}）` : ""}
+        </summary>
+        <p className="caption">
+          只列<strong>本次打开这个编辑器</strong>期间受理的运行。关闭或刷新后，请到下面的
+          “项目／环境历史”里按项目／环境查看。
+        </p>
+        {debug.records.length === 0 ? (
+          <Hint>还没有本次调试记录。点击地址行右侧的「发送」即可调试当前编辑内容。</Hint>
+        ) : (
+          <ul className="record-list">
+            {debug.records.map((item) => (
+              <li key={item.runId}>
+                <button
+                  type="button"
+                  className={item.runId === debug.selectedRunId ? "row-active" : undefined}
+                  onClick={() => setSelection({ source: "debug", runId: item.runId })}
+                >
+                  {item.runId.slice(0, 8)}
+                </button>
+                <span className="caption">
+                  {new Date(item.submittedAt).toLocaleTimeString()} · 环境{" "}
+                  {environments.find((env) => env.id === item.environmentId)?.name ??
+                    item.environmentId.slice(0, 8)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </details>
+
+
+      {/*
+        已发布版本的执行与项目／环境历史。它是次级操作：这里的「保存并执行」会先按
+        ETag 保存、再固定一个已发布版本，与上面的调试发送不是同一条路。保留原有用例
+        执行的既有约束（必须有版本、必须先保存）不变。
+      */}
+      <details className="block">
+        <summary>项目／环境历史与版本执行</summary>
+        <RunPanel
           workspaceId={workspaceId}
           projectId={projectId}
-          assertions={assertions}
-          results={results}
-          readOnly={false}
-          onChange={setAssertions}
-          emptyHint={
-            request.body_type === "json"
-              ? "正文为空或不是合法 JSON，暂时无法展开字段。"
-              : "选择 JSON 正文类型后，可在这里按字段配置断言。"
-          }
+          environmentId={selectedEnvironmentId}
+          caseId={currentId}
+          needsVersion={mustEnsureVersion}
+          publishedVersion={matchingVersion}
+          onEnsureVersion={saveThenPublish}
+          selectedRunId={selection?.source === "history" ? selection.runId : null}
+          onSelectRun={selectHistoryRun}
+          onReport={handleHistoryReport}
+          onRunSubmitted={handleRunSubmitted}
+          captureProvenance={captureRunProvenance}
+          canCancel={!readOnly}
+          readOnly={readOnly}
         />
-      </div>
-
-      <div className="block">
-        <h2>保存与发布</h2>
-        <div className="actions">
-          <button type="button" onClick={() => void save()} disabled={busy}>
-            {busy ? "处理中…" : currentId === null ? "创建用例" : "保存草稿"}
-          </button>
-          <button type="button" onClick={() => void saveThenPublish()} disabled={busy}>
-            保存并发布
-          </button>
-          <button type="button" onClick={onClose}>
-            关闭
-          </button>
-        </div>
-        {creating ? <Hint>用例已创建；列表稍后会刷新，可继续编辑或发布。</Hint> : null}
+        <h3>已发布版本</h3>
         {versions.length > 0 ? (
           <ul className="caption">
             {versions.map((item) => (
@@ -892,18 +1368,8 @@ export function CaseEditor({
         ) : (
           <Hint>尚未发布任何版本。</Hint>
         )}
-      </div>
-
-      <RunPanel
-        workspaceId={workspaceId}
-        projectId={projectId}
-        environmentId={selectedEnvironmentId}
-        caseId={currentId}
-        needsVersion={mustEnsureVersion}
-        publishedVersion={matchingVersion}
-        onEnsureVersion={saveThenPublish}
-        onReport={setReport}
-      />
+        {creating ? <Hint>用例已创建；列表稍后会刷新，可继续编辑或发布。</Hint> : null}
+      </details>
     </section>
   );
 }

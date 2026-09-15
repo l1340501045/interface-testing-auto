@@ -1,0 +1,350 @@
+/**
+ * 执行配置变更的真实失效链（R3 §3／R3-06～09）。
+ *
+ * 这里走**真实 App**：真实外壳 → 真实 EnvironmentPanel／VariablesPanel／CredentialsPanel
+ * → 真实 CaseEditor。没有替身参与通知链，也不注入 `configEpoch` ——那只能证明“传进去会
+ * 失效”，证明不了“管理面板保存成功后确实会传进去”。R2 的问题正是后者：props 有了，App
+ * 没接。
+ *
+ * 断言的是**可观察结果**：在管理面板里保存成功后，工作台里基于旧配置的预检提示与“当前
+ * 通过”立即失效（不等列表刷新回来）。同时验证反向：读取列表、保存失败都**不**推进时钟，
+ * 否则界面会无端作废一份刚算好的结论。
+ */
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const WORKSPACE_ID = "11111111-1111-4111-8111-111111111111";
+const PROJECT_ID = "22222222-2222-4222-8222-222222222222";
+const CASE_ID = "44444444-4444-4444-8444-444444444444";
+const ENV_ID = "55555555-5555-4555-8555-555555555555";
+const RUN_ID = "77777777-7777-4777-8777-777777777777";
+const USER_ID = "99999999-9999-4999-8999-999999999999";
+
+vi.mock("./session/useSession", () => ({
+  useSession: () => ({
+    session: {
+      user: { user_id: USER_ID, username: "tester", display_name: "测试员", is_admin: true },
+      workspaces: [{ id: WORKSPACE_ID, name: "默认工作空间", role: "admin" }],
+    },
+    loading: false,
+    error: null,
+    expired: false,
+    login: vi.fn(),
+    logout: vi.fn(),
+  }),
+}));
+
+vi.mock("./api/client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./api/client")>();
+  return {
+    ...actual,
+    apiGet: vi.fn(),
+    apiSend: vi.fn(),
+    apiSendWithMeta: vi.fn(),
+    apiDelete: vi.fn(),
+  };
+});
+
+import { apiDelete, apiGet, apiSend, apiSendWithMeta } from "./api/client";
+import { App } from "./App";
+
+const apiGetMock = vi.mocked(apiGet);
+const apiSendMock = vi.mocked(apiSend);
+const apiSendWithMetaMock = vi.mocked(apiSendWithMeta);
+void vi.mocked(apiDelete);
+
+interface Call {
+  method: string;
+  path: string;
+  body: unknown;
+}
+
+let calls: Call[] = [];
+/** 环境替身：base_url 保存后被替换，后续预检按**当前**环境返回结论。 */
+function makeEnvironment(baseUrl: string) {
+  return {
+    id: ENV_ID,
+    name: "测试环境",
+    kind: "test",
+    base_url: baseUrl,
+    pool_id: null,
+    variables: {},
+    status: "active",
+  };
+}
+let environment = makeEnvironment("http://echo.test");
+let projectVariables = { version: 1, variables: [] as { name: string; value: unknown }[] };
+/**
+ * 管理**写请求**是否失败：用于验证“失败不推进时钟”。
+ *
+ * 只作用于管理面板的写（PATCH 环境／PUT 变量）。预检是只读的，不受它影响——让预检也
+ * 失败会把“配置变更未推进时钟”与“结论因为缺少预检而失效”两件事混在一起。
+ */
+let failWrites = false;
+
+const BASE = `/api/v1/workspaces/${WORKSPACE_ID}/projects/${PROJECT_ID}`;
+
+const CASE_DETAIL = {
+  id: CASE_ID,
+  folder_id: null,
+  name: "查询订单",
+  request: {
+    method: "GET",
+    path: "/echo",
+    query_params: [],
+    headers: [],
+    body_type: "none" as const,
+    body: "",
+  },
+  assertions: [],
+  rev: 3,
+  status: "draft",
+  latest_version: null,
+  updated_at: "2026-09-15T00:00:00Z",
+  snapshot_hash: "hash-draft",
+};
+
+const PREFLIGHT_READY = {
+  ready: true,
+  issues: [],
+  can_authorize: true,
+  auth: { required: false, state: "none", profile_id: null },
+  context: {
+    snapshot_fingerprint: "fp-1",
+    environment: { id: ENV_ID, name: "测试环境", kind: "test", base_url: "http://echo.test" },
+    input_fingerprint: "in-1",
+  },
+};
+
+const RUN_REPORT = {
+  run: {
+    id: RUN_ID,
+    target_type: "debug_snapshot",
+    case_version_id: null,
+    environment_id: ENV_ID,
+    state: "finished",
+    outcome: "passed",
+    reason_category: null,
+    pool_id: null,
+    created_at: "2026-09-15T00:00:00Z",
+  },
+  steps: [],
+  assertions: [],
+  request: null,
+  response: {
+    status: 200,
+    elapsed_ms: 5,
+    headers: [],
+    body: '{"ok":true}',
+    body_format: "json",
+    body_truncated: false,
+    body_omitted_reason: null,
+    size_bytes: 11,
+  },
+  context: {
+    snapshot_fingerprint: "fp-1",
+    environment: { id: ENV_ID, name: "测试环境", kind: "test", base_url: "http://echo.test" },
+    input_fingerprint: "in-1",
+  },
+};
+
+/** 去掉查询串：列表接口会带筛选参数，路由按基础路径匹配。 */
+function basePath(path: string): string {
+  const index = path.indexOf("?");
+  return index < 0 ? path : path.slice(0, index);
+}
+
+function route(rawPath: string, method: string, body?: unknown): unknown {
+  const path = basePath(rawPath);
+  calls.push({ method, path, body });
+  if (method === "GET" && path.endsWith("/projects")) {
+    return [
+      {
+        id: PROJECT_ID,
+        workspace_id: WORKSPACE_ID,
+        key: "alpha",
+        name: "项目甲",
+        status: "active",
+        role: "admin",
+        pool_id: null,
+      },
+    ];
+  }
+  if (method === "GET" && path.endsWith("/environments")) return [environment];
+  if (method === "GET" && path.endsWith("/folders")) return [];
+  if (method === "GET" && path.endsWith("/cases")) {
+    return [
+      { id: CASE_ID, folder_id: null, name: "查询订单", method: "GET", status: "draft", rev: 3, latest_version: null },
+    ];
+  }
+  if (method === "GET" && path.endsWith("/assertion-types")) return [];
+  if (method === "GET" && path.endsWith("/variables")) return projectVariables;
+  if (method === "GET" && path.includes("/credentials/")) return [];
+  if (method === "GET" && path.includes("/pools")) return [];
+  if (method === "GET" && path.endsWith("/runs")) return [];
+  if (method === "GET" && path.endsWith(`/cases/${CASE_ID}/versions`)) return [];
+  if (method === "GET" && path.endsWith(`/cases/${CASE_ID}`)) return CASE_DETAIL;
+  if (method === "POST" && path.endsWith("/debug-preflight")) {
+    // 预检按**当前**环境回答：环境改了之后旧结论不再匹配。
+    return {
+      ...PREFLIGHT_READY,
+      context: {
+        ...PREFLIGHT_READY.context,
+        environment: { ...PREFLIGHT_READY.context.environment, base_url: environment.base_url },
+      },
+    };
+  }
+  if (method === "POST" && path.endsWith("/runs")) {
+    return { ...RUN_REPORT.run, state: "queued", outcome: null };
+  }
+  if (method === "GET" && path.endsWith("/report")) return RUN_REPORT;
+  if (method === "PATCH" && path.endsWith(`/environments/${ENV_ID}`)) {
+    if (failWrites) throw new Error("环境保存失败");
+    const patch = (body ?? {}) as { base_url?: string };
+    if (typeof patch.base_url === "string") environment = makeEnvironment(patch.base_url);
+    return environment;
+  }
+  if (method === "PUT" && path.endsWith("/variables")) {
+    if (failWrites) throw new Error("变量保存失败");
+    const payload = (body ?? {}) as { variables?: { name: string; value: unknown }[] };
+    projectVariables = { version: projectVariables.version + 1, variables: payload.variables ?? [] };
+    return projectVariables;
+  }
+  throw new Error(`测试未覆盖的请求：${method} ${path}`);
+}
+
+  // 装配阶段的等待预算：这里等的是“用例编辑器挂载完成”，不是某个断言内容。
+  // 整套测试并行跑十几个 jsdom 环境，CPU 争用会把同一段代码的墙上时间放大数倍
+  // （与 test/setup.ts 记录的同一现象）。断言内容不因此放宽：期望的元素一字未改。
+  const SETUP_WAIT = { timeout: 20000 };
+
+/** 打开项目并选中用例，返回编辑器就绪后的容器。 */
+async function openCase(): Promise<void> {
+  render(<App />);
+  const projectSelect = (await screen.findByLabelText("项目")) as HTMLSelectElement;
+  await waitFor(() => expect(projectSelect.value).toBe(PROJECT_ID), SETUP_WAIT);
+  await act(async () => {});
+  // 等侧栏（目录／用例列表）真正挂载：项目选择到位不等于环境与目录已经读完。
+  const browser = await screen.findByLabelText("用例目录");
+  fireEvent.click(await within(browser).findByRole("button", { name: /查询订单/ }));
+  await waitFor(
+    () => expect((screen.getByLabelText("用例名称") as HTMLInputElement).value).toBe("查询订单"),
+    SETUP_WAIT,
+  );
+  // 等编辑防抖触发的展示性预检落定（400ms）。
+  //
+  // “当前通过”的判据要求存在一份**针对当前内容**的预检结论——这是设计：没有它就无法
+  // 说明这份报告对应的配置。因此在这里等它出现，而不是把断言放宽成“包含 200 就算通过”，
+  // 后者会让“结论过期”伪装成通过。
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 450));
+  });
+  await act(async () => {});
+}
+
+/**
+ * 展开侧栏的「环境与凭证管理」次级入口，返回**包含环境面板与管理面板的那个容器**。
+ *
+ * 环境编辑与凭证管理同在这个折叠区里（环境在侧栏，凭证在其下的 #admin-panel）；
+ * 只取 #admin-panel 会漏掉环境面板，测出来的“改环境不失效”其实是没找到控件。
+ */
+async function openAdmin(): Promise<HTMLElement> {
+  fireEvent.click(screen.getByRole("button", { name: "环境与凭证管理" }));
+  await act(async () => {});
+  const panel = document.querySelector(".sidebar-admin");
+  if (panel === null) throw new Error("管理入口未挂载");
+  return panel as HTMLElement;
+}
+
+/** 发一次调试并等它显示真实结论，返回响应区。 */
+async function debugOnce(): Promise<HTMLElement> {
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+  await waitFor(() =>
+    expect(screen.getByRole("region", { name: "响应" }).textContent).toContain("200"),
+  );
+  return screen.getByRole("region", { name: "响应" });
+}
+
+beforeEach(() => {
+  calls = [];
+  environment = makeEnvironment("http://echo.test");
+  projectVariables = { version: 1, variables: [] };
+  failWrites = false;
+  apiGetMock.mockReset();
+  apiSendMock.mockReset();
+  apiSendWithMetaMock.mockReset();
+  apiGetMock.mockImplementation((async (path: string) => route(path, "GET")) as never);
+  apiSendMock.mockImplementation((async (path: string, method: string, body: unknown) => route(path, method, body)) as never);
+  apiSendWithMetaMock.mockImplementation((async (path: string, method: string, body: unknown) => ({
+    data: route(path, method, body),
+    etag: `"${CASE_DETAIL.rev}"`,
+  })) as never);
+});
+
+describe("执行配置变更的真实失效链", () => {
+  it("在真实环境面板里保存 base_url 后，工作台里基于旧环境的结论立即失效", async () => {
+    await openCase();
+    const response = await debugOnce();
+    expect(response.textContent).not.toContain("上一次发送");
+
+    const admin = await openAdmin();
+    // 真实环境编辑表单：打开编辑、改地址、保存。
+    fireEvent.click(within(admin).getByRole("button", { name: "编辑" }));
+    const baseInput = await within(admin).findByLabelText("服务地址");
+    fireEvent.change(baseInput, { target: { value: "http://echo-alt.test" } });
+    const saveButton = within(admin).getByRole("button", { name: "保存环境" });
+    await act(async () => {
+      fireEvent.click(saveButton);
+    });
+
+    // PATCH 一旦成功，工作台当场把旧结论标成“上一次发送”——不等环境列表刷新回来。
+    await waitFor(() => expect(response.textContent).toContain("上一次发送"));
+  });
+
+  it("在真实变量面板里保存项目变量后，当前结论立即失效", async () => {
+    await openCase();
+    const response = await debugOnce();
+
+    const admin = await openAdmin();
+    // 项目变量面板：新增一行并保存。
+    fireEvent.click(within(admin).getByRole("button", { name: "＋添加变量" }));
+    const nameInput = await within(admin).findByLabelText("名称");
+    fireEvent.change(nameInput, { target: { value: "shared" } });
+    await act(async () => {
+      fireEvent.click(within(admin).getByRole("button", { name: "保存为新版本" }));
+    });
+
+    await waitFor(() => expect(response.textContent).toContain("上一次发送"));
+  });
+
+  it("管理写失败不推进失效：结论保持可用", async () => {
+    await openCase();
+    const response = await debugOnce();
+
+    const admin = await openAdmin();
+    failWrites = true;
+    fireEvent.click(within(admin).getByRole("button", { name: "编辑" }));
+    const baseInput = await within(admin).findByLabelText("服务地址");
+    fireEvent.change(baseInput, { target: { value: "http://echo-alt.test" } });
+    await act(async () => {
+      fireEvent.click(within(admin).getByRole("button", { name: "保存环境" }));
+    });
+    await act(async () => {});
+
+    // 保存失败：没有发生配置变更，不该作废一份仍然成立的结论。
+    expect(response.textContent).not.toContain("上一次发送");
+  });
+
+  it("只读地读取管理列表不会反复作废结论", async () => {
+    await openCase();
+    const response = await debugOnce();
+
+    const admin = await openAdmin();
+    // 展开各管理面板会触发多次 GET；读取不是变更。
+    fireEvent.click(within(admin).getByRole("button", { name: "编辑" }));
+    await act(async () => {});
+    await act(async () => {});
+
+    expect(response.textContent).not.toContain("上一次发送");
+  });
+});

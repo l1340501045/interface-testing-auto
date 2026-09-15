@@ -15,14 +15,17 @@ import type {
   CredentialSet,
   CredentialSetSlot,
   CurlPreview,
+  DebugPreflight,
   Environment,
   FieldNode,
   FieldTree,
   Folder,
   LocatorStep,
   NameValuePair,
+  PreflightIssue,
   Project,
   RequestSpec,
+  RunContext,
   RunReport,
   RunStep,
   RunSummary,
@@ -124,6 +127,13 @@ export function toRequestSpec(raw: unknown, field = "request"): RequestSpec {
   };
   const origin = asNullableString(spec.imported_origin, `${field}.imported_origin`);
   if (origin !== null) result.imported_origin = origin;
+  // auth_required 只在**显式为 true** 时保留：缺省、false、以及后端省略的形态都表示
+  // 沿用“跟随环境”。写成 `auth_required: false` 会让服务端算出的摘要与既有版本、
+  // 既有授权对不上——那是兼容性破坏，不是更明确的写法。
+  if (spec.auth_required === true) result.auth_required = true;
+  else if (spec.auth_required !== undefined && spec.auth_required !== null && spec.auth_required !== false) {
+    throw new ContractError(`${field}.auth_required 只能是布尔值`);
+  }
   return result;
 }
 
@@ -380,6 +390,68 @@ function toRunStep(raw: unknown, field: string): RunStep {
   };
 }
 
+/** 调试快照摘要；服务端按规范化内容算出，前端不自己算。 */
+export function toDebugSnapshotDigest(raw: unknown): string {
+  const record = asRecord(raw, "调试摘要");
+  return asString(record.hash, "调试摘要.hash");
+}
+
+function toRunContext(raw: unknown): RunContext | null {
+  // 缺席与 null 同义：后端在“来源无法证明”（旧记录、旧执行器、主密钥已轮换）时不给
+  // 结论。缺失不是错误，因此这里不抛异常，只是没有可用来关联的标记。
+  if (raw === null || raw === undefined) return null;
+  const record = asRecord(raw, "运行报告.context");
+  const environment = asRecord(record.environment, "运行报告.context.environment");
+  return {
+    snapshot_fingerprint: asString(
+      record.snapshot_fingerprint,
+      "运行报告.context.snapshot_fingerprint",
+    ),
+    environment: {
+      id: asString(environment.id, "运行报告.context.environment.id"),
+      name: asString(environment.name, "运行报告.context.environment.name"),
+      kind: asString(environment.kind, "运行报告.context.environment.kind"),
+      base_url: asString(environment.base_url, "运行报告.context.environment.base_url"),
+    },
+    input_fingerprint: asString(record.input_fingerprint, "运行报告.context.input_fingerprint"),
+  };
+}
+
+/** 发送前预检结果；`issues` 与建议动作是普通成员唯一能读到的准入原因。 */
+export function toDebugPreflight(raw: unknown): DebugPreflight {
+  const record = asRecord(raw, "预检结果");
+  const auth = asRecord(record.auth, "预检结果.auth");
+  const state = asString(auth.state, "预检结果.auth.state");
+  if (
+    state !== "none" &&
+    state !== "ready" &&
+    state !== "needs_authorization" &&
+    state !== "unavailable" &&
+    state !== "ambiguous"
+  ) {
+    throw new ContractError(`未知认证状态：${state}`);
+  }
+  return {
+    ready: asBoolean(record.ready, "预检结果.ready"),
+    issues: mapList(record.issues, "预检结果.issues", (item, index): PreflightIssue => {
+      const field = `预检结果.issues[${index}]`;
+      const entry = asRecord(item, field);
+      return {
+        code: asString(entry.code, `${field}.code`),
+        message: asString(entry.message, `${field}.message`),
+        action: asString(entry.action, `${field}.action`) as PreflightIssue["action"],
+      };
+    }),
+    can_authorize: asBoolean(record.can_authorize, "预检结果.can_authorize"),
+    auth: {
+      required: asBoolean(auth.required, "预检结果.auth.required"),
+      state,
+      profile_id: asNullableString(auth.profile_id, "预检结果.auth.profile_id"),
+    },
+    context: toRunContext(record.context),
+  };
+}
+
 export function toRunReport(raw: unknown): RunReport {
   const record = asRecord(raw, "运行报告");
   const request = record.request;
@@ -408,6 +480,7 @@ export function toRunReport(raw: unknown): RunReport {
     }),
     request: request === null || request === undefined ? null : asRecord(request, "运行报告.request"),
     response: response === null || response === undefined ? null : asRecord(response, "运行报告.response"),
+    context: toRunContext(record.context),
   };
 }
 

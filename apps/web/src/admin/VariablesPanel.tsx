@@ -44,10 +44,13 @@ export function VariablesPanel({
   workspaceId,
   projectId,
   canEdit,
+  onExecutionConfigChanged,
 }: {
   workspaceId: string;
   projectId: string;
   canEdit: boolean;
+  /** 项目变量写入成功后通知：它改变请求的解析输入。 */
+  onExecutionConfigChanged: () => void;
 }) {
   const scope = `${workspaceId}/${projectId}`;
   const variables = useResource<VariablesSet>(`${scope}/variables`, (signal) =>
@@ -113,6 +116,9 @@ export function VariablesPanel({
         { variables: toPayload(draft.rows) },
         toVariablesSet,
       );
+      // **先通知**：这次写入改变了请求将以哪些变量解析，工作台里基于旧变量的预检与
+      // “当前通过”必须当场失效，不能等列表刷新回来（那是另一条异步链）。
+      onExecutionConfigChanged();
       // 服务器返回的就是刚刚写入的那一版：直接把它当成新基线，不等刷新。
       setSavedSet({ scope, set: saved });
       setDraft(null);

@@ -1,11 +1,12 @@
 /**
- * 请求编辑器：方法与路径、查询参数与请求头（可重复）、正文与字段树、断言列。
+ * 请求编辑器：可重复的键值行与正文编辑。
+ *
+ * 方法与路径在地址行（工作台的发送栏）里编辑，不在这里重复渲染第二份：两个输入框绑
+ * 同一个字段，改一个另一个不会同步，用户看到的是“打了字没生效”。
  *
  * 目标地址不在这里填写：路径只是相对路径，实际 origin 由所选环境决定，
  * 用例无法把请求指向环境白名单之外的目标。导入 cURL 与保存都不会发出请求。
  */
-import { useMemo } from "react";
-
 import { ltrimPath, type RawKeyValue, type RawRequest } from "./requestDraft";
 export interface KeyValueRowProps {
   rows: RawKeyValue[];
@@ -66,55 +67,34 @@ const BODY_TYPES: { id: RawRequest["body_type"]; label: string }[] = [
   { id: "form", label: "表单" },
 ];
 
-export function MethodAndPath({
+export { BODY_TYPES, METHODS };
+
+/**
+ * 正文编辑：类型选择与正文原文。
+ *
+ * 类型选择无条件渲染——选“无正文”时也要能看到并切回 JSON，否则用户一旦切成“无正文”
+ * 就没有入口把正文加回来。
+ */
+export function BodyEditor({
   request,
   readOnly,
   onChange,
+  onTypeChange,
 }: {
   request: RawRequest;
   readOnly: boolean;
-  onChange: (patch: Partial<RawRequest>) => void;
+  onChange: (body: string) => void;
+  onTypeChange: (bodyType: RawRequest["body_type"]) => void;
 }) {
-  const methods = useMemo(
-    () => (METHODS.includes(request.method) ? METHODS : [request.method, ...METHODS]),
-    [request.method],
-  );
   return (
-    <div className="request-line">
-      <span className="param">
-        <label htmlFor="request-method">方法</label>
-        <select
-          id="request-method"
-          value={request.method}
-          disabled={readOnly}
-          onChange={(event) => onChange({ method: event.target.value })}
-        >
-          {methods.map((method) => (
-            <option key={method} value={method}>
-              {method}
-            </option>
-          ))}
-        </select>
-      </span>
-      <span className="param grow">
-        <label htmlFor="request-path">路径</label>
-        <input
-          id="request-path"
-          value={request.path}
-          readOnly={readOnly}
-          placeholder="/orders"
-          onChange={(event) => onChange({ path: ltrimPath(event.target.value) })}
-        />
-      </span>
+    <div className="body-editor">
       <span className="param">
         <label htmlFor="request-body-type">正文类型</label>
         <select
           id="request-body-type"
           value={request.body_type}
           disabled={readOnly}
-          onChange={(event) =>
-            onChange({ body_type: event.target.value as RawRequest["body_type"] })
-          }
+          onChange={(event) => onTypeChange(event.target.value as RawRequest["body_type"])}
         >
           {BODY_TYPES.map((item) => (
             <option key={item.id} value={item.id}>
@@ -123,34 +103,29 @@ export function MethodAndPath({
           ))}
         </select>
       </span>
+      {request.body_type === "none" ? (
+        <p className="hint">当前没有正文；把正文类型改为 JSON、纯文本或表单即可开始编辑。</p>
+      ) : (
+        <>
+          <label htmlFor="request-body">正文原文</label>
+          <textarea
+            id="request-body"
+            rows={8}
+            value={request.body}
+            readOnly={readOnly}
+            placeholder={request.body_type === "json" ? '{"name": "abc"}' : ""}
+            onChange={(event) => onChange(event.target.value)}
+          />
+          {request.body_type === "json" ? (
+            <p className="caption">
+              正文按原文保存与发送，数字不会经过 JavaScript 解析，长整数保持原样。
+            </p>
+          ) : null}
+        </>
+      )}
     </div>
   );
 }
 
-export function BodyEditor({
-  request,
-  readOnly,
-  onChange,
-}: {
-  request: RawRequest;
-  readOnly: boolean;
-  onChange: (body: string) => void;
-}) {
-  if (request.body_type === "none") return null;
-  return (
-    <div className="body-editor">
-      <label htmlFor="request-body">正文原文</label>
-      <textarea
-        id="request-body"
-        rows={8}
-        value={request.body}
-        readOnly={readOnly}
-        placeholder={request.body_type === "json" ? '{"name": "abc"}' : ""}
-        onChange={(event) => onChange(event.target.value)}
-      />
-      {request.body_type === "json" ? (
-        <p className="caption">正文按原文保存与发送，数字不会经过 JavaScript 解析，长整数保持原样。</p>
-      ) : null}
-    </div>
-  );
-}
+/** 路径补前导斜杠；地址行与导入共用同一处规则。 */
+export { ltrimPath };

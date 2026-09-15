@@ -8,6 +8,9 @@
   --accent: #174372;
   --accent-bg: #edf4fe;
   --accent-line: #b8cee8;
+  /* 主操作按钮：实心蓝，与浅色描边的次级按钮区分开。 */
+  --primary: #1a6fd4;
+  --primary-hover: #1560bb;
   --ok: #1c6b47;
   --ok-bg: #e8f5ee;
   --bad: #a12632;
@@ -101,42 +104,54 @@ label { font-size: 12px; color: #52667c; }
 .project-create button { justify-self: start; margin-top: 10px; }
 
 /* —— 应用外壳 —— */
+/* 外壳收成一条：范围选择是每次操作都要用的，其余（单接口执行标题、执行环境状态行）
+   不占首屏。执行环境在地址行旁边有**可编辑**的那一份，这里不再重复一条只读状态。 */
 .app { min-height: 100vh; display: flex; flex-direction: column; }
 .app-head {
   display: flex;
-  gap: 20px;
+  gap: 16px;
   align-items: flex-end;
   flex-wrap: wrap;
-  padding: 14px 20px;
+  padding: 8px 16px;
   background: #fff;
   border-bottom: 1px solid var(--line);
   position: sticky;
   top: 0;
   z-index: 5;
 }
-.brand { display: flex; flex-direction: column; gap: 2px; }
-.scope { display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap; margin-left: auto; }
-.current-env { font-size: 13px; color: #486b96; padding-bottom: 9px; }
-.who { display: flex; gap: 10px; align-items: center; padding-bottom: 4px; }
+.brand { display: flex; flex-direction: column; gap: 1px; }
+.brand h1 { font-size: 15px; margin: 0; }
+.eyebrow { font-size: 11px; }
+.scope { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; margin-left: auto; }
+.who { display: flex; gap: 10px; align-items: center; padding-bottom: 2px; }
 
 .param { display: flex; flex-direction: column; gap: 3px; }
 .param.grow { flex: 1 1 auto; min-width: 160px; }
 .param input, .param select { width: 100%; }
 
-.workspace { flex: 1; display: grid; grid-template-columns: minmax(280px, 340px) 1fr; align-items: start; }
+/* 侧栏以目录与用例为主：宽度收窄，配置类面板默认折叠在次级入口里。 */
+.workspace { flex: 1; display: grid; grid-template-columns: minmax(240px, 286px) 1fr; align-items: start; }
 .sidebar {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 16px;
+  gap: 10px;
+  padding: 12px;
   border-right: 1px solid var(--line);
   background: #fff;
   position: sticky;
-  top: 77px;
-  max-height: calc(100vh - 77px);
+  top: 57px;
+  max-height: calc(100vh - 57px);
   overflow-y: auto;
 }
-.main-pane { padding: 18px 22px 60px; min-width: 0; }
+.main-pane { padding: 10px 14px 48px; min-width: 0; }
+.sidebar-admin { padding: 10px 12px; }
+.sidebar-admin > summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+}
+.sidebar-admin[open] > summary { margin-bottom: 8px; }
 
 /* —— 用例目录 —— */
 .browser { display: flex; flex-direction: column; gap: 10px; }
@@ -162,8 +177,14 @@ label { font-size: 12px; color: #52667c; }
 .case-name { flex: 1; font-size: 14px; }
 .folder-create, .env-create { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
 .folder-create button, .env-create button { align-self: flex-start; margin-top: 8px; }
-.block { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 14px; }
+details.folder-create { display: block; }
+details.folder-create > summary { cursor: pointer; font-size: 13px; color: var(--accent); }
+/* 卡片间距收紧：请求标题、地址栏、请求标签与响应要读成一整块连续工作区，
+   而不是一串各自独立的大卡片。 */
+.block { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; margin-bottom: 10px; }
 details.block > summary { cursor: pointer; font-weight: 500; font-size: 14px; }
+/* 请求区与响应区之间不留额外空档：它们是一次调试的两个部分。 */
+.tab-panel { margin-bottom: 0; }
 
 /* —— 环境编辑与管理面板 —— */
 .env-list li {
@@ -231,6 +252,37 @@ details.block > summary { cursor: pointer; font-weight: 500; font-size: 14px; }
 /* —— 用例编辑 —— */
 .pane { display: flex; flex-direction: column; }
 .pane-head { display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap; background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 12px 16px; margin-bottom: 14px; }
+
+/* 视觉隐藏但保留给辅助技术与测试标签用；不用 display:none，那会把它从可访问树里摘掉。 */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* 标题行收成一条：名称、目录、状态与保存动作在同一行里，不占掉首屏的纵向空间。 */
+.case-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 5px 10px;
+  margin-bottom: 8px;
+}
+.case-name-input { flex: 1 1 200px; font-size: 15px; font-weight: 600; border-color: transparent; }
+.case-name-input:hover { border-color: var(--line); }
+.case-folder-select { flex: 0 1 180px; font-size: 13px; }
+.head-actions { display: flex; gap: 6px; margin-left: auto; }
+.head-actions button { padding: 6px 11px; font-size: 13px; }
 .split { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
 .request-line { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
 .request-line select { min-width: 96px; }
@@ -280,12 +332,136 @@ details.block > summary { cursor: pointer; font-weight: 500; font-size: 14px; }
 .run-report { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line-soft); }
 .evidence { max-height: 280px; overflow: auto; padding: 10px; background: #f7f9fc; border: 1px solid var(--line-soft); border-radius: 8px; font-size: 12px; }
 
+/* —— 请求调试工作台 ——
+ *
+ * 目标是紧凑的工具型界面：首屏就能找到地址、环境与发送，响应标题也在首屏之内。
+ * 因此这里刻意减少独立卡片与说明段落的厚度，主按钮用实心蓝而不是浅色描边。
+ */
+.primary {
+  color: #fff;
+  background: var(--primary);
+  border-color: var(--primary);
+  font-weight: 600;
+  padding: 9px 22px;
+}
+.primary:hover:not(:disabled) { background: var(--primary-hover); }
+.danger { color: var(--bad); background: var(--bad-bg); border-color: #e5b7bc; }
+
+.send-bar {
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 14px;
+  margin-bottom: 10px;
+  position: sticky;
+  /* 吸在应用标题栏之下：请求内容很长时，地址、环境与发送仍然可达。 */
+  top: 53px;
+  z-index: 3;
+}
+/* 工具与管理入口同排；管理入口不再为它一个按钮占一整行。 */
+.toolbar-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+/* 授权类说明：紧凑一行，不用红色问题块——它影响的是下一次发送，不是本次执行结果。 */
+.auth-note { color: var(--warn); margin: 6px 0 0; }
+.curl-import { display: inline-flex; flex-direction: column; gap: 6px; }
+.curl-import > button { font-size: 13px; padding: 5px 10px; }
+.curl-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 6px;
+  padding: 10px 12px;
+  background: #f7f9fc;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  max-width: 720px;
+}
+.send-line { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+.send-line select { min-width: 150px; }
+.address-preview { margin: 8px 0 0; word-break: break-all; }
+.issue-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.issue-list li {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px solid #e5b7bc;
+  background: var(--bad-bg);
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+/* 标签栏：只切换可见性，面板保持在 DOM 里。 */
+.request-tabs { margin-top: 10px; }
+.tab-bar { display: flex; gap: 2px; flex-wrap: wrap; border-bottom: 1px solid var(--line); }
+.tab {
+  padding: 7px 14px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  color: #52667c;
+  font-size: 13px;
+}
+.tab:hover:not(:disabled) { background: var(--accent-bg); }
+.tab-active { color: var(--accent); border-bottom-color: var(--primary); font-weight: 600; }
+.tab-badge {
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--idle-bg);
+  color: #52667c;
+  font-size: 11px;
+  font-weight: 400;
+}
+.tab:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+/* 面板限高并自带滚动：请求区是工具区，不该把紧跟其后的响应标题推到 1366×768 首屏
+   之外。长正文仍在面板内完整可达，只是需要滚动一次。 */
+.tab-panel { padding: 10px 0 0; max-height: 260px; overflow: auto; }
+
+.tab-panel[hidden] { display: none; }
+.auth-tab { display: flex; flex-direction: column; gap: 6px; }
+.checkbox-row { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; line-height: 1.5; }
+.checkbox-row input { margin-top: 3px; }
+
+/* 响应区：紧跟在请求区下方。 */
+.response-pane {
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 14px;
+  margin-bottom: 10px;
+}
+/* 响应区内部标签：与请求区同一套观感，读成一个连续工作区。 */
+.response-pane .tab-bar { margin-bottom: 8px; }
+.response-tab-body { min-height: 40px; }
+.response-head { border: none; padding: 0; margin-bottom: 8px; background: none; }
+.response-head h2 { margin: 0; }
+/* 状态／耗时／正文大小收成一行：三块大数字卡片会把正文挤出视野。 */
+.metrics-line { display: flex; gap: 16px; flex-wrap: wrap; align-items: baseline; margin: 6px 0; }
+.metric-inline { font-size: 13px; color: var(--ink-soft); }
+.metric-inline strong { font-size: 15px; color: var(--accent); margin: 0 2px; }
+.response-body { margin-top: 8px; }
+.record-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.record-list li { display: flex; gap: 10px; align-items: baseline; }
+.record-list button { font-family: ui-monospace, Menlo, monospace; font-size: 12px; padding: 3px 8px; }
+.record-list button.row-active { background: var(--primary); border-color: var(--primary); color: #fff; }
+
 @media (max-width: 1000px) {
   .workspace { grid-template-columns: 1fr; }
   .sidebar { position: static; max-height: none; border-right: none; border-bottom: 1px solid var(--line); }
   .split { grid-template-columns: 1fr; }
   .app-head { align-items: flex-start; }
   .scope { margin-left: 0; }
+  /* 窄屏下侧栏在上方，发送栏不再吸顶：吸顶会把地址与发送按钮压出可视区。 */
+  .send-bar { position: static; }
+}
+@media (max-width: 760px) {
+  /* 窄屏重排核心控制：地址占满一行，环境与发送留在同一行内可达。 */
+  .send-line { flex-direction: column; align-items: stretch; }
+  .send-line .param.grow { min-width: 0; }
+  .send-line .primary, .send-line .danger { width: 100%; }
+  .metrics { gap: 16px; }
+  .tab-bar { overflow-x: auto; flex-wrap: nowrap; }
 }
 @media (max-width: 600px) {
   .main-pane { padding: 14px 12px 48px; }

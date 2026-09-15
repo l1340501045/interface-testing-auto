@@ -129,13 +129,16 @@ export function CaseBrowser({
           ))}
         </ul>
         {canEdit ? (
-          <div className="folder-create">
+          // 新建目录是低频操作，收进展开区：常驻的输入框与按钮会把下面的用例列表
+          // 挤下去，而列表才是每次都要用的那一个。
+          <details className="folder-create">
+            <summary>＋新建目录</summary>
             <label htmlFor="new-folder">新目录名称</label>
             <input id="new-folder" value={newFolder} onChange={(event) => setNewFolder(event.target.value)} />
             <button type="button" onClick={() => void createFolder()}>
               添加目录
             </button>
-          </div>
+          </details>
         ) : (
           <Hint>当前角色为只读，不能编辑目录与用例。</Hint>
         )}

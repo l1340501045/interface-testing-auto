@@ -17,7 +17,7 @@
  *   同一个槽位出现两行时后一行会覆盖前一行：重复槽位在选择器里就被挡住，提交前再
  *   拒绝一次，绝不让“保存了两行”的成功提示建立在只生效一行之上。
  */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiError, apiDelete, apiSend, projectPath } from "../api/client";
 import {
@@ -495,6 +495,7 @@ export function CredentialsPanel({
   canAdmin,
   currentUser,
   currentCase,
+  onExecutionConfigChanged,
 }: {
   workspaceId: string;
   projectId: string;
@@ -502,6 +503,8 @@ export function CredentialsPanel({
   canAdmin: boolean;
   currentUser: { user_id: string; display_name: string };
   currentCase: { caseId: string; versionId: string | null } | null;
+  /** 身份配置、秘密与用途授权成功变更后通知：它们决定请求以谁的身份发出。 */
+  onExecutionConfigChanged: () => void;
 }) {
   const scope = `${workspaceId}/${projectId}`;
   const secrets = useResource<Secret[]>(canAdmin ? `${scope}/secrets` : null, (signal) =>
@@ -519,6 +522,18 @@ export function CredentialsPanel({
       signal,
     }),
   );
+
+  /**
+   * 绑定集合保存后的统一处理。
+   *
+   * 它不经过 `submit`（那是表单动作的包装），因此需要自己的成功出口：整份集合切换会改变
+   * 请求实际注入的凭证，与身份配置同等重要。子级不再另发第二次通知——一次成功只通知一次。
+   */
+  const reloadProfiles = profiles.reload;
+  const onProfileChanged = useCallback(() => {
+    onExecutionConfigChanged();
+    reloadProfiles();
+  }, [onExecutionConfigChanged, reloadProfiles]);
   // 主体只能从可见成员里选：手抄用户 id 最容易把授权签发给一个不相干的人。
   const members = useResource<WorkspaceMember[]>(canAdmin ? `${scope}/members` : null, (signal) =>
     apiSend(`/workspaces/${workspaceId}/members`, "GET", undefined, toWorkspaceMemberList, { signal }),
@@ -675,13 +690,20 @@ export function CredentialsPanel({
     grantTouched;
   useLeaveReport(`credentials:${scope}`, { dirty: formDirty, busy });
 
-  /** 统一的提交包装：成功提示、失败转述、忙碌状态只写一次。 */
+  /**
+   * 统一的提交包装：成功提示、失败转述、忙碌状态只写一次。
+   *
+   * 成功时通知一次执行配置变更：秘密、身份配置与用途授权都会改变“这次请求以什么身份
+   * 发出、是否被允许”，工作台里基于旧配置的预检与“当前通过”必须立即失效。
+   * **失败不通知**——没有发生变更，作废结论只会让用户白等一次重新检查。
+   */
   async function submit(action: () => Promise<string>) {
     setMessage(null);
     setFailure(null);
     setBusy(true);
     try {
       setMessage(await action());
+      onExecutionConfigChanged();
     } catch (cause) {
       setFailure(cause instanceof ApiError ? cause.message : "操作失败，请稍后重试");
     } finally {
@@ -922,7 +944,7 @@ export function CredentialsPanel({
                 secrets={secretList}
                 busy={bindingBusy === profile.id}
                 onBusy={(value) => setBindingBusy(value ? profile.id : null)}
-                onProfileChanged={profiles.reload}
+                onProfileChanged={onProfileChanged}
               />
             </li>
           ))}

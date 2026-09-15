@@ -426,12 +426,16 @@ describe("用例目录承载用例的闭环", () => {
     // 在目录树里归档 A：编辑器拿到的是同一份目录清单，必须立刻反映出来。
     fireEvent.click(within(browser).getAllByRole("button", { name: "归档" })[0]!);
 
-    await waitFor(() =>
-      expect(within(folderSelect()).queryByRole("option", { name: "A 模块" })).toBeNull(),
-    );
-    // 同一个清单里 B 还在：只断言“A 不见了”会被“编辑器压根没拿到目录清单”蒙混过关，
-    // 那时任何用例都会显示成失效目录，与“这份清单确实刷新过”不是一回事。
-    expect(within(folderSelect()).getByRole("option", { name: "B 模块" })).toBeTruthy();
+    // A 不见与 B 还在必须**同时**成立，所以放在同一个等待条件里。
+    //
+    // 拆成“先等 A 不见、再同步断言 B 还在”会引入一个瞬时态：目录清单重取还没回来时，
+    // 选择器里只剩失效占位，「A 模块」确实已经不见了，但「B 模块」也还没到——第一段
+    // 因此通过，第二段随负载随机失败。这里的结论本来就是一个收敛条件（清单刷新过），
+    // 不是某一帧的快照。
+    await waitFor(() => {
+      expect(within(folderSelect()).queryByRole("option", { name: "A 模块" })).toBeNull();
+      expect(within(folderSelect()).getByRole("option", { name: "B 模块" })).toBeTruthy();
+    });
     // 关键：失效状态必须如实显示，不能被显示成「未分组」——那等于在界面上宣布一个
     // 用户没做过的改动，用户一保存就真的被移出原目录。
     expect(selectedFolderLabel()).toContain("已失效");

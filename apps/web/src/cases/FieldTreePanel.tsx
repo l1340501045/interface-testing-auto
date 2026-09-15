@@ -35,6 +35,22 @@ export function containsSelector(node: FieldNode, key: string): boolean {
   return node.children.some((child) => containsSelector(child, key));
 }
 
+/**
+ * 按定位路径在当前字段树里找出对应节点。
+ *
+ * 图表里存**路径**而不是节点对象：树会因为来源变化而重建，同一条路径在新树里可能是
+ * 不同的类型与值。留着旧对象继续用它试算，就会拿上一份响应的样例去算当前配置的条件——
+ * 用户看到的是一个从未存在过的匹配结果。
+ */
+export function findSelector(node: FieldNode, key: string): FieldNode | null {
+  if (JSON.stringify(node.selector) === key) return node;
+  for (const child of node.children) {
+    const found = findSelector(child, key);
+    if (found !== null) return found;
+  }
+  return null;
+}
+
 function FieldRow({
   node,
   depth,
@@ -102,6 +118,7 @@ export function FieldTreePanel({
   readOnly,
   onChange,
   emptyHint,
+  sourceKey,
 }: {
   title: string;
   tree: FieldTreeState;
@@ -116,18 +133,40 @@ export function FieldTreePanel({
   readOnly: boolean;
   onChange: (next: CaseAssertion[]) => void;
   emptyHint: string;
+  /**
+   * 这棵树的数据来源标识（哪条运行／哪份样例）。
+   *
+   * 换代时清掉选中节点：路径可能碰巧还在，但它指向的是另一份数据，继续用它试算等于
+   * 拿上一份响应算当前条件。
+   */
+  sourceKey: string;
 }) {
-  const [active, setActive] = useState<FieldNode | null>(null);
+  /**
+   * 当前选中的字段：只记**定位路径**，节点对象每次从当前树里重新解析。
+   *
+   * 记对象会留下上一棵树的类型与值：同一路径在新响应里变成另一种类型时，详情区仍按旧
+   * 节点渲染，试算用的也是旧样例。路径是稳定的身份，节点内容是每次现取的。
+   */
+  const [activeKey, setActiveKey] = useState<string | null>(null);
   const groups = useMemo(() => groupByField(assertions), [assertions]);
 
-  // 正文变化后字段树会重建，之前选中的节点可能已不存在；此时收起详情，
-  // 避免继续对一棵旧树的路径新增断言。
-  const activeKey = active ? JSON.stringify(active.selector) : null;
   const root = tree.tree?.root ?? null;
+  const active = useMemo(
+    () => (activeKey === null || root === null ? null : findSelector(root, activeKey)),
+    [root, activeKey],
+  );
+
+  // 路径在新树里已不存在（例如换了一份结构不同的响应）时收起详情，
+  // 避免继续对一棵旧树的路径新增断言。
   useEffect(() => {
     if (activeKey === null || root === null) return;
-    if (!containsSelector(root, activeKey)) setActive(null);
+    if (!containsSelector(root, activeKey)) setActiveKey(null);
   }, [root, activeKey]);
+
+  // 来源换代（换运行／换样例）时清掉选中：即使路径碰巧还在，它指向的也是另一份数据。
+  useEffect(() => {
+    setActiveKey(null);
+  }, [sourceKey]);
 
   if (tree.error) return <ErrorText message={tree.error} />;
   if (tree.loading && tree.tree === null) return <Loading label="正在展开字段树…" />;
@@ -140,7 +179,12 @@ export function FieldTreePanel({
         <span className="caption">共 {tree.tree.node_count} 个节点</span>
       </div>
       <ul className="tree">
-        <FieldRow node={tree.tree.root} depth={0} activeKey={activeKey} onSelect={setActive} />
+        <FieldRow
+          node={tree.tree.root}
+          depth={0}
+          activeKey={activeKey}
+          onSelect={(node) => setActiveKey(JSON.stringify(node.selector))}
+        />
       </ul>
 
       {active ? (
