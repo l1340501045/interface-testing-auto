@@ -185,6 +185,23 @@ function route(rawPath: string, method: string, body?: unknown): unknown {
   if (method === "GET" && path.endsWith(`/cases/${CASE_ID}/versions`)) return [];
   if (method === "GET" && path.endsWith(`/cases/${CASE_ID}`)) return CASE_DETAIL;
   if (method === "POST" && path.endsWith("/debug-preflight")) {
+    // 地址缺协议时服务端不会走到白名单判断，而是直接报“环境地址不合法”并建议去改环境。
+    // 这里按同一口径回答，页面看到的结论与真实服务端一致。
+    if (!environment.base_url.includes("://")) {
+      return {
+        ready: false,
+        issues: [
+          {
+            code: "environment_url_invalid",
+            message: "环境地址必须以 http:// 或 https:// 开头，不能只写主机名或“主机:端口”。",
+            action: "configure_environment",
+          },
+        ],
+        can_authorize: true,
+        auth: { required: false, state: "none", profile_id: null },
+        context: null,
+      };
+    }
     // 预检按**当前**环境回答：环境改了之后旧结论不再匹配。
     return {
       ...PREFLIGHT_READY,
@@ -346,5 +363,100 @@ describe("执行配置变更的真实失效链", () => {
     await act(async () => {});
 
     expect(response.textContent).not.toContain("上一次发送");
+  });
+});
+
+/**
+ * 环境地址不合法时的“下一步”必须是真能点的入口（ENV-03／ENV-04）。
+ *
+ * 走**真实 App**：真实外壳 → 真实 CaseEditor → 真实 SendBar → 真实侧栏管理区。
+ * 只测 SendBar 收到回调会调用它，证明不了外壳把它接到了环境那一段；这里断言点击之后
+ * 展开的确实是含环境编辑的那个折叠区。
+ */
+describe("环境地址无效时的真实入口", () => {
+  it("点“前往环境设置”必须真正展开环境面板，而不是只展开外层", async () => {
+    // 存量坏数据：地址缺协议，请求发不出去，但记录仍在。
+    environment = makeEnvironment("target-service:8080");
+    await openCase();
+
+    const entry = await screen.findByRole("button", { name: "前往环境设置" });
+    // 无效地址不能被当成“实际目标”展示。
+    expect(screen.getByText(/环境地址不合法，暂时无法确定/)).toBeTruthy();
+    expect(screen.queryByText(/实际目标：target-service:8080/)).toBeNull();
+
+    const sidebar = document.querySelector(".sidebar-admin") as HTMLDetailsElement;
+    const panel = document.getElementById("environment-panel") as HTMLDetailsElement;
+    expect(sidebar.open).toBe(false);
+    /*
+      只断言 `sidebar.open` 是不够的：外层展开后，“环境（N）”这一层仍可能是折叠的，
+      用户点进来看到的还是一个没有编辑入口的空标题。这里必须断言**内层**的 open。
+
+      为什么不断言“编辑按钮可见”：jsdom 不建模 details 折叠对内容可见性的影响，折叠时
+      同样能找到按钮——那样的断言恒真，测不出这个缺陷。`open` 才是用户看到的状态。
+    */
+    expect(panel.open).toBe(false);
+
+    fireEvent.click(entry);
+    await act(async () => {});
+
+    expect(sidebar.open).toBe(true);
+    expect(panel.open).toBe(true);
+
+    // 展开管理区必须保住同一份未保存用例：草稿没有被重挂载或清空。
+    expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/echo");
+  });
+
+  it("展开后确实能走到环境编辑表单（编辑入口不再藏在折叠标题下）", async () => {
+    environment = makeEnvironment("target-service:8080");
+    await openCase();
+
+    fireEvent.click(await screen.findByRole("button", { name: "前往环境设置" }));
+    await act(async () => {});
+
+    const panel = document.getElementById("environment-panel") as HTMLDetailsElement;
+    expect(panel.open).toBe(true);
+    // 面板内的编辑入口真的可用：点开后能看到地址输入框。
+    fireEvent.click(within(panel).getByRole("button", { name: "编辑" }));
+    expect((await within(panel).findByLabelText("服务地址")) as HTMLInputElement).toBeTruthy();
+  });
+
+  it("缺协议的地址在环境面板里就地挡住，不发写请求", async () => {
+    environment = makeEnvironment("target-service:8080");
+    await openCase();
+    await screen.findByRole("button", { name: "前往环境设置" });
+
+    const admin = await openAdmin();
+    fireEvent.click(within(admin).getByRole("button", { name: "编辑" }));
+    const baseInput = await within(admin).findByLabelText("服务地址");
+    // 不改地址直接保存：服务端会拒绝这条存量值，本地也应当先挡住。
+    const writesBefore = calls.filter((call) => call.method === "PATCH").length;
+    await act(async () => {
+      fireEvent.click(within(admin).getByRole("button", { name: "保存环境" }));
+    });
+
+    expect(calls.filter((call) => call.method === "PATCH")).toHaveLength(writesBefore);
+    expect((baseInput as HTMLInputElement).value).toBe("target-service:8080");
+  });
+
+  it("把环境地址修好之后，同一份未保存草稿可以继续调试", async () => {
+    environment = makeEnvironment("target-service:8080");
+    await openCase();
+    await screen.findByRole("button", { name: "前往环境设置" });
+
+    // 走真实环境编辑表单改地址。
+    const admin = await openAdmin();
+    fireEvent.click(within(admin).getByRole("button", { name: "编辑" }));
+    const baseInput = await within(admin).findByLabelText("服务地址");
+    fireEvent.change(baseInput, { target: { value: "http://echo.test" } });
+    await act(async () => {
+      fireEvent.click(within(admin).getByRole("button", { name: "保存环境" }));
+    });
+
+    // 配置变更由外壳广播；预检按新地址重新给结论，无效提示随之消失。
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "前往环境设置" })).toBeNull(),
+    );
+    // 草稿没有被清掉或重载：还是原来那一份请求内容。
+    expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/echo");
   });
 });

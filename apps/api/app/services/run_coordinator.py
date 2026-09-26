@@ -16,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..config import Settings
+from ..kernel.environment_url import EnvironmentUrlError, check_base_url
 from ..kernel.request_spec import RequestSpecError, validate_request
 from ..kernel.target_policy import TargetGuard, TargetPolicyError
 from ..models import (
@@ -150,15 +151,23 @@ def resolve_target(
 ) -> tuple[dict, str]:
     """校验环境类型与目标来源，返回（已校验请求, 目标 origin）。
 
-    这里只做不依赖网络的策略校验（环境类型、来源白名单、元数据地址）。解析地址
-    会随 DNS 可用性波动，创建运行不应因解析失败被拒绝；真正的解析与地址固定必须
-    发生在发送前一刻，否则既挡不住 DNS 改绑，也分不清“网络失败”与“策略拒绝”。
+    这里只做不依赖网络的策略校验（环境地址语法、环境类型、来源白名单、元数据地址）。
+    解析地址会随 DNS 可用性波动，创建运行不应因解析失败被拒绝；真正的解析与地址固定
+    必须发生在发送前一刻，否则既挡不住 DNS 改绑，也分不清“网络失败”与“策略拒绝”。
     worker 在 executor 发送前重新解析并固定地址。
     """
     try:
         guard.check_environment(environment.kind)
     except TargetPolicyError as error:
         raise RunRejected("production_blocked", str(error)) from error
+
+    # 地址本身缺协议／缺主机时，后面拼出来的目标必然解析不了；那种失败会被白名单检查
+    # 报成 target_not_allowed，把用户引向去改本来正确的用例路径。地址问题在这里单独报出，
+    # 并归到“环境配置”。按库里的**原文**校验：既不猜协议，也不用 trim 后的地址替换目标。
+    try:
+        check_base_url(environment.base_url)
+    except EnvironmentUrlError as error:
+        raise RunRejected("environment_url_invalid", str(error)) from error
 
     base = environment.base_url.rstrip("/")
     probe = f"{base}{request.get('path', '/')}"

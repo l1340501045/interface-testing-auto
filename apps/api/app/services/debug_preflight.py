@@ -62,12 +62,17 @@ class PreflightResult:
 
 
 # 需要管理员调整环境／执行池配置的问题码；其余归到“改请求”。
+#
+# `environment_url_invalid` 属于环境本身配错了地址（缺协议、主机或端口不合法），下一步是
+# 去环境设置里改地址，不是去动用例。它与 `target_not_allowed` 不是一回事：后者是地址
+# 合法但不在执行池白名单内，仍然按“改请求／确认目标”处理，不能一并归成环境问题。
 _ENVIRONMENT_ACTIONS = {
     "production_blocked",
     "pool_not_granted",
     "pool_unavailable",
     "pool_rebound",
     "pool_config_invalid",
+    "environment_url_invalid",
 }
 
 

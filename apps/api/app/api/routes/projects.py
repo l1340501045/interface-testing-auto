@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from ...config import Settings
 from ...db import get_db
+from ...kernel.environment_url import EnvironmentUrlError, normalize_base_url
 from ...kernel.target_policy import TargetPolicyError, normalize_origin
 from ...kernel.valueliteral import ValueLiteral, ValueLiteralError
 from ...models import (
@@ -238,6 +239,22 @@ def list_environments(
     return [_environment_out(item) for item in items]
 
 
+def _checked_base_url(raw: str) -> str:
+    """环境地址在写库前做语法校验，返回将与请求一起提交的同一份文本。
+
+    过去这里只检查了字符串长度，环境表里因此可以存下裸主机名或“主机:端口”这类缺协议
+    的地址；它们拼不出可解析的目标，直到执行时才失败，并且被归到“目标不在白名单”，把
+    用户引向去修改本来正确的用例路径。地址本身的问题必须在保存时就报出来。
+
+    校验只做语法判断：不解析 DNS、不建立连接，也不回显原始地址（粘贴来的原文里可能带
+    凭证）。错误码固定为 `environment_url_invalid`，界面据此把错误指到地址输入框。
+    """
+    try:
+        return normalize_base_url(raw)
+    except EnvironmentUrlError as error:
+        raise bad_request("environment_url_invalid", str(error)) from error
+
+
 def _granted_pool_id(session: Session, scope: deps.ProjectScope) -> uuid.UUID:
     """项目已授权的活动执行池；没有可用池时直接拒绝创建环境。"""
     pool_id = session.scalar(
@@ -268,6 +285,7 @@ def create_environment(
 ) -> EnvironmentOut:
     if payload.kind == "production":
         raise bad_request("production_not_enabled", "本阶段不启用生产环境执行，请先创建测试环境。")
+    base_url = _checked_base_url(payload.base_url)
     duplicate = session.scalar(
         select(Environment).where(
             Environment.project_id == scope.project_id, Environment.name == payload.name
@@ -283,7 +301,7 @@ def create_environment(
         project_id=scope.project_id,
         name=payload.name,
         kind=payload.kind,
-        base_url=payload.base_url,
+        base_url=base_url,
         pool_id=pool_id,
         variables=variables,
     )
@@ -303,10 +321,13 @@ def update_environment(
     session: Session = Depends(get_db),
 ) -> EnvironmentOut:
     environment = _get_environment(session, scope, environment_id)
+    # 地址先校验再改任何字段：非法地址必须整条 PATCH 失败，不能留下“地址没改、变量改了”
+    # 这种改到一半的记录，也不能推进 rev。
+    base_url = _checked_base_url(payload.base_url) if payload.base_url is not None else None
     if payload.name is not None:
         environment.name = payload.name
-    if payload.base_url is not None:
-        environment.base_url = payload.base_url
+    if base_url is not None:
+        environment.base_url = base_url
     if payload.variables is not None:
         # 环境级普通变量与项目级走同一校验：非法字面量与秘密都不能从这条入口进来。
         environment.variables = _validate_variables(list(payload.variables.items()))
