@@ -108,6 +108,8 @@ function OutsideTreeRow({
   readOnly,
   onUpsert,
   onRemove,
+  pendingKey,
+  idPrefix,
 }: {
   targetSource: CaseAssertion["target_source"];
   selector: LocatorStep[];
@@ -120,9 +122,11 @@ function OutsideTreeRow({
   readOnly: boolean;
   onUpsert: (next: CaseAssertion) => void;
   onRemove: (id: string) => void;
+  pendingKey?: string;
+  idPrefix: string;
 }) {
   const [fieldType, setFieldType] = useState(() => inferFieldType(items));
-  const typeSelectId = `outside-type-${fieldKey(targetSource, selector)}`;
+  const typeSelectId = `${idPrefix}-outside-type-${fieldKey(targetSource, selector)}`;
 
   return (
     <div className="response-field">
@@ -156,6 +160,7 @@ function OutsideTreeRow({
         readOnly={readOnly}
         onUpsert={onUpsert}
         onRemove={onRemove}
+        pendingKey={pendingKey}
       />
     </div>
   );
@@ -171,6 +176,8 @@ export function ResponseFieldPanel({
   results,
   readOnly,
   onChange,
+  pendingPrefix,
+  idPrefix = "response",
 }: {
   workspaceId: string;
   projectId: string;
@@ -182,6 +189,8 @@ export function ResponseFieldPanel({
   results: Map<string, AssertionResult>;
   readOnly: boolean;
   onChange: (next: CaseAssertion[]) => void;
+  pendingPrefix?: string;
+  idPrefix?: string;
 }) {
   const [sample, setSample] = useState("");
   const [manualPath, setManualPath] = useState("");
@@ -247,9 +256,9 @@ export function ResponseFieldPanel({
         <Hint>已使用最近一次运行的响应正文；没有运行记录时才使用粘贴样例。</Hint>
       ) : (
         <div className="body-editor">
-          <label htmlFor="response-sample">响应样例</label>
+          <label htmlFor={`${idPrefix}-sample`}>响应样例</label>
           <textarea
-            id="response-sample"
+            id={`${idPrefix}-sample`}
             rows={5}
             value={sample}
             placeholder='例如 {"code": 0, "data": {"name": "abc"}}'
@@ -280,6 +289,7 @@ export function ResponseFieldPanel({
             ? "本次响应正文为空或不是 JSON，无法展开字段；可用下方“添加预期字段”按路径指定。"
             : "粘贴响应样例后，可在这里按字段配置断言；也可以用下方的“添加预期字段”。"
         }
+        pendingPrefix={pendingPrefix}
       />
 
       <div className="kv-block">
@@ -289,9 +299,9 @@ export function ResponseFieldPanel({
         </p>
         <div className="actions">
           <span className="param grow">
-            <label htmlFor="manual-field-path">字段路径</label>
+            <label htmlFor={`${idPrefix}-manual-field-path`}>字段路径</label>
             <input
-              id="manual-field-path"
+              id={`${idPrefix}-manual-field-path`}
               value={manualPath}
               placeholder="例如 data.name 或 items[0].price"
               onChange={(event) => setManualPath(event.target.value)}
@@ -335,6 +345,8 @@ export function ResponseFieldPanel({
               readOnly={readOnly}
               onUpsert={(next) => onChange(upsertAssertion(assertions, next))}
               onRemove={(id) => onChange(removeAssertion(assertions, id))}
+              pendingKey={pendingPrefix ? `${pendingPrefix}:assertion-outside-${group.key}` : undefined}
+              idPrefix={idPrefix}
             />
           ))}
         </div>

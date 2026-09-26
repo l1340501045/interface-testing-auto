@@ -6,7 +6,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { ApiError, apiGet, apiSend, onUnauthorized } from "../api/client";
+import { ApiError, apiGet, apiSend, invalidateClientSession, onUnauthorized } from "../api/client";
 import { toSession } from "../api/guards";
 import type { SessionInfo } from "../api/types";
 
@@ -77,6 +77,11 @@ export function useSession(): SessionState {
   }, []);
 
   const logout = useCallback(async () => {
+    // 点击退出的同一帧先清主体与敏感 UI；远端撤销独立完成，不让网络等待保留旧编辑会话。
+    invalidateClientSession();
+    known.current = null;
+    setExpired(false);
+    setSession(null);
     try {
       await apiSend("/auth/logout", "POST", undefined, () => null);
     } catch (cause) {
@@ -86,8 +91,6 @@ export function useSession(): SessionState {
       }
     } finally {
       known.current = null;
-      setExpired(false);
-      setSession(null);
     }
   }, []);
 

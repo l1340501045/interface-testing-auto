@@ -61,6 +61,7 @@ let calls: Call[] = [];
 let gates: Record<string, { promise: Promise<unknown>; resolve: (value: unknown) => void }> = {};
 /** 未挂起时直接返回的详情，按用例 id 索引。 */
 let immediate: Record<string, unknown> = {};
+let createGate: { promise: Promise<unknown>; resolve: (value: unknown) => void } | null = null;
 
 /** 挂起某条用例的详情请求，返回放行用的屏障。 */
 function hold(caseId: string): (detail: unknown) => void {
@@ -70,6 +71,13 @@ function hold(caseId: string): (detail: unknown) => void {
   });
   gates[caseId] = { promise, resolve: release };
   return (detail: unknown) => release(detail);
+}
+
+function holdCreate(): (value: unknown) => void {
+  let release!: (value: unknown) => void;
+  const promise = new Promise<unknown>((resolve) => { release = resolve; });
+  createGate = { promise, resolve: release };
+  return release;
 }
 
 function detail(caseId: string, name: string, rev: number) {
@@ -115,6 +123,7 @@ function route(method: string, path: string, body: unknown): unknown {
   }
   if (method === "POST" && path.endsWith("/cases")) {
     const created = detail(NEW_ID, (body as { name: string }).name, 1);
+    if (createGate !== null) return createGate.promise;
     return { data: created, etag: '"1"' };
   }
   throw new Error(`测试未覆盖的请求：${method} ${path}`);
@@ -163,6 +172,7 @@ describe("已有内容到达之前的编辑窗口", () => {
     calls = [];
     gates = {};
     immediate = {};
+    createGate = null;
     apiGetMock.mockReset();
     apiSendMock.mockReset();
     vi.mocked(apiSendWithMeta).mockReset();
@@ -290,5 +300,19 @@ describe("已有内容到达之前的编辑窗口", () => {
       expect(calls.filter((call) => call.path.endsWith(NEW_ID) && call.method === "GET")).toHaveLength(1),
     );
     expect(nameInput().value).toBe("保存后继续输入的名称");
+  });
+
+  it("保存按钮与 Ctrl+S 共用同步锁，首次 POST 只创建一次", async () => {
+    renderEditor(null);
+    fireEvent.change(nameInput(), { target: { value: "只创建一次" } });
+    const release = holdCreate();
+
+    fireEvent.click(screen.getByRole("button", { name: "创建用例" }));
+    fireEvent.keyDown(window, { key: "s", ctrlKey: true });
+    expect(calls.filter((call) => call.method === "POST" && call.path.endsWith("/cases"))).toHaveLength(1);
+
+    release({ data: detail(NEW_ID, "只创建一次", 1), etag: '"1"' });
+    await waitFor(() => expect(screen.getByText("用例已创建，继续编辑后仍可保存。")).toBeTruthy());
+    expect(calls.filter((call) => call.method === "POST" && call.path.endsWith("/cases"))).toHaveLength(1);
   });
 });

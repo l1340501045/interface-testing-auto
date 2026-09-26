@@ -26,12 +26,15 @@ import type {
 } from "../api/types";
 import { ErrorText, Hint, Loading, Notice } from "../components/Feedback";
 import { useLeaveReport } from "../hooks/leaveGuard";
+import type { LeaveState } from "../hooks/leaveGuard";
 import { useResource } from "../hooks/useResource";
 import { ResponsePanel } from "../runs/ResponsePanel";
 import { AuthTab, SendBar, type SendStage } from "../runs/SendBar";
 import { isTerminal } from "../runs/useRuns";
 import { submissionKey, useDebugRun, type DebugSubmission } from "../runs/useDebugRun";
 import { AssertionTab } from "./AssertionTab";
+import { AssertionColumn } from "./AssertionColumn";
+import { removeAssertion, upsertAssertion } from "./assertionGroups";
 import { CurlImport } from "./CurlImport";
 import { CaseHeading } from "./CaseHeading";
 import { unknownFolderLabel } from "./folderLabels";
@@ -40,7 +43,7 @@ import { RequestTabs } from "./RequestTabs";
 import { ResizableWorkbench } from "./ResizableWorkbench";
 import { ResponseFieldPanel } from "./ResponseFieldPanel";
 import { RunPanel, type RunProvenance } from "../runs/RunPanel";
-import { emptyRequest, rawToSpec, requestToRaw, sameRequest, type RawRequest } from "./requestDraft";
+import { emptyRequest, newRequestRow, rawToSpec, requestToRaw, sameRequest, upgradeRequestV2, type RawKeyValue, type RawRequest } from "./requestDraft";
 import { useFieldTree } from "./useFieldTree";
 
 /** 正文类型的短标签，用在请求体标签上；不写“有”这种没有信息量的词。 */
@@ -126,6 +129,11 @@ export function CaseEditor({
   configEpoch = 0,
   getConfigEpoch,
   separateHistory = false,
+  active = true,
+  leaveKey,
+  onTabMeta,
+  domIdPrefix,
+  onRegisterCloseSave,
 }: {
   workspaceId: string;
   projectId: string;
@@ -191,6 +199,13 @@ export function CaseEditor({
   getConfigEpoch?: () => number | null;
   /** App 已提供独立任务／报告页时，编辑器只保留版本执行动作。 */
   separateHistory?: boolean;
+  /** 多标签宿主只允许活动实例响应全局快捷操作与上报活动授权目标。 */
+  active?: boolean;
+  /** 外壳可识别的离开登记键，用于按目标标签汇总关闭。 */
+  leaveKey?: string;
+  onTabMeta?: (meta: { name: string; method: string; dirty: boolean; busy: boolean }) => void;
+  domIdPrefix?: string;
+  onRegisterCloseSave?: (controller: { save: () => Promise<boolean>; state: () => LeaveState } | null) => void;
 }) {
   // 新建的用例在保存后才有 id。这里自己记住它，避免“创建成功但再保存又建一条”。
   const [currentId, setCurrentId] = useState<string | null>(caseSummaryId);
@@ -209,7 +224,14 @@ export function CaseEditor({
 
   const [name, setName] = useState("");
   const [request, setRequest] = useState<RawRequest>(emptyRequest);
+  const legacyRowIdsRef = useRef(new WeakMap<object, string>());
   const [assertions, setAssertions] = useState<CaseAssertion[]>([]);
+  const nameRef = useRef(name);
+  const requestRef = useRef(request);
+  const assertionsRef = useRef(assertions);
+  nameRef.current = name;
+  requestRef.current = request;
+  assertionsRef.current = assertions;
   /**
    * 所属目录。`null` 是**未分组**这个明确取值，不是“还没加载”。
    *
@@ -236,6 +258,7 @@ export function CaseEditor({
     assertions: string;
     folderId: string | null;
   } | null>(null);
+  const baselineSyncRef = useRef(baseline);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -275,6 +298,7 @@ export function CaseEditor({
     configEpoch: number;
   } | null>(null);
   const [creating, setCreating] = useState(false);
+  const [versionOperationActive, setVersionOperationActive] = useState(false);
   /** 请求标签；默认停在参数上，首屏即可看到地址、环境与发送。 */
   const [activeTab, setActiveTab] = useState("params");
   const [sendError, setSendError] = useState<string | null>(null);
@@ -299,7 +323,31 @@ export function CaseEditor({
    * 没有切换。真正该失效的只有换用例／换项目／换主体／卸载。
    */
   const [editorKey] = useState(() => newEditorInstance());
+  const editRevisionRef = useRef(0);
+  const saveInFlightRef = useRef<Promise<CaseDetail | null> | null>(null);
+  const editorWriteGateRef = useRef(false);
+  const shortcutLockRef = useRef(false);
+  const executionGateRef = useRef<"debug" | "version" | null>(null);
+  const onTabMetaRef = useRef(onTabMeta);
+  onTabMetaRef.current = onTabMeta;
+  const principalRef = useRef(currentUserId);
+  const environmentRef = useRef(selectedEnvironmentId);
+  principalRef.current = currentUserId;
+  environmentRef.current = selectedEnvironmentId;
+  const aliveRef = useRef(true);
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => { aliveRef.current = false; };
+  }, []);
   const debugReadOnly = readOnly;
+
+  function currentExecutionEpoch(): number | null {
+    return getConfigEpoch === undefined ? configEpoch : getConfigEpoch();
+  }
+
+  function ownsEditor(owner: { workspaceId: string; projectId: string; editorKey: string; principalId: string | null }): boolean {
+    return aliveRef.current && owner.workspaceId === workspaceId && owner.projectId === projectId && owner.editorKey === editorKey && owner.principalId === principalRef.current;
+  }
 
   /**
    * 刚刚由本页写入的那一份详情。
@@ -449,6 +497,7 @@ export function CaseEditor({
   // 离开保护也就形同虚设。目录同样要进基线：新用例的初值来自“从哪个目录点的新建”，
   // 基线取同一个值，才不会一打开就被算成改过目录。
   const effectiveBaseline = baseline ?? { ...BLANK_DRAFT, folderId: initialFolderId };
+  baselineSyncRef.current = effectiveBaseline;
 
   const dirty = useMemo(() => {
     return (
@@ -458,6 +507,24 @@ export function CaseEditor({
       effectiveBaseline.folderId !== folderId
     );
   }, [effectiveBaseline, name, request, assertions, folderId]);
+
+  /** v1 只为呈现生成稳定行视图；不写回 state，因此纯读取不 dirty、不改 hash。 */
+  const presentedUpgrade = useMemo(() => {
+    if (request.schema_version === 2) return upgradeRequestV2(request, assertions);
+    const stableId = (row: RawKeyValue): string => {
+      const existing = legacyRowIdsRef.current.get(row);
+      if (existing !== undefined) return existing;
+      const created = newRequestRow(row).row_id;
+      legacyRowIdsRef.current.set(row, created);
+      return created;
+    };
+    return upgradeRequestV2(request, assertions, {
+      query_params: request.query_params.map(stableId),
+      headers: request.headers.map(stableId),
+    });
+  }, [request, assertions]);
+  const presentedRequest = request.schema_version === 2 ? request : presentedUpgrade.request;
+  const presentedAssertions = request.schema_version === 2 ? assertions : presentedUpgrade.assertions;
 
   /**
    * 当前值指向的目录是否已经不在可选清单里（被归档、被删、或不属于这个项目）。
@@ -529,15 +596,16 @@ export function CaseEditor({
   const currentVersionId = matchingVersion?.id ?? null;
   useEffect(() => {
     if (currentId === null) return;
+    if (!active) return;
     onCurrentVersion?.({ caseId: currentId, versionId: currentVersionId });
     // 编辑器卸载（切换用例、关闭、切换范围）时撤销上报：留着它会让授权表单按一条
     // 已经不在屏幕上的用例预选。
     return () => onCurrentVersion?.(null);
-  }, [currentId, currentVersionId, onCurrentVersion]);
+  }, [active, currentId, currentVersionId, onCurrentVersion]);
 
   const bodyText = request.body_type === "json" ? request.body : "";
   // 请求正文树的来源标识就是正文本身：正文一变就是另一份数据。
-  const bodyTree = useFieldTree(workspaceId, projectId, bodyText, bodyText);
+  const bodyTree = useFieldTree(workspaceId, projectId, bodyText, bodyText, active);
 
   /**
    * 当前表单对应的请求定义；不合法时给出原因而不抛到渲染里。
@@ -547,14 +615,14 @@ export function CaseEditor({
    */
   const currentSpec = useMemo(() => {
     try {
-      return { spec: rawToSpec(request), error: null as string | null };
+      return { spec: rawToSpec(request, assertions), error: null as string | null };
     } catch (cause) {
       return {
         spec: null,
         error: cause instanceof Error ? cause.message : "请求定义不合法",
       };
     }
-  }, [request]);
+  }, [request, assertions]);
 
   const currentSubmission = useMemo<DebugSubmission | null>(() => {
     if (selectedEnvironmentId === null || currentSpec.spec === null || debugReadOnly) return null;
@@ -600,15 +668,21 @@ export function CaseEditor({
     onDebugRunAccepted,
     getConfigEpoch,
   );
+  const debugAcceptancePending = debug.phase !== "idle" && debug.phase !== "running";
+  const closeOperationPendingRef = useRef(false);
+  closeOperationPendingRef.current = debugAcceptancePending || versionOperationActive;
 
   // 上报离开状态：范围切换与关闭由外壳统一拦一次，避免每个入口各写一份判断。
   // **未结束的调试操作同样计入 busy**：离开发送中的链路会让用户既看不到受理结果，也
   // 不会知道它是否已经产生副作用；unknown 也属于未结束，不能因为阶段名里没有“运行”
   // 就当成空闲。
-  useLeaveReport(`case:${workspaceId}/${projectId}/${editorKey}`, {
+  useLeaveReport(leaveKey ?? `case:${workspaceId}/${projectId}/${editorKey}`, {
     dirty,
-    busy: busy || debug.operationActive,
+    busy: busy || debugAcceptancePending || versionOperationActive,
   });
+  useEffect(() => {
+    onTabMetaRef.current?.({ name: name.trim() || "新请求", method: request.method, dirty, busy: busy || debugAcceptancePending || versionOperationActive });
+  }, [name, request.method, dirty, busy, debugAcceptancePending, versionOperationActive]);
 
   /**
    * 内容或环境变化后自动预检一次（防抖）。
@@ -618,14 +692,14 @@ export function CaseEditor({
    * 因此这里的结论过期不会导致越权发送。
    */
   useEffect(() => {
-    if (currentSubmission === null) return;
+    if (!active || currentSubmission === null) return;
     const timer = window.setTimeout(() => {
       void debug.runPreflight(currentSubmission);
     }, 400);
     return () => window.clearTimeout(timer);
     // debug.runPreflight 是稳定回调；把它放进依赖会让每次渲染都重排一次防抖。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentSnapshotKey, editorKey, configEpoch]);
+  }, [active, currentSnapshotKey, editorKey, configEpoch]);
 
   /**
    * 发送当前编辑内容。
@@ -636,6 +710,10 @@ export function CaseEditor({
    */
   async function sendDebug() {
     setSendError(null);
+    if (versionOperationActive || executionGateRef.current !== null) {
+      setSendError("同一标签已有版本运行正在确认，请先处理完成。");
+      return;
+    }
     if (selectedEnvironmentId === null) {
       setSendError("请先选择执行环境。");
       return;
@@ -645,7 +723,12 @@ export function CaseEditor({
       return;
     }
     const environment = environments.find((item) => item.id === selectedEnvironmentId) ?? null;
-    await debug.start(currentSubmission, environment?.name ?? selectedEnvironmentId);
+    executionGateRef.current = "debug";
+    try {
+      await debug.start(currentSubmission, environment?.name ?? selectedEnvironmentId);
+    } finally {
+      executionGateRef.current = null;
+    }
   }
 
   /** 用户确认授权并发送；摘要与签发都由服务端完成，用户不接触内部摘要。 */
@@ -855,12 +938,13 @@ export function CaseEditor({
     return map;
   }, [displayedReport, activeMatches]);
 
-  async function save(): Promise<CaseDetail | null> {
+  async function performSave(): Promise<CaseDetail | null> {
+    const owner = { workspaceId, projectId, editorKey, principalId: principalRef.current };
     setError(null);
     setNotice(null);
     let spec;
     try {
-      spec = rawToSpec(request);
+      spec = rawToSpec(request, assertions);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "请求定义不合法");
       return null;
@@ -884,6 +968,7 @@ export function CaseEditor({
           { name, folder_id: folderId, request: spec, assertions },
           toCaseDetail,
         );
+        if (!ownsEditor(owner)) return null;
         // 刚写入的这一版直接成为新基线：不等随后的重新拉取，用户接着编辑的内容
         // 不会在那次拉取回来时被旧内容盖掉。就绪标记要跟着一起更新，否则表单会退回
         // 载入态，正在输入的表单被卸载重挂（焦点与选择都会丢）。
@@ -899,12 +984,14 @@ export function CaseEditor({
         // 基线必须跟着服务端走，否则界面会显示成“没有未保存修改”。表单里显示的那一份
         // 只在用户没在等待期间改过时才跟着回显走（见 submittedFolderId）。
         if (folderIdRef.current === submittedFolderId) setFolderId(created.data.folder_id);
-        setBaseline({
+        const nextBaseline = {
           name: created.data.name,
           request: requestToRaw(created.data.request),
           assertions: JSON.stringify(created.data.assertions),
           folderId: created.data.folder_id,
-        });
+        };
+        baselineSyncRef.current = nextBaseline;
+        setBaseline(nextBaseline);
         setNotice("用例已创建，继续编辑后仍可保存。");
         onSaved(created.data.id);
         return created.data;
@@ -928,6 +1015,7 @@ export function CaseEditor({
         toCaseDetail,
         { headers: etag ? { "If-Match": etag } : {} },
       );
+      if (!ownsEditor(owner)) return null;
       setEtag(updated.etag);
       setDraftRev(updated.data.rev);
       setAppliedStamp({ key: detailKey ?? "", rev: updated.data.rev });
@@ -935,12 +1023,14 @@ export function CaseEditor({
       setDraftSnapshotHash(updated.data.snapshot_hash);
       // 同新建路径：等待期间用户改过目录就保留他的选择，只把基线推进到服务端那一边。
       if (folderIdRef.current === submittedFolderId) setFolderId(updated.data.folder_id);
-      setBaseline({
+      const nextBaseline = {
         name: updated.data.name,
         request: requestToRaw(updated.data.request),
         assertions: JSON.stringify(updated.data.assertions),
         folderId: updated.data.folder_id,
-      });
+      };
+      baselineSyncRef.current = nextBaseline;
+      setBaseline(nextBaseline);
       setNotice("已保存到草稿。");
       onSaved(updated.data.id);
       return updated.data;
@@ -958,6 +1048,42 @@ export function CaseEditor({
     }
   }
 
+  /** 所有保存入口共享责任层同步锁；首次 POST 也不会因按钮＋快捷键重复创建。 */
+  function save(): Promise<CaseDetail | null> {
+    const inFlight = saveInFlightRef.current;
+    if (inFlight !== null) return inFlight;
+    if (editorWriteGateRef.current) return Promise.resolve(null);
+    editorWriteGateRef.current = true;
+    const operation = performSave().finally(() => {
+      if (saveInFlightRef.current === operation) saveInFlightRef.current = null;
+      editorWriteGateRef.current = false;
+    });
+    saveInFlightRef.current = operation;
+    return operation;
+  }
+
+  useEffect(() => {
+    if (onRegisterCloseSave === undefined) return;
+    const state = (): LeaveState => {
+      const base = baselineSyncRef.current ?? { ...BLANK_DRAFT, folderId: initialFolderId };
+      return {
+        dirty:
+          base.name !== nameRef.current ||
+          !sameRequest(base.request, requestRef.current) ||
+          base.assertions !== JSON.stringify(assertionsRef.current) ||
+          base.folderId !== folderIdRef.current,
+        busy: editorWriteGateRef.current || closeOperationPendingRef.current,
+      };
+    };
+    const action = async () => {
+      const submitted = { name: nameRef.current, request: requestRef.current, assertions: assertionsRef.current, folderId: folderIdRef.current };
+      const saved = await save();
+      return saved !== null && !closeOperationPendingRef.current && nameRef.current === submitted.name && sameRequest(requestRef.current, submitted.request) && JSON.stringify(assertionsRef.current) === JSON.stringify(submitted.assertions) && folderIdRef.current === submitted.folderId;
+    };
+    onRegisterCloseSave({ save: action, state });
+    return () => onRegisterCloseSave(null);
+  }, [onRegisterCloseSave, save]);
+
   /**
    * 保存草稿，并确保有一版固定了屏幕上的执行内容；返回执行要固定到的那一版。
    *
@@ -968,7 +1094,24 @@ export function CaseEditor({
    * 于是改目录这一步会把原本匹配的授权打断，直到执行前才暴露，界面上没有任何异常。
    * 只有执行快照内容真的变了（摘要与任何已发布版本都不同）才固化新版本。
    */
-  async function saveThenPublish(): Promise<CaseVersion | null> {
+  async function performSaveThenPublish(): Promise<CaseVersion | null> {
+    const operationOwner = {
+      workspaceId,
+      projectId,
+      editorKey,
+      principalId: principalRef.current,
+      environmentId: environmentRef.current,
+      configEpoch: currentExecutionEpoch(),
+    };
+    const executionStillOwned = () =>
+      ownsEditor(operationOwner) &&
+      operationOwner.environmentId === environmentRef.current &&
+      operationOwner.configEpoch !== null &&
+      currentExecutionEpoch() === operationOwner.configEpoch;
+    if (!executionStillOwned()) {
+      setError("当前主体、环境或执行配置已变化，未开始版本准备。");
+      return null;
+    }
     setError(null);
     // 用例 id 必须取自 save() 的返回值：新建时 setCurrentId 只是排队了一次
     // 状态更新，本函数闭包里的 currentId 仍是 null，用它当目标会漏掉发布。
@@ -978,8 +1121,12 @@ export function CaseEditor({
     let targetRev = draftRev;
     let targetHash = draftSnapshotHash;
     if (dirty || currentId === null) {
-      const saved = await save();
+      const saved = await performSave();
       if (saved === null) return null;
+      if (!executionStillOwned()) {
+        setError("保存完成，但主体、环境或执行配置已变化；未继续发布或运行。");
+        return null;
+      }
       targetId = saved.id;
       targetRev = saved.rev;
       targetHash = saved.snapshot_hash;
@@ -993,6 +1140,10 @@ export function CaseEditor({
       // 读不到版本时并没有固化任何版本，这句提示不能与“发布失败”混为一谈：
       // `loadVersions` 自己吞掉读取失败并返回 null，所以它不会走到下面的 catch。
       const existing = await loadVersions(targetId);
+      if (!executionStillOwned()) {
+        setError("版本读取完成，但主体、环境或执行配置已变化；未继续发布或运行。");
+        return null;
+      }
       if (existing === null) {
         setError("版本列表读取失败，未提交执行");
         return null;
@@ -1016,6 +1167,7 @@ export function CaseEditor({
         { side_effect: "unknown", draft_rev: targetRev },
         toCaseVersion,
       );
+      if (!executionStillOwned()) return null;
       // 发布返回的那一版就是刚刚固化的内容，草稿摘要与它一致：接着执行会固定在这一版。
       // 先接纳它再提示，界面上的版本区、左侧列表与授权选择器同时拿到这一版。
       acceptVersion(targetId, version);
@@ -1036,6 +1188,14 @@ export function CaseEditor({
     }
   }
 
+  function saveThenPublish(): Promise<CaseVersion | null> {
+    if (editorWriteGateRef.current) return Promise.resolve(null);
+    editorWriteGateRef.current = true;
+    return performSaveThenPublish().finally(() => {
+      editorWriteGateRef.current = false;
+    });
+  }
+
   /**
    * 解析一条 cURL 并填入编辑器。
    *
@@ -1046,6 +1206,7 @@ export function CaseEditor({
     if (!text.trim()) {
       return { error: "请先粘贴 cURL 命令文本。", warnings: [] };
     }
+    const startedRevision = editRevisionRef.current;
     setBusy(true);
     try {
       const preview = await apiSend(
@@ -1061,10 +1222,31 @@ export function CaseEditor({
           warnings: [...preview.warnings, ...preview.unsupported],
         };
       }
-      setRequest((current) => ({
-        ...requestToRaw(preview.draft),
-        method: preview.draft.method || current.method,
-      }));
+      if (!aliveRef.current) return { error: "编辑器已关闭，解析结果没有应用。", warnings: preview.warnings };
+      const changedWhileParsing = editRevisionRef.current !== startedRevision;
+      const currentRequest = requestRef.current;
+      const currentAssertions = assertionsRef.current;
+      const hasAssertions = currentAssertions.length > 0;
+      if ((changedWhileParsing || currentRequest.schema_version === 2 || hasAssertions) && !window.confirm(
+        `${changedWhileParsing ? "解析期间请求已被修改。" : ""}应用会整份替换请求；原行断言会保留为“字段已删除”，历史位置条件不会自动绑定新行。仍要应用吗？`,
+      )) {
+        return { error: "已保留解析预览，当前请求没有被覆盖。", warnings: preview.warnings };
+      }
+      let next = requestToRaw(preview.draft);
+      let nextAssertions = currentAssertions;
+      if (currentRequest.schema_version === 2 || hasAssertions) {
+        const upgraded = upgradeRequestV2(currentRequest, currentAssertions);
+        nextAssertions = upgraded.assertions;
+        next = {
+          ...next,
+          schema_version: 2,
+          query_params: next.query_params.map((row) => newRequestRow(row)),
+          headers: next.headers.map((row) => newRequestRow(row)),
+        };
+      }
+      editRevisionRef.current += 1;
+      setRequest({ ...next, method: preview.draft.method || currentRequest.method });
+      setAssertions(nextAssertions);
       return { error: null, warnings: preview.warnings };
     } catch (cause) {
       return {
@@ -1077,8 +1259,81 @@ export function CaseEditor({
   }
 
   function patchRequest(patch: Partial<RawRequest>) {
+    editRevisionRef.current += 1;
     setRequest((current) => ({ ...current, ...patch }));
   }
+
+  function changeAssertions(next: CaseAssertion[] | ((current: CaseAssertion[]) => CaseAssertion[])) {
+    editRevisionRef.current += 1;
+    setAssertions(next);
+  }
+
+  function changeRows(field: "query_params" | "headers", rows: RawKeyValue[]) {
+    const upgraded = request.schema_version === 2
+      ? { request, assertions, migrated: 0, historical: 0 }
+      : presentedUpgrade;
+    if (request.schema_version !== 2 && (upgraded.migrated > 0 || upgraded.historical > 0)) {
+      const accepted = window.confirm(
+        `首次编辑参数会启用稳定行定位：可迁移 ${upgraded.migrated} 条断言，${upgraded.historical} 条历史位置条件保持原语义。继续吗？`,
+      );
+      if (!accepted) return;
+    }
+    const originalRows = request[field];
+    const upgradedRows = upgraded.request[field];
+    const used = new Set<string>();
+    const stableRows = rows.map((row, submittedIndex) => {
+      if (row.row_id) {
+        used.add(row.row_id);
+        return row;
+      }
+      const originalIndex = originalRows.findIndex((item) => item === row);
+      const candidate = upgradedRows[originalIndex >= 0 ? originalIndex : submittedIndex];
+      if (candidate?.row_id && !used.has(candidate.row_id)) {
+        used.add(candidate.row_id);
+        return { ...candidate, ...row, row_id: candidate.row_id, enabled: candidate.enabled, description: row.description ?? candidate.description };
+      }
+      return newRequestRow(row);
+    });
+    const otherField = field === "query_params" ? "headers" : "query_params";
+    if (stableRows.length + upgraded.request[otherField].length > 500) {
+      setError("启用新版参数功能后 Query 和 Header 合计最多 500 行；请先删除多余行。");
+      return;
+    }
+    editRevisionRef.current += 1;
+    setAssertions(upgraded.assertions);
+    setRequest({ ...upgraded.request, [field]: stableRows });
+  }
+
+  function changeRowAssertions(next: CaseAssertion[] | ((current: CaseAssertion[]) => CaseAssertion[])) {
+    if (request.schema_version === 2) {
+      changeAssertions(next);
+      return;
+    }
+    editRevisionRef.current += 1;
+    const upgradedAssertions = typeof next === "function" ? next(presentedUpgrade.assertions) : next;
+    setRequest(presentedUpgrade.request);
+    setAssertions(upgradedAssertions);
+  }
+
+  useEffect(() => {
+    if (!active) return;
+    const handle = (event: KeyboardEvent) => {
+      if (event.repeat || event.isComposing || (!event.metaKey && !event.ctrlKey)) return;
+      const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest('[role="dialog"]')) return;
+      const saveShortcut = event.key.toLowerCase() === "s";
+      const sendShortcut = event.key === "Enter";
+      if (!saveShortcut && !sendShortcut) return;
+      event.preventDefault();
+      if (shortcutLockRef.current || readOnly) return;
+      shortcutLockRef.current = true;
+      void (saveShortcut ? save() : sendDebug()).finally(() => {
+        shortcutLockRef.current = false;
+      });
+    };
+    window.addEventListener("keydown", handle);
+    return () => window.removeEventListener("keydown", handle);
+  }, [active, readOnly, save, sendDebug]);
 
   if (detail.error) {
     return (
@@ -1101,6 +1356,7 @@ export function CaseEditor({
   return (
     <section className="pane workbench">
       <CaseHeading
+        idPrefix={domIdPrefix ? `${domIdPrefix}-case` : "case"}
         name={name}
         onNameChange={setName}
         folderId={folderId}
@@ -1139,6 +1395,7 @@ export function CaseEditor({
         controls={(
           <>
             <SendBar
+              idPrefix={domIdPrefix ? `${domIdPrefix}-send` : undefined}
               request={request}
               environments={environments}
               selectedEnvironmentId={selectedEnvironmentId}
@@ -1160,7 +1417,7 @@ export function CaseEditor({
               canAuthorize={debug.preflight?.can_authorize ?? false}
               onSubmitAuthorization={() => void confirmAuthorization()}
               onCancelAuthorization={cancelAuthorization}
-              tools={<CurlImport onImport={importCurl} disabled={readOnly} loading={busy} />}
+              tools={<CurlImport idPrefix={domIdPrefix ? `${domIdPrefix}-request` : ""} pendingKey={leaveKey ? `${leaveKey}:curl` : undefined} onImport={importCurl} disabled={readOnly} loading={busy} />}
               authorization={debug.authorizationView}
             />
             {sendError ? <ErrorText message={sendError} /> : null}
@@ -1176,6 +1433,7 @@ export function CaseEditor({
           断言、样例与预期字段都在标签内，不再常驻在请求区外面把响应挤到首屏之外。
         */}
         <RequestTabs
+          idPrefix={domIdPrefix ? `${domIdPrefix}-request` : "request"}
           activeId={activeTab}
           onChange={setActiveTab}
           tabs={[
@@ -1188,11 +1446,37 @@ export function CaseEditor({
                   <h3>查询参数（可重复）</h3>
                   <p className="caption">重复键按原样保留顺序与出现次数。</p>
                   <KeyValueRows
-                    rows={request.query_params}
+                    rows={presentedRequest.query_params}
                     label="查询参数"
                     addLabel="＋添加查询参数"
                     readOnly={readOnly}
-                    onChange={(rows) => patchRequest({ query_params: rows })}
+                    idPrefix={`${editorKey}-query`}
+                    kind="query"
+                    version={2}
+                    pendingPrefix={leaveKey}
+                    otherRows={presentedRequest.headers}
+                    ownerRevision={`${editRevisionRef.current}:${JSON.stringify(assertions)}`}
+                    relatedAssertionCount={presentedAssertions.filter((item) => {
+                      const first = item.selector[0];
+                      return item.target_source === "request.query" && first?.kind === "row" && presentedRequest.query_params.some((row) => row.row_id === first.row_id);
+                    }).length}
+                    assertionSlot={(row) => row.row_id ? (
+                      <AssertionColumn
+                        types={types.data ?? []}
+                        typesError={types.error?.message ?? null}
+                        workspaceId={workspaceId}
+                        projectId={projectId}
+                        field={{ targetSource: "request.query", selector: [{ kind: "row", row_id: row.row_id }, { kind: "key", key: "value" }], fieldType: "string" }}
+                        own={presentedAssertions.filter((item) => item.target_source === "request.query" && item.selector[0]?.kind === "row" && item.selector[0].row_id === row.row_id)}
+                        sample={row.enabled === false ? null : { type: "string", text: row.value }}
+                        results={results}
+                        readOnly={readOnly}
+                        onUpsert={(next) => changeRowAssertions((current) => upsertAssertion(current, next))}
+                        onRemove={(id) => changeRowAssertions((current) => removeAssertion(current, id))}
+                        pendingKey={leaveKey ? `${leaveKey}:assertion-query-${row.row_id}` : undefined}
+                      />
+                    ) : null}
+                    onChange={(rows) => changeRows("query_params", rows)}
                   />
                 </>
               ),
@@ -1227,11 +1511,37 @@ export function CaseEditor({
                     当作普通内容保存与展示。
                   </p>
                   <KeyValueRows
-                    rows={request.headers}
+                    rows={presentedRequest.headers}
                     label="请求头"
                     addLabel="＋添加请求头"
                     readOnly={readOnly}
-                    onChange={(rows) => patchRequest({ headers: rows })}
+                    idPrefix={`${editorKey}-header`}
+                    kind="header"
+                    version={2}
+                    pendingPrefix={leaveKey}
+                    otherRows={presentedRequest.query_params}
+                    ownerRevision={`${editRevisionRef.current}:${JSON.stringify(assertions)}`}
+                    relatedAssertionCount={presentedAssertions.filter((item) => {
+                      const first = item.selector[0];
+                      return item.target_source === "request.header" && first?.kind === "row" && presentedRequest.headers.some((row) => row.row_id === first.row_id);
+                    }).length}
+                    assertionSlot={(row) => row.row_id ? (
+                      <AssertionColumn
+                        types={types.data ?? []}
+                        typesError={types.error?.message ?? null}
+                        workspaceId={workspaceId}
+                        projectId={projectId}
+                        field={{ targetSource: "request.header", selector: [{ kind: "row", row_id: row.row_id }, { kind: "key", key: "value" }], fieldType: "string" }}
+                        own={presentedAssertions.filter((item) => item.target_source === "request.header" && item.selector[0]?.kind === "row" && item.selector[0].row_id === row.row_id)}
+                        sample={row.enabled === false ? null : { type: "string", text: row.value }}
+                        results={results}
+                        readOnly={readOnly}
+                        onUpsert={(next) => changeRowAssertions((current) => upsertAssertion(current, next))}
+                        onRemove={(id) => changeRowAssertions((current) => removeAssertion(current, id))}
+                        pendingKey={leaveKey ? `${leaveKey}:assertion-header-${row.row_id}` : undefined}
+                      />
+                    ) : null}
+                    onChange={(rows) => changeRows("headers", rows)}
                   />
                 </>
               ),
@@ -1243,6 +1553,7 @@ export function CaseEditor({
               content: (
                 <>
                   <BodyEditor
+                    idPrefix={domIdPrefix ? `${domIdPrefix}-request` : "request"}
                     request={request}
                     readOnly={readOnly}
                     onChange={(body) => patchRequest({ body })}
@@ -1265,7 +1576,7 @@ export function CaseEditor({
                   assertions={assertions}
                   results={results}
                   readOnly={readOnly}
-                  onChange={setAssertions}
+                  onChange={changeAssertions}
                   bodyTree={bodyTree}
                   bodySourceKey={bodyText}
                   bodyHint={
@@ -1273,6 +1584,8 @@ export function CaseEditor({
                       ? "正文为空或不是合法 JSON，暂时无法展开字段。"
                       : "选择 JSON 正文类型后，可在这里按字段配置断言。"
                   }
+                  pendingPrefix={leaveKey}
+                  request={presentedRequest}
                 />
               ),
             },
@@ -1321,7 +1634,9 @@ export function CaseEditor({
             assertions={assertions}
             results={results}
             readOnly={readOnly}
-            onChange={setAssertions}
+            onChange={changeAssertions}
+            pendingPrefix={leaveKey}
+            idPrefix={domIdPrefix ? `${domIdPrefix}-response` : "response"}
           />
         }
       />
@@ -1388,6 +1703,16 @@ export function CaseEditor({
           canCancel={!readOnly}
           readOnly={readOnly}
           showHistory={!separateHistory}
+          operationBlocked={debug.operationActive}
+          onOperationActive={setVersionOperationActive}
+          tryAcquireOperation={() => {
+            if (executionGateRef.current !== null) return false;
+            executionGateRef.current = "version";
+            return true;
+          }}
+          releaseOperation={() => {
+            if (executionGateRef.current === "version") executionGateRef.current = null;
+          }}
         />
         <h3>已发布版本</h3>
         {versions.length > 0 ? (

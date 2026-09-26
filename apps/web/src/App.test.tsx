@@ -35,7 +35,7 @@ const FOLDER_B = "82828282-8282-4282-8282-828282828282";
 vi.mock("./session/useSession", () => ({
   useSession: () => ({
     session: {
-      user: { id: "u-1", username: "tester", display_name: "测试员", is_admin: true },
+      user: { user_id: "u-1", username: "tester", display_name: "测试员", is_admin: true },
       workspaces: fixtures.workspaces,
     },
     loading: false,
@@ -82,6 +82,8 @@ const postCalls: { path: string; body: unknown }[] = [];
 let holdCreate = false;
 let releaseCreate: (() => void) | null = null;
 let createdId = "";
+let caseSaveGate: { promise: Promise<void>; resolve: () => void } | null = null;
+const caseSaveByName = new Map<string, { promise: Promise<void>; resolve: () => void }>();
 
 function project(key: string, name: string, workspaceId: string, id: string): unknown {
   return { id, workspace_id: workspaceId, key, name, status: "active", role: "admin", pool_id: null };
@@ -157,13 +159,13 @@ function routes(path: string, method = "GET", body?: unknown): unknown {
   }
   if (clean.endsWith("/environments")) return environmentList;
   if (method === "POST" && clean.endsWith("/cases")) {
-    const payload = (body ?? {}) as { name?: string; folder_id?: string | null };
+    const payload = (body ?? {}) as { name?: string; folder_id?: string | null; request?: unknown; assertions?: unknown[] };
     casePosts.push({ path, body });
-    const id = CREATED_CASE;
+    const id = casePosts.length === 1 ? CREATED_CASE : CASE_2;
     const row = caseRow(id, String(payload.name ?? ""), payload.folder_id ?? null);
     const project = projectInPath(clean);
     casesByProject[project] = [...(casesByProject[project] ?? []), row];
-    return caseDetail(id);
+    return { ...(caseDetail(id) as Record<string, unknown>), name: payload.name, folder_id: payload.folder_id ?? null, request: payload.request, assertions: payload.assertions ?? [] };
   }
   if (clean.endsWith("/cases")) {
     const rows = casesByProject[projectInPath(clean)] ?? [];
@@ -204,18 +206,24 @@ beforeEach(() => {
   holdCreate = false;
   releaseCreate = null;
   createdId = CREATED_1;
+  caseSaveGate = null;
+  caseSaveByName.clear();
   fixtures.workspaces = [{ id: WORKSPACE_ID, name: "默认工作空间", role: "admin" }];
   apiGetMock.mockImplementation((async (path: string) => routes(path)) as never);
   apiSendMock.mockImplementation((async (path: string, method: string, body: unknown) =>
     routes(path, method, body)) as never);
   // 用例保存走带 ETag 的调用；同样打到替身上，让“新建用例”这一段是真的走通的。
-  apiSendWithMetaMock.mockImplementation((async (path: string, method: string, body: unknown) => ({
-    data: routes(path, method, body),
-    etag: '"1"',
-  })) as never);
+  apiSendWithMetaMock.mockImplementation((async (path: string, method: string, body: unknown) => {
+    const data = routes(path, method, body);
+    const namedGate = caseSaveByName.get(String((body as { name?: string }).name ?? ""));
+    if (namedGate !== undefined) await namedGate.promise;
+    else if (caseSaveGate !== null) await caseSaveGate.promise;
+    return { data, etag: '"1"' };
+  }) as never);
   // 每条用例换一个全新的确认框替身：调用次数要能按用例清零，否则“这次有没有弹确认”
   // 这类断言会读到上一条用例留下的调用记录。
   window.confirm = vi.fn(() => true);
+  window.alert = vi.fn();
 });
 
 /** 新建项目表单里项目键那一栏的标签；两个 describe 都要按它定位。 */
@@ -248,24 +256,148 @@ describe("未保存内容的离开保护", () => {
     await act(async () => {});
   }
 
-  it("新建用例里输入内容后算作有未保存修改，切换用例前先确认", async () => {
+  function activeCaseName(): HTMLInputElement {
+    const active = document.querySelector<HTMLElement>(".workspace-editor:not([hidden])");
+    if (active === null) throw new Error("没有活动请求标签");
+    return within(active).getByLabelText("用例名称") as HTMLInputElement;
+  }
+
+  it("新建用例里输入内容后再开标签不会确认，原草稿仍保留", async () => {
     await openDirtyNewCase();
-    // 阻止离开，编辑器必须还在，草稿不能被丢掉。
-    vi.mocked(window.confirm).mockReturnValue(false);
     fireEvent.click(screen.getByRole("button", { name: "＋新建用例" }));
 
-    await waitFor(() => expect(window.confirm).toHaveBeenCalled());
-    expect((screen.getByLabelText("用例名称") as HTMLInputElement).value).toBe("尚未保存的用例");
+    const tabs = document.querySelector<HTMLElement>(".workspace-tabs");
+    if (tabs === null) throw new Error("没有请求标签栏");
+    await waitFor(() => expect(within(tabs).getAllByRole("tab")).toHaveLength(2));
+    expect(window.confirm).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("tab", { name: /尚未保存的用例/ }));
+    expect(activeCaseName().value).toBe("尚未保存的用例");
   });
 
-  it("确认离开后才真正切换用例", async () => {
+  it("多个新建标签各自保留独立草稿", async () => {
     await openDirtyNewCase();
-    vi.mocked(window.confirm).mockReturnValue(true);
-    // 再点一次“新建”会重建编辑器；确认后应当回到空白草稿。
     fireEvent.click(screen.getByRole("button", { name: "＋新建用例" }));
+    await waitFor(() => expect(activeCaseName().value).toBe(""));
+    fireEvent.change(activeCaseName(), { target: { value: "第二个草稿" } });
+    fireEvent.click(screen.getByRole("tab", { name: /尚未保存的用例/ }));
+    expect(activeCaseName().value).toBe("尚未保存的用例");
+    fireEvent.click(screen.getByRole("tab", { name: /第二个草稿/ }));
+    expect(activeCaseName().value).toBe("第二个草稿");
+  });
 
-    await waitFor(() => expect(window.confirm).toHaveBeenCalled());
-    await waitFor(() => expect((screen.getByLabelText("用例名称") as HTMLInputElement).value).toBe(""));
+  it("活动标签名称变长时只调整标签容器滚动且不抢输入焦点", async () => {
+    await openDirtyNewCase();
+    const scroller = document.querySelector<HTMLElement>(".workspace-tab-scroll");
+    if (scroller === null) throw new Error("没有标签滚动容器");
+    const tab = within(scroller).getByRole("tab", { selected: true });
+    let itemRight = 180;
+    let viewportRight = 200;
+    vi.spyOn(scroller, "getBoundingClientRect").mockImplementation(() => ({ left: 0, right: viewportRight, top: 0, bottom: 40, width: viewportRight, height: 40, x: 0, y: 0, toJSON: () => ({}) } as DOMRect));
+    vi.spyOn(tab, "getBoundingClientRect").mockImplementation(() => ({ left: 80, right: itemRight, top: 0, bottom: 38, width: itemRight - 80, height: 38, x: 80, y: 0, toJSON: () => ({}) } as DOMRect));
+    scroller.scrollLeft = 0;
+
+    const input = activeCaseName();
+    input.focus();
+    itemRight = 280;
+    fireEvent.change(input, { target: { value: "这是一个会让活动标签宽度明显增长的完整请求名称" } });
+
+    await waitFor(() => expect(scroller.scrollLeft).toBe(80));
+    expect(document.activeElement).toBe(input);
+    viewportRight = 150;
+    window.dispatchEvent(new Event("resize"));
+    expect(scroller.scrollLeft).toBe(210);
+    expect(window.scrollX).toBe(0);
+  });
+
+  it("保存后关闭只移除冻结目标，等待期间新开的活动标签保留", async () => {
+    await openDirtyNewCase();
+    let release!: () => void;
+    const promise = new Promise<void>((resolve) => { release = resolve; });
+    caseSaveGate = { promise, resolve: release };
+
+    // 单一关闭对话框明确选择“保存并关闭”；保存实际进入 deferred 后继续操作工作区。
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    const dialog = await screen.findByRole("dialog", { name: "关闭请求标签" });
+    expect(within(dialog).getByText(/尚未保存的用例/)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存并关闭" }));
+    await waitFor(() => expect(apiSendWithMetaMock).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "＋新请求" }));
+    fireEvent.change(activeCaseName(), { target: { value: "等待期间新开的 B" } });
+    expect(screen.getByRole("tab", { name: /等待期间新开的 B/ })).toBeTruthy();
+
+    release();
+    await waitFor(() => expect(screen.queryByRole("tab", { name: /尚未保存的用例/ })).toBeNull());
+    expect(screen.getByRole("tab", { name: /等待期间新开的 B/ })).toBeTruthy();
+    expect(activeCaseName().value).toBe("等待期间新开的 B");
+  });
+
+  it("关闭对话框的取消直接返回并保留全部输入", async () => {
+    await openDirtyNewCase();
+    const opener = screen.getByRole("button", { name: "关闭" });
+    opener.focus();
+    fireEvent.click(opener);
+    const dialog = await screen.findByRole("dialog", { name: "关闭请求标签" });
+    const save = within(dialog).getByRole("button", { name: "保存并关闭" });
+    expect(within(dialog).getByRole("button", { name: "放弃修改并关闭" })).toBeTruthy();
+    const cancel = within(dialog).getByRole("button", { name: "取消" });
+    await waitFor(() => expect(document.activeElement).toBe(cancel));
+    fireEvent.keyDown(cancel, { key: "Tab" });
+    expect(document.activeElement).toBe(save);
+    fireEvent.keyDown(save, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(cancel);
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "关闭请求标签" })).toBeNull();
+    expect(activeCaseName().value).toBe("尚未保存的用例");
+    await waitFor(() => expect(document.activeElement).toBe(opener));
+  });
+
+  it("关闭全部保存期间再次编辑已保存目标，整组保留", async () => {
+    await renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "＋新建用例" }));
+    fireEvent.change(activeCaseName(), { target: { value: "目标 A" } });
+    fireEvent.click(screen.getByRole("button", { name: "＋新请求" }));
+    fireEvent.change(activeCaseName(), { target: { value: "目标 B" } });
+
+    let releaseB!: () => void;
+    const promiseB = new Promise<void>((resolve) => { releaseB = resolve; });
+    caseSaveByName.set("目标 B", { promise: promiseB, resolve: releaseB });
+    fireEvent.click(screen.getByRole("button", { name: "关闭全部" }));
+    const dialog = await screen.findByRole("dialog", { name: "关闭请求标签" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存并关闭" }));
+    await waitFor(() => expect(apiSendWithMetaMock).toHaveBeenCalledTimes(2));
+
+    fireEvent.click(screen.getByRole("tab", { name: /目标 A/ }));
+    fireEvent.change(activeCaseName(), { target: { value: "A 保存后又编辑" } });
+    releaseB();
+
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "关闭请求标签" })).toBeTruthy());
+    expect(screen.getByRole("tab", { name: /A 保存后又编辑/ })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: /目标 B/ })).toBeTruthy();
+  });
+
+  it("关闭保存开始后取消会作废旧关闭意图，且不会启动后续标签保存", async () => {
+    await renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "＋新建用例" }));
+    fireEvent.change(activeCaseName(), { target: { value: "取消目标 A" } });
+    fireEvent.click(screen.getByRole("button", { name: "＋新请求" }));
+    fireEvent.change(activeCaseName(), { target: { value: "尚未开始保存 B" } });
+
+    let release!: () => void;
+    const promise = new Promise<void>((resolve) => { release = resolve; });
+    caseSaveGate = { promise, resolve: release };
+    fireEvent.click(screen.getByRole("button", { name: "关闭全部" }));
+    const dialog = await screen.findByRole("dialog", { name: "关闭请求标签" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存并关闭" }));
+    await waitFor(() => expect(apiSendWithMetaMock).toHaveBeenCalledTimes(1));
+    expect((within(dialog).getByRole("button", { name: "放弃修改并关闭" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(within(dialog).getByRole("button", { name: "取消" }));
+    expect(screen.queryByRole("dialog", { name: "关闭请求标签" })).toBeNull();
+
+    release();
+    await waitFor(() => expect(screen.getByRole("tab", { name: /取消目标 A/ })).toBeTruthy());
+    expect(screen.getByRole("tab", { name: /尚未开始保存 B/ })).toBeTruthy();
+    expect(apiSendWithMetaMock).toHaveBeenCalledTimes(1);
   });
 
   it("在四个页面间往返不会重建编辑器或丢失草稿", async () => {
@@ -275,7 +407,7 @@ describe("未保存内容的离开保护", () => {
     fireEvent.click(screen.getByRole("button", { name: "环境配置" }));
     expect(window.location.hash).toBe("#/environments");
     expect(screen.queryByRole("region", { name: "接口工作台" })).toBeNull();
-    expect(document.getElementById("case-name")).toBe(draft);
+    expect(screen.getByLabelText("用例名称")).toBe(draft);
 
     fireEvent.click(screen.getByRole("button", { name: "接口工作台" }));
     expect(screen.getByLabelText("用例名称")).toBe(draft);
@@ -529,17 +661,14 @@ describe("新建项目入口", () => {
     fireEvent.click(screen.getByRole("button", { name: "创建项目" }));
     await waitFor(() => expect(postCalls).toHaveLength(1));
 
-    // 请求在飞时离开走的是 busy 分支：提示说的是“有正在进行的操作”，不是单纯的
-    // “表单没保存”。拒绝确认就停在原工作空间。
-    vi.mocked(window.confirm).mockReturnValue(false);
+    // 普通范围切换不得用确认绕过在途操作；安全退出才有明确例外。
     fireEvent.change(screen.getByLabelText("工作空间"), { target: { value: WORKSPACE_B } });
-    await waitFor(() =>
-      expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining("正在进行的操作")),
-    );
+    await waitFor(() => expect(window.alert).toHaveBeenCalledWith(expect.stringContaining("普通切换不能丢弃")));
     expect((screen.getByLabelText("工作空间") as HTMLSelectElement).value).toBe(WORKSPACE_ID);
 
-    // 确认之后才真的换工作空间；新工作空间的表单不被上一个范围的忙碌锁住。
-    vi.mocked(window.confirm).mockReturnValue(true);
+    // 原操作完成后才允许普通切换；新工作空间不被旧范围锁住。
+    releaseCreate?.();
+    await waitFor(() => expect(screen.queryByText("创建中…")).toBeNull());
     fireEvent.change(screen.getByLabelText("工作空间"), { target: { value: WORKSPACE_B } });
     await waitFor(() =>
       expect((screen.getByLabelText("项目") as HTMLSelectElement).value).toBe(PROJECT_B),

@@ -27,10 +27,12 @@ export function RequestTabs({
   tabs,
   activeId,
   onChange,
+  idPrefix = "request",
 }: {
   tabs: RequestTab[];
   activeId: string;
   onChange: (id: string) => void;
+  idPrefix?: string;
 }) {
   const refs = useRef<Record<string, HTMLButtonElement | null>>({});
 
@@ -59,9 +61,9 @@ export function RequestTabs({
               key={tab.id}
               type="button"
               role="tab"
-              id={`request-tab-${tab.id}`}
+              id={`${idPrefix}-tab-${tab.id}`}
               aria-selected={selected}
-              aria-controls={`request-panel-${tab.id}`}
+              aria-controls={`${idPrefix}-panel-${tab.id}`}
               tabIndex={selected ? 0 : -1}
               className={selected ? "tab tab-active" : "tab"}
               ref={(node) => {
@@ -80,8 +82,8 @@ export function RequestTabs({
         <div
           key={tab.id}
           role="tabpanel"
-          id={`request-panel-${tab.id}`}
-          aria-labelledby={`request-tab-${tab.id}`}
+          id={`${idPrefix}-panel-${tab.id}`}
+          aria-labelledby={`${idPrefix}-tab-${tab.id}`}
           hidden={tab.id !== activeId}
           className="tab-panel"
         >

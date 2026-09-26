@@ -82,12 +82,13 @@ function parametersToInputs(type: AssertionType | null, parameters: unknown): Re
 }
 
 function renderControl(
+  idPrefix: string,
   name: string,
   field: ParamField,
   value: unknown,
   onChange: (next: unknown) => void,
 ) {
-  const id = `param-${name}`;
+  const id = `${idPrefix}-param-${name}`;
   const label = field.label ?? name;
   if (field.control === "switch") {
     return (
@@ -150,6 +151,7 @@ export function AssertionEditor({
   editing,
   onSubmit,
   onCancel,
+  idPrefix = "assertion",
 }: {
   types: AssertionType[];
   field: FieldContext;
@@ -161,6 +163,7 @@ export function AssertionEditor({
   editing: boolean;
   onSubmit: (draft: AssertionDraft) => void;
   onCancel: () => void;
+  idPrefix?: string;
 }) {
   const candidates = useMemo(() => applicableTypes(types, field.fieldType), [types, field.fieldType]);
   const [selected, setSelected] = useState(() => candidates.some((item) => item.id === initial?.type) ? (initial?.type ?? "") : "");
@@ -255,8 +258,8 @@ export function AssertionEditor({
       </p>
 
       <span className="param">
-        <label htmlFor="assertion-type">断言类型</label>
-        <select id="assertion-type" value={selected} onChange={(e) => chooseType(e.target.value)}>
+        <label htmlFor={`${idPrefix}-type`}>断言类型</label>
+        <select id={`${idPrefix}-type`} value={selected} onChange={(e) => chooseType(e.target.value)}>
           <option value="">请选择</option>
           {groups.map((group) => (
             <optgroup key={group.group} label={group.group}>
@@ -275,7 +278,7 @@ export function AssertionEditor({
       <div className="param-grid">
         {type
           ? Object.entries(type.params_schema).map(([name, paramField]) =>
-              renderControl(name, paramField, inputs[name], (next) =>
+              renderControl(idPrefix, name, paramField, inputs[name], (next) =>
                 setInputs((current) => ({ ...current, [name]: next })),
               ),
             )
@@ -288,9 +291,9 @@ export function AssertionEditor({
 
       <div className="param-row">
         <span className="param">
-          <label htmlFor="assertion-severity">严重级别</label>
+          <label htmlFor={`${idPrefix}-severity`}>严重级别</label>
           <select
-            id="assertion-severity"
+            id={`${idPrefix}-severity`}
             value={severity}
             onChange={(e) => setSeverity(e.target.value === "warning" ? "warning" : "error")}
           >
@@ -300,9 +303,9 @@ export function AssertionEditor({
         </span>
         {field.fieldType === "string" || field.fieldType === "integer" ? (
           <span className="param">
-            <label htmlFor="assertion-compare">比较方式</label>
+            <label htmlFor={`${idPrefix}-compare`}>比较方式</label>
             <select
-              id="assertion-compare"
+              id={`${idPrefix}-compare`}
               value={compareAs ?? ""}
               onChange={(e) => {
                 const next = e.target.value;

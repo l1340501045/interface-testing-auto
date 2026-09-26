@@ -8,7 +8,7 @@
  * 页面只展示服务端持久化的运行与结果，不根据本地状态推断“已完成”。入参失败不发请求，
  * 网络失败与断言失败在报告里是不同类别，这里按类别如实呈现。
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { ApiError, apiSend, projectPath } from "../api/client";
 import type { CaseVersion, RunReport } from "../api/types";
@@ -23,10 +23,26 @@ export interface RunProvenance {
 }
 
 function toRunId(raw: unknown): string | null {
-  if (typeof raw !== "object" || raw === null) return null;
+  if (typeof raw !== "object" || raw === null) throw new Error("运行受理响应损坏：缺少运行编号");
   const id = (raw as Record<string, unknown>).id;
-  return typeof id === "string" ? id : null;
+  if (typeof id !== "string" || id === "") throw new Error("运行受理响应损坏：缺少运行编号");
+  return id;
 }
+
+/** 后端在创建 Run 记录前就会返回的稳定准入拒绝码；仅首次提交可据此结束本地操作。 */
+const INITIAL_RUN_REJECTIONS = new Map<string, number>([
+  ["target_required", 400],
+  ["case_invalid", 400],
+  ["environment_url_invalid", 400],
+  ["target_not_allowed", 400],
+  ["production_blocked", 403],
+  ["pool_unavailable", 400],
+  ["pool_not_granted", 403],
+  ["pool_config_invalid", 400],
+  ["not_found", 404],
+  ["forbidden", 403],
+  ["client_contract_required", 409],
+]);
 
 export function ReportView({ report }: { report: RunReport }) {
   return (
@@ -113,6 +129,10 @@ export function RunPanel({
   canCancel = false,
   readOnly = false,
   showHistory = true,
+  operationBlocked = false,
+  onOperationActive,
+  tryAcquireOperation,
+  releaseOperation,
 }: {
   workspaceId: string;
   projectId: string;
@@ -166,10 +186,24 @@ export function RunPanel({
   readOnly?: boolean;
   /** 独立任务／报告页已承接历史时，只保留版本执行动作。 */
   showHistory?: boolean;
+  operationBlocked?: boolean;
+  onOperationActive?: (active: boolean) => void;
+  tryAcquireOperation?: () => boolean;
+  releaseOperation?: () => void;
 }) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [accepted, setAccepted] = useState<string | null>(null);
+  const [unknown, setUnknown] = useState<{
+    key: string;
+    payload: { environment_id: string; case_version_id: string };
+    version: CaseVersion;
+    provenance: RunProvenance;
+  } | null>(null);
+  const localOperation = useRef(false);
+
+  useLayoutEffect(() => onOperationActive?.(busy || unknown !== null), [busy, unknown, onOperationActive]);
+  useLayoutEffect(() => () => onOperationActive?.(false), [onOperationActive]);
 
   const runs = useRuns(workspaceId, projectId, environmentId, showHistory);
   // 独立历史页只替代列表呈现；当前编辑器刚提交的版本运行仍要把报告回填给响应区。
@@ -187,6 +221,7 @@ export function RunPanel({
   async function startRun() {
     setError(null);
     setAccepted(null);
+    if (operationBlocked || unknown !== null || localOperation.current) return;
     if (environmentId === null) {
       setError("请先选择执行环境。");
       return;
@@ -197,6 +232,9 @@ export function RunPanel({
       setError("当前范围或执行配置已变化，请确认后重新提交。");
       return;
     }
+    if (tryAcquireOperation && !tryAcquireOperation()) return;
+    localOperation.current = true;
+    let keepOperation = false;
     setBusy(true);
     try {
       // 执行固定已发布版本：草稿变化不会影响本次运行，也不会有中间态请求被发出去。
@@ -207,29 +245,73 @@ export function RunPanel({
         setError("发布未完成，未提交运行。");
         return;
       }
+      const currentProvenance = captureProvenance();
+      if (
+        currentProvenance === null ||
+        currentProvenance.environmentId !== provenance.environmentId ||
+        currentProvenance.configEpoch !== provenance.configEpoch
+      ) {
+        setError("保存或版本准备期间执行环境／配置已变化；已保存成果保留，本次没有继续提交运行。");
+        return;
+      }
+      const pending = {
+        key: typeof crypto !== "undefined" && typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
+        payload: { environment_id: environmentId, case_version_id: version.id },
+        version,
+        provenance,
+      };
+      keepOperation = await submitPending(pending, "initial");
+    } catch (cause) {
+      setError(cause instanceof ApiError ? cause.message : cause instanceof Error ? cause.message : "提交运行失败");
+    } finally {
+      setBusy(false);
+      if (!keepOperation) {
+        localOperation.current = false;
+        releaseOperation?.();
+      }
+    }
+  }
+
+  async function submitPending(pending: NonNullable<typeof unknown>, mode: "initial" | "confirm"): Promise<boolean> {
+    try {
       const run = await apiSend(
         projectPath(workspaceId, projectId, "/runs"),
         "POST",
-        { environment_id: environmentId, case_version_id: version.id },
+        pending.payload,
         toRunId,
+        { headers: { "Idempotency-Key": pending.key } },
       );
+      setUnknown(null);
       // 不写“正在等待领取”这类静态预测：真实阶段与结果由上方响应区和本列表按服务端
       // 状态呈现，长期挂着的 banner 只会与已经结束的运行自相矛盾。
       setAccepted(
         run
-          ? `已提交运行（编号 ${run.slice(0, 8)}），执行已发布版本 v${version.version}。`
+          ? `已提交运行（编号 ${run.slice(0, 8)}），执行已发布版本 v${pending.version.version}。`
           : "已提交运行。",
       );
       if (run !== null) {
         onSelectRun(run);
         // 传的是提交前捕获的那一份，不是此刻重新读的配置。
-        onRunSubmitted(run, provenance);
+        onRunSubmitted(run, pending.provenance);
       }
       runs.reload();
+      return false;
     } catch (cause) {
-      setError(cause instanceof ApiError ? cause.message : cause instanceof Error ? cause.message : "提交运行失败");
-    } finally {
-      setBusy(false);
+      if (
+        mode === "initial" &&
+        cause instanceof ApiError &&
+        INITIAL_RUN_REJECTIONS.get(cause.code) === cause.status
+      ) {
+        setUnknown(null);
+        setError(cause.message);
+        return false;
+      }
+      // 除服务端明确声明“创建运行前已拒绝”的准入错误外，网络、正文解析、损坏信封以及
+      // 确认阶段的 403/409 都不能证明首次未受理。
+      setUnknown(pending);
+      const detail = cause instanceof Error ? `（${cause.message}）` : "";
+      setError(`服务端是否已受理暂时未知${detail}。请使用原操作确认；不会更换内容或重复生成操作键。`);
+      return true;
     }
   }
 
@@ -255,7 +337,7 @@ export function RunPanel({
         <button
           type="button"
           onClick={() => void startRun()}
-          disabled={busy || caseId === null || readOnly}
+          disabled={busy || caseId === null || readOnly || operationBlocked || unknown !== null}
         >
           {busy ? "提交中…" : "保存并执行"}
         </button>
@@ -268,6 +350,12 @@ export function RunPanel({
       ) : null}
       {caseId === null ? <Hint>请先创建并保存用例，再提交运行。</Hint> : null}
       {accepted ? <Hint>{accepted}</Hint> : null}
+      {unknown ? (
+        <div className="notice">
+          <p>这次版本运行是否受理仍未知；确认会提交完全相同的版本、环境和操作键。</p>
+          <button type="button" disabled={busy} onClick={() => { setBusy(true); void submitPending(unknown, "confirm").then((keep) => { if (!keep) { localOperation.current = false; releaseOperation?.(); } }).catch((cause) => setError(cause instanceof Error ? cause.message : "确认失败")).finally(() => setBusy(false)); }}>确认原操作</button>
+        </div>
+      ) : null}
       {error ? <ErrorText message={error} /> : null}
       {showHistory && runs.error ? <ErrorText message={runs.error.message} /> : null}
 

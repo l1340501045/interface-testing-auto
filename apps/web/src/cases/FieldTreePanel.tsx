@@ -119,6 +119,7 @@ export function FieldTreePanel({
   onChange,
   emptyHint,
   sourceKey,
+  pendingPrefix,
 }: {
   title: string;
   tree: FieldTreeState;
@@ -140,6 +141,7 @@ export function FieldTreePanel({
    * 拿上一份响应算当前条件。
    */
   sourceKey: string;
+  pendingPrefix?: string;
 }) {
   /**
    * 当前选中的字段：只记**定位路径**，节点对象每次从当前树里重新解析。
@@ -204,6 +206,7 @@ export function FieldTreePanel({
             readOnly={readOnly}
             onUpsert={(next) => onChange(upsertAssertion(assertions, next))}
             onRemove={(id) => onChange(removeAssertion(assertions, id))}
+            pendingKey={pendingPrefix ? `${pendingPrefix}:assertion-${targetSource}-${activeKey ?? "field"}` : undefined}
           />
         </div>
       ) : (

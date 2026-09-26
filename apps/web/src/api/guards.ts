@@ -25,6 +25,7 @@ import type {
   PreflightIssue,
   Project,
   RequestSpec,
+  RequestSpecV2,
   RunContext,
   RunReport,
   RunStep,
@@ -96,6 +97,23 @@ function toNameValue(raw: unknown, field: string): NameValuePair {
   return { name: asString(item.name, `${field}.name`), value: asString(item.value, `${field}.value`) };
 }
 
+function toRequestRowV2(raw: unknown, field: string): RequestSpecV2["query_params"][number] {
+  const item = asRecord(raw, field);
+  const rowId = asString(item.row_id, `${field}.row_id`);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rowId)) {
+    throw new ContractError(`${field}.row_id 应为 UUID`);
+  }
+  const description = asString(item.description, `${field}.description`);
+  if ([...description].length > 1024) throw new ContractError(`${field}.description 最多 1024 个字符`);
+  return {
+    row_id: rowId,
+    name: asString(item.name, `${field}.name`),
+    value: asString(item.value, `${field}.value`),
+    enabled: asBoolean(item.enabled, `${field}.enabled`),
+    description,
+  };
+}
+
 function toLocatorStep(raw: unknown, field: string): LocatorStep {
   const step = asRecord(raw, field);
   const kind = asString(step.kind, `${field}.kind`);
@@ -108,6 +126,7 @@ function toLocatorStep(raw: unknown, field: string): LocatorStep {
       occurrence: asNumber(step.occurrence, `${field}.occurrence`),
     };
   }
+  if (kind === "row") return { kind: "row", row_id: asString(step.row_id, `${field}.row_id`) };
   throw new ContractError(`未知定位步骤：${kind}`);
 }
 
@@ -117,14 +136,41 @@ export function toRequestSpec(raw: unknown, field = "request"): RequestSpec {
   if (bodyType !== "none" && bodyType !== "json" && bodyType !== "text" && bodyType !== "form") {
     throw new ContractError(`未知正文类型：${bodyType}`);
   }
-  const result: RequestSpec = {
+  const normalizedBodyType: RequestSpec["body_type"] = bodyType;
+  const schemaVersion = spec.schema_version;
+  if (schemaVersion !== undefined && schemaVersion !== 2) {
+    throw new ContractError(`${field}.schema_version 仅支持 2`);
+  }
+  const common = {
     method: asString(spec.method, `${field}.method`),
     path: asString(spec.path, `${field}.path`),
-    query_params: mapList(spec.query_params, `${field}.query_params`, itemGuard(`${field}.query_params`, toNameValue)),
-    headers: mapList(spec.headers, `${field}.headers`, itemGuard(`${field}.headers`, toNameValue)),
-    body_type: bodyType,
+    body_type: normalizedBodyType,
     body: asString(spec.body ?? "", `${field}.body`),
   };
+  let result: RequestSpec;
+  if (schemaVersion === undefined) {
+    for (const [index, item] of [...asArray(spec.query_params, `${field}.query_params`), ...asArray(spec.headers, `${field}.headers`)].entries()) {
+      const row = asRecord(item, `${field}.rows[${index}]`);
+      if ("row_id" in row || "enabled" in row || "description" in row) {
+        throw new ContractError("旧请求不能携带新版行元数据");
+      }
+    }
+    const queryParams = mapList(spec.query_params, `${field}.query_params`, itemGuard(`${field}.query_params`, toNameValue));
+    const headers = mapList(spec.headers, `${field}.headers`, itemGuard(`${field}.headers`, toNameValue));
+    result = { ...common, query_params: queryParams, headers };
+  } else {
+    const queryParams = mapList(spec.query_params, `${field}.query_params`, itemGuard(`${field}.query_params`, toRequestRowV2));
+    const headers = mapList(spec.headers, `${field}.headers`, itemGuard(`${field}.headers`, toRequestRowV2));
+    if (queryParams.length + headers.length > 500) {
+      throw new ContractError("Query 和 Header 合计最多 500 行");
+    }
+    const ids = new Set<string>();
+    for (const row of [...queryParams, ...headers]) {
+      if (ids.has(row.row_id)) throw new ContractError(`请求行 ID 重复：${row.row_id}`);
+      ids.add(row.row_id);
+    }
+    result = { ...common, schema_version: 2, query_params: queryParams, headers };
+  }
   const origin = asNullableString(spec.imported_origin, `${field}.imported_origin`);
   if (origin !== null) result.imported_origin = origin;
   // auth_required 只在**显式为 true** 时保留：缺省、false、以及后端省略的形态都表示

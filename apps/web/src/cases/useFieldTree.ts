@@ -31,6 +31,7 @@ export function useFieldTree(
    * 无关——用它配出来的条件是照着另一份响应写的。
    */
   sourceKey: string,
+  enabled = true,
 ): FieldTreeState {
   const inputKey = `${sourceKey}\u0000${text}`;
   /**
@@ -49,8 +50,12 @@ export function useFieldTree(
     }),
   );
   const latest = useRef(0);
+  const stateRef = useRef(state);
+  stateRef.current = state;
 
   useEffect(() => {
+    if (!enabled) return;
+    if (stateRef.current.key === inputKey && stateRef.current.tree !== null) return;
     if (!workspaceId || !projectId || !text.trim()) {
       setState({ key: inputKey, tree: null, error: null, loading: false });
       return;
@@ -92,7 +97,7 @@ export function useFieldTree(
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [workspaceId, projectId, text, sourceKey, inputKey]);
+  }, [enabled, workspaceId, projectId, text, sourceKey, inputKey]);
 
   // 门控：只有与当前输入匹配的那棵树可以交互。key 对不上时返回加载态，而不是把上一份
   // 来源的树交出去——那正是“在 r2 未到时点 r1 节点试算”的入口。

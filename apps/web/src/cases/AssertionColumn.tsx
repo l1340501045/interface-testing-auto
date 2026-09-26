@@ -4,11 +4,12 @@
  * 每条条件归属于当前用例，复制出来的条件也是新归属，不形成隐藏的共享关系。
  * 执行结果按断言标识回填，与配置并列显示，便于对照期望与实际。
  */
-import { useState } from "react";
+import { useId, useState } from "react";
 
 import type { AssertionResult, AssertionType, CaseAssertion, LocatorStep, ValueLiteral } from "../api/types";
 import { describeValue } from "../api/literals";
 import { Loading, StatusTag } from "../components/Feedback";
+import { useLeaveReport } from "../hooks/leaveGuard";
 import { AssertionEditor, type AssertionDraft, type FieldContext } from "./AssertionEditor";
 import { newAssertionId } from "./assertionGroups";
 import { summarize } from "./assertionModel";
@@ -29,6 +30,7 @@ export function AssertionColumn({
   readOnly,
   onUpsert,
   onRemove,
+  pendingKey,
 }: {
   types: AssertionType[];
   typesError: string | null;
@@ -42,9 +44,12 @@ export function AssertionColumn({
   readOnly: boolean;
   onUpsert: (next: CaseAssertion) => void;
   onRemove: (id: string) => void;
+  pendingKey?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const editorId = useId().replace(/:/g, "");
+  useLeaveReport(pendingKey ?? `assertion:${editorId}`, { dirty: open, busy: false });
 
   const editing = editingId ? (own.find((item) => item.id === editingId) ?? null) : null;
 
@@ -145,6 +150,7 @@ export function AssertionColumn({
             editing={editing !== null}
             onSubmit={commit}
             onCancel={close}
+            idPrefix={`assertion-${editorId}`}
           />
         )
       ) : readOnly ? null : (

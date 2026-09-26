@@ -9,6 +9,14 @@
 const CSRF_COOKIE = "interface_csrf";
 const CSRF_HEADER = "X-CSRF-Token";
 const API_PREFIX = "/api/v1";
+export const REQUEST_CONTRACT_HEADERS = { "X-Request-Contract": "2" } as const;
+
+/** v2 兼容错误统一转成用户可以直接采取行动的文案。 */
+function compatibilityMessage(code: string, fallback: string): string {
+  if (code === "client_contract_required") return "当前页面版本无法完整读取这份请求，请刷新页面后重试。";
+  if (code === "request_contract_downgrade") return "这份请求已使用新版参数格式，不能用旧格式覆盖；请刷新页面后继续编辑。";
+  return fallback;
+}
 
 /** 后端错误信封：稳定 code、中文 message、可关联日志的 trace_id。 */
 export interface ApiErrorBody {
@@ -49,6 +57,12 @@ export class ApiError extends Error {
  */
 type UnauthorizedListener = () => void;
 const unauthorizedListeners = new Set<UnauthorizedListener>();
+let sessionGeneration = 0;
+
+/** 同步作废当前主体已发出的旧请求结果；不会声称取消已经到达服务端的写操作。 */
+export function invalidateClientSession(): void {
+  sessionGeneration += 1;
+}
 
 export function onUnauthorized(listener: UnauthorizedListener): () => void {
   unauthorizedListeners.add(listener);
@@ -58,6 +72,7 @@ export function onUnauthorized(listener: UnauthorizedListener): () => void {
 }
 
 function notifyUnauthorized(): void {
+  invalidateClientSession();
   for (const listener of [...unauthorizedListeners]) listener();
 }
 
@@ -103,8 +118,14 @@ function toErrorBody(payload: unknown, status: number): ApiErrorBody {
 }
 
 async function send(path: string, options: RequestOptions): Promise<RawResponse> {
+  const generation = sessionGeneration;
   const method = options.method ?? "GET";
-  const headers: Record<string, string> = { Accept: "application/json", ...options.headers };
+  // 新客户端始终声明完整理解 RequestSpec v2；后端只在相关资源上使用该能力声明。
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    ...REQUEST_CONTRACT_HEADERS,
+    ...options.headers,
+  };
   if (method !== "GET" && method !== "HEAD") {
     headers[CSRF_HEADER] = readCookie(CSRF_COOKIE);
   }
@@ -121,8 +142,10 @@ async function send(path: string, options: RequestOptions): Promise<RawResponse>
     if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
     throw new NetworkError("无法连接服务，请检查网络后重试");
   }
+  if (generation !== sessionGeneration) throw new DOMException("旧会话请求已作废", "AbortError");
 
   const text = await response.text();
+  if (generation !== sessionGeneration) throw new DOMException("旧会话请求已作废", "AbortError");
   let payload: unknown = null;
   if (text) {
     try {
@@ -133,10 +156,17 @@ async function send(path: string, options: RequestOptions): Promise<RawResponse>
     }
   }
   if (!response.ok) {
+    if (generation !== sessionGeneration) throw new DOMException("旧会话请求已作废", "AbortError");
     const error = toErrorBody(payload, response.status);
     if (response.status === 401) notifyUnauthorized();
-    throw new ApiError(response.status, error.code, error.message, error.trace_id);
+    throw new ApiError(
+      response.status,
+      error.code,
+      compatibilityMessage(error.code, error.message),
+      error.trace_id,
+    );
   }
+  if (generation !== sessionGeneration) throw new DOMException("旧会话请求已作废", "AbortError");
   return { status: response.status, headers: response.headers, body: payload };
 }
 

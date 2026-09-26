@@ -50,8 +50,8 @@ export function addressPreview(baseUrl: string | null, request: RawRequest): str
   const base = (baseUrl ?? "").replace(/\/+$/, "");
   const path = request.path.trim() === "" ? "/" : ltrimPath(request.path.trim());
   const query = request.query_params
-    .filter((row) => row.name.trim() !== "")
-    .map((row) => `${row.name.trim()}=${row.value}`)
+    .filter((row) => row.enabled !== false && (request.schema_version === 2 ? row.name !== "" : row.name.trim() !== ""))
+    .map((row) => `${request.schema_version === 2 ? row.name : row.name.trim()}=${row.value}`)
     .join("&");
   return query === "" ? `${base}${path}` : `${base}${path}?${query}`;
 }
@@ -100,6 +100,7 @@ export function SendBar({
   onCancelAuthorization,
   authorization,
   tools,
+  idPrefix,
 }: {
   request: RawRequest;
   environments: Environment[];
@@ -146,13 +147,17 @@ export function SendBar({
    * 等于没有这个能力。
    */
   tools?: ReactNode;
+  idPrefix?: string;
 }) {
+  const methodId = idPrefix ? `${idPrefix}-method` : "request-method";
+  const pathId = idPrefix ? `${idPrefix}-path` : "request-path";
+  const environmentId = idPrefix ? `${idPrefix}-environment` : "send-environment";
   const environment = environments.find((item) => item.id === selectedEnvironmentId) ?? null;
   const preview = environment === null ? null : addressPreview(environment.base_url, request);
   const methods = METHODS.includes(request.method) ? METHODS : [request.method, ...METHODS];
   const hasVariables =
     VARIABLE_PATTERN.test(request.path) ||
-    request.query_params.some((row) => VARIABLE_PATTERN.test(row.value));
+    request.query_params.some((row) => row.enabled !== false && VARIABLE_PATTERN.test(row.value));
   const awaitingAuthorization = stage === "awaiting_authorization";
   const blocked = preflight !== null && !preflight.ready;
   const needsAuthorize =
@@ -187,9 +192,9 @@ export function SendBar({
     <div className="send-bar">
       <div className="send-line">
         <span className="param method-cell">
-          <label htmlFor="request-method">方法</label>
+          <label htmlFor={methodId}>方法</label>
           <select
-            id="request-method"
+            id={methodId}
             value={request.method}
             disabled={readOnly}
             onChange={(event) => onPatch({ method: event.target.value })}
@@ -202,9 +207,9 @@ export function SendBar({
           </select>
         </span>
         <span className="param grow">
-          <label htmlFor="request-path">路径</label>
+          <label htmlFor={pathId}>路径</label>
           <input
-            id="request-path"
+            id={pathId}
             value={request.path}
             readOnly={readOnly}
             placeholder="/orders"
@@ -212,9 +217,9 @@ export function SendBar({
           />
         </span>
         <span className="param">
-          <label htmlFor="send-environment">执行环境</label>
+          <label htmlFor={environmentId}>执行环境</label>
           <select
-            id="send-environment"
+            id={environmentId}
             value={selectedEnvironmentId ?? ""}
             disabled={readOnly}
             onChange={(event) => onSelectEnvironment(event.target.value)}

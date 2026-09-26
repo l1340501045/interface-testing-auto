@@ -14,6 +14,7 @@ import { AssertionColumn } from "./AssertionColumn";
 import { FieldTreePanel } from "./FieldTreePanel";
 import { fieldAssertions, groupByField, removeAssertion, upsertAssertion } from "./assertionGroups";
 import type { FieldTreeState } from "./useFieldTree";
+import type { RawRequest } from "./requestDraft";
 
 /** 固定的响应断言行：状态码与耗时无需样例即可配置。 */
 export const RESPONSE_FIELDS = [
@@ -33,6 +34,8 @@ export function AssertionTab({
   bodyTree,
   bodySourceKey,
   bodyHint,
+  pendingPrefix,
+  request,
 }: {
   workspaceId: string;
   projectId: string;
@@ -47,6 +50,8 @@ export function AssertionTab({
   /** 请求正文字段树的来源标识（即正文本身）；换代时清掉选中节点。 */
   bodySourceKey: string;
   bodyHint: string;
+  pendingPrefix?: string;
+  request: RawRequest;
 }) {
   // 按字段分组复用既有实现：它同时负责同字段条件按 sort_order 排序，自己再滤一遍
   // 会得到第二份顺序规则，删改之后两边就可能不一致。
@@ -78,6 +83,7 @@ export function AssertionTab({
             readOnly={readOnly}
             onUpsert={(next) => onChange(upsertAssertion(assertions, next))}
             onRemove={(id) => onChange(removeAssertion(assertions, id))}
+            pendingKey={pendingPrefix ? `${pendingPrefix}:assertion-${field.target}` : undefined}
           />
         </div>
       ))}
@@ -99,11 +105,12 @@ export function AssertionTab({
         readOnly={readOnly}
         onChange={onChange}
         emptyHint={bodyHint}
+        pendingPrefix={pendingPrefix}
       />
 
       <h3>全部条件</h3>
       <p className="caption">条件属于当前用例；字段旁的配置入口是主路径，这里是汇总视图。</p>
-      <AssertionSummary assertions={assertions} results={results} />
+      <AssertionSummary assertions={assertions} results={results} request={request} readOnly={readOnly} onChange={onChange} />
     </>
   );
 }
@@ -112,9 +119,15 @@ export function AssertionTab({
 function AssertionSummary({
   assertions,
   results,
+  request,
+  readOnly,
+  onChange,
 }: {
   assertions: CaseAssertion[];
   results: Map<string, AssertionResult>;
+  request: RawRequest;
+  readOnly: boolean;
+  onChange: (next: CaseAssertion[]) => void;
 }) {
   if (assertions.length === 0) {
     return (
@@ -132,20 +145,61 @@ function AssertionSummary({
           <th>类型</th>
           <th>严重级别</th>
           <th>最近结论</th>
+          <th>处理</th>
         </tr>
       </thead>
       <tbody>
-        {assertions.map((item) => (
+        {assertions.map((item) => {
+          const first = item.selector[0];
+          const rows = item.target_source === "request.query"
+            ? request.query_params
+            : item.target_source === "request.header"
+              ? request.headers
+              : [];
+          const orphaned = first?.kind === "row" && !rows.some((row) => row.row_id === first.row_id);
+          const canRebind = first?.kind === "row" && (item.target_source === "request.query" || item.target_source === "request.header");
+          return (
           <tr key={item.id}>
             <td>
               {item.target_source}
               {item.selector.length > 0 ? ` · ${item.selector.length} 级定位` : ""}
+              {orphaned ? <strong className="field-warn"> · 字段已删除</strong> : null}
+              {first && first.kind !== "row" && (item.target_source === "request.query" || item.target_source === "request.header") ? <span className="caption"> · 历史位置条件</span> : null}
             </td>
             <td>{item.type}</td>
             <td>{item.severity === "error" ? "必需" : "提示"}</td>
             <td>{assertionResultLabel(results.get(item.id))}</td>
+            <td>
+              {readOnly ? null : (
+                <span className="inline-actions">
+                  {orphaned && canRebind ? (
+                    <label>
+                      重新绑定
+                      <select
+                        aria-label={`重新绑定条件 ${item.id}`}
+                        value=""
+                        onChange={(event) => {
+                          const rowId = event.target.value;
+                          if (rowId === "" || first?.kind !== "row") return;
+                          onChange(assertions.map((assertion) => assertion.id === item.id ? { ...assertion, selector: [{ kind: "row", row_id: rowId }, ...assertion.selector.slice(1)] } : assertion));
+                        }}
+                      >
+                        <option value="">选择当前字段…</option>
+                        {rows.map((row, index) => row.row_id ? (
+                          <option key={row.row_id} value={row.row_id}>
+                            {index + 1}. {row.name || "未命名字段"}{row.enabled === false ? "（已停用）" : ""}
+                          </option>
+                        ) : null)}
+                      </select>
+                    </label>
+                  ) : null}
+                  <button type="button" onClick={() => onChange(removeAssertion(assertions, item.id))}>删除</button>
+                </span>
+              )}
+            </td>
           </tr>
-        ))}
+          );
+        })}
       </tbody>
     </table>
   );
