@@ -37,6 +37,7 @@ import { CaseHeading } from "./CaseHeading";
 import { unknownFolderLabel } from "./folderLabels";
 import { BodyEditor, KeyValueRows } from "./RequestParts";
 import { RequestTabs } from "./RequestTabs";
+import { ResizableWorkbench } from "./ResizableWorkbench";
 import { ResponseFieldPanel } from "./ResponseFieldPanel";
 import { RunPanel, type RunProvenance } from "../runs/RunPanel";
 import { emptyRequest, rawToSpec, requestToRaw, sameRequest, type RawRequest } from "./requestDraft";
@@ -124,6 +125,7 @@ export function CaseEditor({
   onOpenEnvironment,
   configEpoch = 0,
   getConfigEpoch,
+  separateHistory = false,
 }: {
   workspaceId: string;
   projectId: string;
@@ -164,10 +166,10 @@ export function CaseEditor({
   projectRole?: string | null;
   /** 当前登录用户 id：就地授权要指定被授权人，只能是自己。 */
   currentUserId?: string | null;
-  /** 打开侧栏的环境与凭证管理入口；界面整理不改变原有功能的可达性。 */
+  /** 打开独立环境配置页并定位身份配置；界面整理不改变原有能力。 */
   onOpenAdmin?: () => void;
   /**
-   * 打开侧栏管理区里**环境**那一段的入口。
+   * 打开独立配置页里**环境**那一段的入口。
    *
    * 与 `onOpenAdmin` 分开，是因为两者要去的地方不同：地址类问题（例如环境地址缺协议）
    * 要送到环境编辑，凭证类问题要送到凭证列表。不传时退回 `onOpenAdmin`，老调用点不受影响。
@@ -187,6 +189,8 @@ export function CaseEditor({
    * `configEpoch` 会读到发起时的旧值，于是失效比用户看到的晚一拍。
    */
   getConfigEpoch?: () => number | null;
+  /** App 已提供独立任务／报告页时，编辑器只保留版本执行动作。 */
+  separateHistory?: boolean;
 }) {
   // 新建的用例在保存后才有 id。这里自己记住它，避免“创建成功但再保存又建一条”。
   const [currentId, setCurrentId] = useState<string | null>(caseSummaryId);
@@ -1131,35 +1135,41 @@ export function CaseEditor({
         地址行：唯一一组方法／路径／环境输入，加上常驻的蓝色「发送」。
         首屏第一眼就能找到它——这是本轮的核心改动，不再藏在长表单底部。
       */}
-      <SendBar
-        request={request}
-        environments={environments}
-        selectedEnvironmentId={selectedEnvironmentId}
-        onSelectEnvironment={onSelectEnvironment}
-        onPatch={patchRequest}
-        onSend={() => void sendDebug()}
-        onStopWaiting={debug.stopWaiting}
-        onRetryAcceptance={() => void debug.retryAcceptance()}
-        onResumeWaiting={debug.resumeWaiting}
-        paused={debug.paused}
-        stage={sendStage}
-        readOnly={readOnly}
-        readOnlyReason={readOnlyReason}
-        preflight={debug.preflight}
-        preflightError={debug.preflightError}
-        preflighting={debug.preflighting}
-        onOpenAdmin={() => onOpenAdmin?.()}
-        onOpenEnvironment={onOpenEnvironment ? () => onOpenEnvironment() : undefined}
-        canAuthorize={debug.preflight?.can_authorize ?? false}
-        onSubmitAuthorization={() => void confirmAuthorization()}
-        onCancelAuthorization={cancelAuthorization}
-        tools={<CurlImport onImport={importCurl} disabled={readOnly} loading={busy} />}
-        authorization={debug.authorizationView}
-      />
-      {sendError ? <ErrorText message={sendError} /> : null}
-      {debug.error ? <ErrorText message={debug.error} /> : null}
-      {debug.notice ? <Notice tone="info" title={debug.notice} /> : null}
-
+      <ResizableWorkbench
+        controls={(
+          <>
+            <SendBar
+              request={request}
+              environments={environments}
+              selectedEnvironmentId={selectedEnvironmentId}
+              onSelectEnvironment={onSelectEnvironment}
+              onPatch={patchRequest}
+              onSend={() => void sendDebug()}
+              onStopWaiting={debug.stopWaiting}
+              onRetryAcceptance={() => void debug.retryAcceptance()}
+              onResumeWaiting={debug.resumeWaiting}
+              paused={debug.paused}
+              stage={sendStage}
+              readOnly={readOnly}
+              readOnlyReason={readOnlyReason}
+              preflight={debug.preflight}
+              preflightError={debug.preflightError}
+              preflighting={debug.preflighting}
+              onOpenAdmin={() => onOpenAdmin?.()}
+              onOpenEnvironment={onOpenEnvironment ? () => onOpenEnvironment() : undefined}
+              canAuthorize={debug.preflight?.can_authorize ?? false}
+              onSubmitAuthorization={() => void confirmAuthorization()}
+              onCancelAuthorization={cancelAuthorization}
+              tools={<CurlImport onImport={importCurl} disabled={readOnly} loading={busy} />}
+              authorization={debug.authorizationView}
+            />
+            {sendError ? <ErrorText message={sendError} /> : null}
+            {debug.error ? <ErrorText message={debug.error} /> : null}
+            {debug.notice ? <Notice tone="info" title={debug.notice} /> : null}
+          </>
+        )}
+        request={(
+          <>
       <div className="block">
         {/*
           标签只切换可见性，不卸载面板：切走再回来时输入框、光标与未提交的编辑都还在。
@@ -1270,6 +1280,11 @@ export function CaseEditor({
         />
       </div>
 
+          </>
+        )}
+        response={(
+          <>
+
       {/*
         只在**确有终态结果**且与当前输入不同源时提示“字段行标为未执行”。
         排队中的运行还没有结论：那时说“字段行旁显示的是最近一次运行的结论”是一句空话，
@@ -1278,7 +1293,9 @@ export function CaseEditor({
       {displayedReport !== null && isTerminal(displayedReport.run) && !activeMatches ? (
         <Hint>
           字段行旁显示的是最近一次运行的结论，但当前内容或执行环境已与那次运行不同，因此统一标为“未执行”；
-          那次运行的完整报告仍在下方“本次记录”与“项目／环境历史”里。
+          {separateHistory
+            ? "那次运行的完整报告仍可在“本次记录”或顶部“测试报告”中查看。"
+            : "那次运行的完整报告仍可在“本次记录”或本页“项目／环境历史”中查看。"}
         </Hint>
       ) : null}
 
@@ -1314,8 +1331,10 @@ export function CaseEditor({
           本次记录{debug.records.length > 0 ? `（${debug.records.length}）` : ""}
         </summary>
         <p className="caption">
-          只列<strong>本次打开这个编辑器</strong>期间受理的运行。关闭或刷新后，请到下面的
-          “项目／环境历史”里按项目／环境查看。
+          只列<strong>本次打开这个编辑器</strong>期间受理的运行。关闭或刷新后，
+          {separateHistory
+            ? "请到顶部“任务中心”或“测试报告”按项目／环境查看。"
+            : "请到本页“项目／环境历史”按项目／环境查看。"}
         </p>
         {debug.records.length === 0 ? (
           <Hint>还没有本次调试记录。点击地址行右侧的「发送」即可调试当前编辑内容。</Hint>
@@ -1341,6 +1360,10 @@ export function CaseEditor({
         )}
       </details>
 
+          </>
+        )}
+      />
+
 
       {/*
         已发布版本的执行与项目／环境历史。它是次级操作：这里的「保存并执行」会先按
@@ -1348,7 +1371,7 @@ export function CaseEditor({
         执行的既有约束（必须有版本、必须先保存）不变。
       */}
       <details className="block">
-        <summary>项目／环境历史与版本执行</summary>
+        <summary>版本执行与发布记录</summary>
         <RunPanel
           workspaceId={workspaceId}
           projectId={projectId}
@@ -1364,6 +1387,7 @@ export function CaseEditor({
           captureProvenance={captureRunProvenance}
           canCancel={!readOnly}
           readOnly={readOnly}
+          showHistory={!separateHistory}
         />
         <h3>已发布版本</h3>
         {versions.length > 0 ? (

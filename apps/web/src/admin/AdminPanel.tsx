@@ -20,6 +20,9 @@ export function AdminPanel({
   currentUser,
   currentCase,
   anchorId,
+  credentialsAnchorId,
+  credentialsOpen,
+  onCredentialsOpenChange,
   onExecutionConfigChanged,
 }: {
   workspaceId: string;
@@ -34,6 +37,9 @@ export function AdminPanel({
    * 只是滚动与聚焦，不改变可见性——原有管理能力必须始终可达，不能靠 CSS 藏起来。
    */
   anchorId?: string;
+  credentialsAnchorId?: string;
+  credentialsOpen?: boolean;
+  onCredentialsOpenChange?: (open: boolean) => void;
   /**
    * 执行配置**成功变更**的通知（环境／变量／身份）。
    *
@@ -62,6 +68,9 @@ export function AdminPanel({
         currentUser={currentUser}
         currentCase={currentCase}
         onExecutionConfigChanged={onExecutionConfigChanged}
+        anchorId={credentialsAnchorId}
+        open={credentialsOpen}
+        onOpenChange={onCredentialsOpenChange}
       />
     </div>
   );

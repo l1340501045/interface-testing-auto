@@ -363,7 +363,7 @@ async function openCase(): Promise<void> {
 
 /** 执行已发布版本（真实 RunPanel 的「保存并执行」），返回提交次数。 */
 async function runVersion(): Promise<void> {
-  const history = screen.getByRole("heading", { name: "已发布版本执行与项目历史" }).closest(".block");
+  const history = screen.getByRole("heading", { name: "执行已发布版本" }).closest(".block");
   fireEvent.click(within(history as HTMLElement).getByRole("button", { name: "保存并执行" }));
   await act(async () => {});
 }
@@ -378,7 +378,7 @@ async function expectCurrentPassed(): Promise<void> {
     await waitFor(() => expect(assertionColumnText()).toContain("通过"));
   } catch (cause) {
     // eslint-disable-next-line no-console
-    console.log("DIAG-HIST", JSON.stringify((screen.getByRole("heading", { name: "已发布版本执行与项目历史" }).closest(".block") as HTMLElement).textContent?.slice(0, 300)), "| calls:", JSON.stringify(calls.slice(-6)));
+    console.log("DIAG-HIST", JSON.stringify((screen.getByRole("heading", { name: "执行已发布版本" }).closest(".block") as HTMLElement).textContent?.slice(0, 300)), "| calls:", JSON.stringify(calls.slice(-6)));
     throw cause;
   }
 }
@@ -392,18 +392,23 @@ async function expectNotCurrent(): Promise<void> {
 }
 
 function admin(): HTMLElement {
-  const panel = document.querySelector(".sidebar-admin");
+  const panel = screen.queryByRole("region", { name: "环境配置" });
   if (panel === null) throw new Error("管理入口未挂载");
   return panel as HTMLElement;
 }
 
 async function openAdmin(): Promise<HTMLElement> {
-  fireEvent.click(screen.getByRole("button", { name: "环境与凭证管理" }));
+  fireEvent.click(screen.getByRole("button", { name: "环境配置" }));
   await act(async () => {});
   return admin();
 }
 
+function returnWorkbench(): void {
+  fireEvent.click(screen.getByRole("button", { name: "接口工作台" }));
+}
+
 beforeEach(() => {
+  window.history.replaceState(null, "", "#/workbench");
   runSeq = 0;
   calls.length = 0;
   runGate.pending = null;
@@ -443,7 +448,7 @@ describe("R5 版本配置依据在 POST 前固定", () => {
 
     // 发起版本执行，但让 202 一直不回来。
     holdNextRun();
-    const history = screen.getByRole("heading", { name: "已发布版本执行与项目历史" }).closest(".block");
+    const history = screen.getByRole("heading", { name: "执行已发布版本" }).closest(".block");
     fireEvent.click(within(history as HTMLElement).getByRole("button", { name: "保存并执行" }));
     await act(async () => {});
     expect(runGate.pending).not.toBeNull();
@@ -456,6 +461,7 @@ describe("R5 版本配置依据在 POST 前固定", () => {
     await act(async () => {
       fireEvent.click(within(panel).getByRole("button", { name: "保存环境" }));
     });
+    returnWorkbench();
 
     // 现在放行 202。
     await act(async () => {
@@ -487,6 +493,7 @@ describe("R5 版本配置依据在 POST 前固定", () => {
     await act(async () => {
       fireEvent.click(within(panel).getByRole("button", { name: "保存环境" }));
     });
+    returnWorkbench();
     await expectNotCurrent();
 
     await runVersion();
@@ -513,6 +520,7 @@ describe("版本运行当前结论的执行配置依据", () => {
     await act(async () => {
       fireEvent.click(within(panel).getByRole("button", { name: "保存环境" }));
     });
+    returnWorkbench();
 
     await expectNotCurrent();
     // 旧报告仍可读：响应区照常显示那条运行的终态与结果。
@@ -532,6 +540,7 @@ describe("版本运行当前结论的执行配置依据", () => {
     await act(async () => {
       fireEvent.click(within(panel).getByRole("button", { name: "保存为新版本" }));
     });
+    returnWorkbench();
 
     await expectNotCurrent();
   });
@@ -551,6 +560,7 @@ describe("版本运行当前结论的执行配置依据", () => {
     await act(async () => {
       fireEvent.click(within(panel).getByRole("button", { name: "保存整份绑定集合" }));
     });
+    returnWorkbench();
 
     await expectNotCurrent();
   });
@@ -565,6 +575,7 @@ describe("版本运行当前结论的执行配置依据", () => {
     await act(async () => {
       fireEvent.click(within(panel).getByRole("button", { name: "撤销授权" }));
     });
+    returnWorkbench();
 
     await expectNotCurrent();
   });
@@ -582,6 +593,7 @@ describe("版本运行当前结论的执行配置依据", () => {
     await act(async () => {
       fireEvent.click(within(panel).getByRole("button", { name: "保存环境" }));
     });
+    returnWorkbench();
     await expectNotCurrent();
 
     // 在新配置下重新运行 → 依据重新建立（新 run_id、新配置世代）。

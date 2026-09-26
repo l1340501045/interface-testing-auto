@@ -49,6 +49,48 @@ export function runOutcomeLabel(run: RunSummary): string {
   }
 }
 
+export function runTargetLabel(run: RunSummary): string {
+  if (run.target_type === "debug_snapshot") return "临时调试";
+  if (run.target_type === "case_version") return "固定版本";
+  return run.target_type;
+}
+
+export function runTimeLabel(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
+export function stepStateLabel(state: string): string {
+  if (state === "created") return "已创建";
+  if (state === "queued") return "排队中";
+  if (state === "running") return "执行中";
+  if (state === "sending") return "发送中";
+  if (state === "finished") return "已结束";
+  if (state === "skipped") return "已跳过";
+  return state;
+}
+
+export function stepOutcomeLabel(outcome: string | null): string | null {
+  if (outcome === null) return null;
+  if (outcome === "passed") return "通过";
+  if (outcome === "failed") return "断言失败";
+  if (outcome === "completed_unchecked") return "响应未校验";
+  if (outcome === "canceled") return "已取消";
+  if (outcome === "interrupted") return "结果不明";
+  if (outcome === "timed_out") return "超过截止时间";
+  if (outcome === "error") return "执行错误";
+  return outcome;
+}
+
 /** 失败原因分类：配置错误与业务断言失败要分开看，前者说明断言本身写错了。 */
 export function runReasonLabel(run: RunSummary): string | null {
   // 已取消的运行不附加原因。
@@ -94,8 +136,9 @@ export function useRuns(
   workspaceId: string | null,
   projectId: string | null,
   environmentId: string | null,
+  enabled = true,
 ) {
-  const key = workspaceId && projectId ? `${workspaceId}/${projectId}#${environmentId ?? "all"}` : null;
+  const key = enabled && workspaceId && projectId ? `${workspaceId}/${projectId}#${environmentId ?? "all"}` : null;
   const resource = useResource<RunSummary[]>(key, (signal) => {
     const suffix = environmentId ? `/runs?environment_id=${environmentId}` : "/runs";
     return apiGet(projectPath(workspaceId ?? "", projectId ?? "", suffix), toRunList, signal);

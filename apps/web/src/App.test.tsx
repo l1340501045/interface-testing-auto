@@ -186,6 +186,7 @@ function routes(path: string, method = "GET", body?: unknown): unknown {
  * 模块级的——只有 describe 级别的钩子会让另一个 describe 里的用例读到上个用例的残留。
  */
 beforeEach(() => {
+  window.history.replaceState(null, "", "#/workbench");
   apiGetMock.mockReset();
   apiSendMock.mockReset();
   apiSendWithMetaMock.mockReset();
@@ -267,6 +268,49 @@ describe("未保存内容的离开保护", () => {
     await waitFor(() => expect((screen.getByLabelText("用例名称") as HTMLInputElement).value).toBe(""));
   });
 
+  it("在四个页面间往返不会重建编辑器或丢失草稿", async () => {
+    await openDirtyNewCase();
+    const draft = screen.getByLabelText("用例名称") as HTMLInputElement;
+
+    fireEvent.click(screen.getByRole("button", { name: "环境配置" }));
+    expect(window.location.hash).toBe("#/environments");
+    expect(screen.queryByRole("region", { name: "接口工作台" })).toBeNull();
+    expect(document.getElementById("case-name")).toBe(draft);
+
+    fireEvent.click(screen.getByRole("button", { name: "接口工作台" }));
+    expect(screen.getByLabelText("用例名称")).toBe(draft);
+    expect(draft.value).toBe("尚未保存的用例");
+    expect(window.confirm).not.toHaveBeenCalled();
+  });
+
+  it("配置页浏览另一个环境不会改变工作台执行目标", async () => {
+    environmentList = [
+      { id: ENV_ID, name: "环境 A", kind: "test", base_url: "http://a.test", pool_id: null, variables: {}, status: "active" },
+      { id: "66666666-6666-4666-8666-666666666666", name: "环境 B", kind: "test", base_url: "http://b.test", pool_id: null, variables: {}, status: "active" },
+    ];
+    await openDirtyNewCase();
+    const draft = screen.getByLabelText("用例名称") as HTMLInputElement;
+    await waitFor(() => expect((screen.getByLabelText("执行环境") as HTMLSelectElement).value).toBe(ENV_ID));
+
+    fireEvent.click(screen.getByRole("button", { name: "环境配置" }));
+    fireEvent.click(screen.getByText("环境（2）"));
+    fireEvent.click(screen.getByRole("button", { name: "环境 B" }));
+    fireEvent.click(screen.getByRole("button", { name: "返回接口工作台" }));
+
+    expect(screen.getByLabelText("用例名称")).toBe(draft);
+    expect(draft.value).toBe("尚未保存的用例");
+    expect((screen.getByLabelText("执行环境") as HTMLSelectElement).value).toBe(ENV_ID);
+    expect(casePosts).toHaveLength(0);
+    expect(postCalls).toHaveLength(0);
+
+    fireEvent.change(screen.getByLabelText("执行环境"), {
+      target: { value: "66666666-6666-4666-8666-666666666666" },
+    });
+    expect((screen.getByLabelText("执行环境") as HTMLSelectElement).value).toBe(
+      "66666666-6666-4666-8666-666666666666",
+    );
+  });
+
   it("切换项目会带走编辑器，因此同样要确认；拒绝后仍停在原项目", async () => {
     await openDirtyNewCase();
     const projectSelect = screen.getByLabelText("项目") as HTMLSelectElement;
@@ -308,6 +352,7 @@ describe("未保存内容的离开保护", () => {
     ];
     await renderShell();
 
+    fireEvent.click(screen.getByRole("button", { name: "环境配置" }));
     fireEvent.click(screen.getByRole("button", { name: "编辑" }));
     fireEvent.change(screen.getByLabelText("值"), { target: { value: "2" } });
     await act(async () => {});
