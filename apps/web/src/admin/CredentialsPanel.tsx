@@ -496,6 +496,9 @@ export function CredentialsPanel({
   currentUser,
   currentCase,
   onExecutionConfigChanged,
+  anchorId,
+  open,
+  onOpenChange,
 }: {
   workspaceId: string;
   projectId: string;
@@ -505,6 +508,9 @@ export function CredentialsPanel({
   currentCase: { caseId: string; versionId: string | null } | null;
   /** 身份配置、秘密与用途授权成功变更后通知：它们决定请求以谁的身份发出。 */
   onExecutionConfigChanged: () => void;
+  anchorId?: string;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 }) {
   const scope = `${workspaceId}/${projectId}`;
   const secrets = useResource<Secret[]>(canAdmin ? `${scope}/secrets` : null, (signal) =>
@@ -861,7 +867,16 @@ export function CredentialsPanel({
 
   if (!canAdmin) {
     return (
-      <details className="block">
+      <details
+        className="block"
+        id={anchorId}
+        tabIndex={anchorId ? -1 : undefined}
+        open={open}
+        onToggle={(event) => {
+          if (open !== undefined && event.currentTarget.open === open) return;
+          onOpenChange?.(event.currentTarget.open);
+        }}
+      >
         <summary>人工凭证</summary>
         <Hint>秘密、身份配置与用途授权都需要管理员权限；当前角色只能查看环境与用例。</Hint>
       </details>
@@ -869,7 +884,16 @@ export function CredentialsPanel({
   }
 
   return (
-    <details className="block">
+    <details
+      className="block"
+      id={anchorId}
+      tabIndex={anchorId ? -1 : undefined}
+      open={open}
+      onToggle={(event) => {
+        if (open !== undefined && event.currentTarget.open === open) return;
+        onOpenChange?.(event.currentTarget.open);
+      }}
+    >
       <summary>人工凭证</summary>
       <p className="caption">
         秘密只保存不显示；身份配置按版本新增，当前集合按槽位绑定秘密版本；用途授权固定到某一条用例版本，而不是整个项目，并按签发时的普通变量冻结输入。

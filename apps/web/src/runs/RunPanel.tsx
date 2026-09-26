@@ -14,7 +14,7 @@ import { ApiError, apiSend, projectPath } from "../api/client";
 import type { CaseVersion, RunReport } from "../api/types";
 import { ErrorText, Hint, Loading, StatusTag } from "../components/Feedback";
 import { describeValue } from "../api/literals";
-import { isTerminal, runOutcomeLabel, runReasonLabel, runStateLabel, useRunReport, useRuns } from "./useRuns";
+import { isTerminal, runOutcomeLabel, runReasonLabel, runStateLabel, runTimeLabel, stepOutcomeLabel, stepStateLabel, useRunReport, useRuns } from "./useRuns";
 
 /** 一次版本提交的执行配置依据：提交**之前**冻结，受理后原样登记。 */
 export interface RunProvenance {
@@ -28,7 +28,7 @@ function toRunId(raw: unknown): string | null {
   return typeof id === "string" ? id : null;
 }
 
-function ReportView({ report }: { report: RunReport }) {
+export function ReportView({ report }: { report: RunReport }) {
   return (
     <div className="report">
       <p>
@@ -44,8 +44,8 @@ function ReportView({ report }: { report: RunReport }) {
         <ul className="caption">
           {report.steps.map((step) => (
             <li key={`${step.step_key}-${step.attempt_no}`}>
-              第 {step.attempt_no} 次 · {step.state}
-              {step.outcome ? ` · ${step.outcome}` : ""}
+              第 {step.attempt_no} 次 · {stepStateLabel(step.state)}
+              {stepOutcomeLabel(step.outcome) ? ` · ${stepOutcomeLabel(step.outcome)}` : ""}
               {step.elapsed_ms !== null ? ` · ${step.elapsed_ms} 毫秒` : ""}
               {step.error_code ? ` · ${step.error_code}` : ""}
             </li>
@@ -57,6 +57,7 @@ function ReportView({ report }: { report: RunReport }) {
       {report.assertions.length === 0 ? (
         <Hint>本次运行没有断言结果记录。</Hint>
       ) : (
+        <div className="table-scroll">
         <table className="report-table">
           <thead>
             <tr>
@@ -83,6 +84,7 @@ function ReportView({ report }: { report: RunReport }) {
             ))}
           </tbody>
         </table>
+        </div>
       )}
 
       <details>
@@ -110,6 +112,7 @@ export function RunPanel({
   captureProvenance,
   canCancel = false,
   readOnly = false,
+  showHistory = true,
 }: {
   workspaceId: string;
   projectId: string;
@@ -161,12 +164,15 @@ export function RunPanel({
   canCancel?: boolean;
   /** 只读角色：可以看历史与报告，不能提交版本执行或取消。 */
   readOnly?: boolean;
+  /** 独立任务／报告页已承接历史时，只保留版本执行动作。 */
+  showHistory?: boolean;
 }) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [accepted, setAccepted] = useState<string | null>(null);
 
-  const runs = useRuns(workspaceId, projectId, environmentId);
+  const runs = useRuns(workspaceId, projectId, environmentId, showHistory);
+  // 独立历史页只替代列表呈现；当前编辑器刚提交的版本运行仍要把报告回填给响应区。
   const report = useRunReport(workspaceId, projectId, selectedRunId);
 
   useEffect(() => {
@@ -240,10 +246,10 @@ export function RunPanel({
 
   return (
     <div className="block">
-      <h2>已发布版本执行与项目历史</h2>
+      <h2>{showHistory ? "已发布版本执行与项目历史" : "执行已发布版本"}</h2>
       <p className="caption">
-        这里固定**已发布版本**：需要先保存（内容变了还要发布）。调试当前编辑内容请用页面
-        顶部的「发送」，它不写用例、不产生版本。
+        这里固定<strong>已发布版本</strong>：需要先保存（内容变了还要发布）。调试当前编辑内容请用页面
+        顶部的「发送」，它不写用例、不产生版本。{showHistory ? "最近记录也会显示在下方。" : "提交后的状态请到任务中心查看。"}
       </p>
       <div className="actions">
         <button
@@ -253,9 +259,9 @@ export function RunPanel({
         >
           {busy ? "提交中…" : "保存并执行"}
         </button>
-        <button type="button" onClick={runs.reload} disabled={runs.loading}>
-          刷新运行列表
-        </button>
+        {showHistory ? (
+          <button type="button" onClick={runs.reload} disabled={runs.loading}>刷新运行列表</button>
+        ) : null}
       </div>
       {readOnly || !canCancel ? (
         <Hint>当前角色只能查看历史报告，不能提交或取消运行。</Hint>
@@ -263,14 +269,14 @@ export function RunPanel({
       {caseId === null ? <Hint>请先创建并保存用例，再提交运行。</Hint> : null}
       {accepted ? <Hint>{accepted}</Hint> : null}
       {error ? <ErrorText message={error} /> : null}
-      {runs.error ? <ErrorText message={runs.error.message} /> : null}
+      {showHistory && runs.error ? <ErrorText message={runs.error.message} /> : null}
 
-      {runs.loading && runs.data === null ? <Loading label="正在加载运行记录…" /> : null}
-      {runs.data && runs.data.length === 0 ? (
+      {showHistory && runs.loading && runs.data === null ? <Loading label="正在加载运行记录…" /> : null}
+      {showHistory && runs.data && runs.data.length === 0 ? (
         <Hint>当前环境还没有运行记录。提交执行后，这里会显示排队、执行与结果。</Hint>
       ) : null}
 
-      {runs.data && runs.data.length > 0 ? (
+      {showHistory && runs.data && runs.data.length > 0 ? (
         <table className="report-table">
           <thead>
             <tr>
@@ -290,7 +296,7 @@ export function RunPanel({
                   {runOutcomeLabel(run)}
                   {runReasonLabel(run) ? `（${runReasonLabel(run)}）` : ""}
                 </td>
-                <td>{run.created_at}</td>
+                <td><time dateTime={run.created_at} title={run.created_at}>{runTimeLabel(run.created_at)}</time></td>
                 <td className="inline-actions">
                   <button type="button" onClick={() => onSelectRun(run.id)}>
                     查看报告
@@ -307,7 +313,7 @@ export function RunPanel({
         </table>
       ) : null}
 
-      {selectedRunId ? (
+      {showHistory && selectedRunId ? (
         <div className="run-report">
           <h3>运行 {selectedRunId.slice(0, 8)} 的报告</h3>
           {selected && !isTerminal(selected) ? (

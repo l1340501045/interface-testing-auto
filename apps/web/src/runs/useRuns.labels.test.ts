@@ -13,7 +13,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { RunSummary } from "../api/types";
-import { isTerminal, runOutcomeLabel, runReasonLabel, runStateLabel } from "./useRuns";
+import { isTerminal, runOutcomeLabel, runReasonLabel, runStateLabel, runTargetLabel, runTimeLabel, stepOutcomeLabel, stepStateLabel } from "./useRuns";
 
 function run(over: Partial<RunSummary> = {}): RunSummary {
   return {
@@ -62,5 +62,15 @@ describe("运行状态与原因", () => {
     expect(isTerminal(run({ state: "running", outcome: null }))).toBe(false);
     expect(isTerminal(run({ state: "finished" }))).toBe(true);
     expect(runStateLabel(run({ state: "queued" }))).toBe("排队中");
+  });
+
+  it("列表与报告把来源、时间和步骤枚举翻译成用户语义", () => {
+    expect(runTargetLabel(run())).toBe("临时调试");
+    expect(runTargetLabel(run({ target_type: "case_version" }))).toBe("固定版本");
+    expect(runTimeLabel("2026-09-15T00:00:00Z")).not.toContain("T");
+    expect(stepStateLabel("finished")).toBe("已结束");
+    expect(stepStateLabel("sending")).toBe("发送中");
+    expect(stepStateLabel("skipped")).toBe("已跳过");
+    expect(stepOutcomeLabel("error")).toBe("执行错误");
   });
 });

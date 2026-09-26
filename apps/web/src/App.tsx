@@ -4,7 +4,7 @@
  * 范围（工作空间、项目、环境）只保存在组件状态里，任何一次范围切换都会清空
  * 下游选择，避免把上一个项目的用例或环境带到当前项目显示。
  */
-import { useCallback, useEffect, useMemo, useRef, useState, type SyntheticEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiError, apiSend } from "./api/client";
 import type { SessionInfo } from "./api/types";
@@ -14,8 +14,10 @@ import { CaseEditor } from "./cases/CaseEditor";
 import { useFolders } from "./cases/useCases";
 import { Empty, ErrorText, Hint, Loading } from "./components/Feedback";
 import { LeaveGuardProvider, useLeaveAggregate, useLeaveReport } from "./hooks/leaveGuard";
+import { PAGE_LABEL, pageFromHash, pageHash, type AppPage } from "./navigation";
 import { EnvironmentPanel } from "./projects/EnvironmentPanel";
 import { useEnvironments, useProjects } from "./projects/useProjects";
+import { RunCenter } from "./runs/RunCenter";
 import { LoginPage } from "./session/LoginPage";
 import { useSession } from "./session/useSession";
 
@@ -111,11 +113,21 @@ function ProjectCreateForm({
 }
 
 function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => void }) {
+  const [page, setPage] = useState<AppPage>(() => pageFromHash(window.location.hash));
   const [workspaceId, setWorkspaceId] = useState<string | null>(session.workspaces[0]?.id ?? null);
   const [projectId, setProjectId] = useState<string | null>(null);
   const [environmentId, setEnvironmentId] = useState<string | null>(null);
+  /** 配置页正在浏览的环境；与工作台实际发送使用的环境严格分离。 */
+  const [settingsEnvironmentId, setSettingsEnvironmentId] = useState<string | null>(null);
   const [editor, setEditor] = useState<EditorTarget | null>(null);
   const [selectedCaseId, setSelectedCaseId] = useState<string | null>(null);
+  const [reportRequest, setReportRequest] = useState<{
+    runId: string;
+    token: number;
+    workspaceId: string;
+    projectId: string;
+  } | null>(null);
+  const reportRequestToken = useRef(0);
   const [caseRefresh, setCaseRefresh] = useState(0);
   /**
    * 目录清单的刷新序号。目录与用例分属两个资源：新建／归档目录只该重拉目录，
@@ -178,60 +190,54 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   /** 能不能建项目看工作空间角色：查看者连入口都不显示。 */
   const canCreateProject = canEdit(currentWorkspace?.role ?? null);
 
-  /**
-   * 打开侧栏的环境与凭证管理。
-   *
-   * 工作台的认证提示要能把用户送到真正能改配置的地方，否则“去配置凭证”只是一句
-   * 空话。这里滚动并聚焦侧栏里已经存在的面板——不新建第二套管理界面，也不隐藏原有
-   * 入口，整理布局不改变任何权限。
-   */
-  const [adminOpen, setAdminOpen] = useState(false);
-  /**
-   * 展开侧栏管理区并滚动到指定配置块。
-   *
-   * 环境与凭证在同一个 details 里，但它们是**两个不同的块**：只认一个锚点，会把点“前往
-   * 环境设置”的用户送到下面的凭证列表，入口看起来点了却找不到要改的东西。因此锚点按
-   * 动作分开，仍复用同一段展开与聚焦逻辑。
-   */
-  const revealAdminBlock = useCallback((anchorId: string) => {
-    // 先展开再滚动：折叠的 details 里滚动不到任何内容，点了“环境与凭证管理”却停在
-    // 一个空标题上，比没有入口更让人困惑。
-    setAdminOpen(true);
-    window.requestAnimationFrame(() => {
-      const panel = document.getElementById(anchorId);
-      if (panel === null) return;
-      // `scrollIntoView` 不是所有宿主都实现（测试用的 jsdom、部分嵌入式 webview）。
-      // 缺失时跳过滚动但保留聚焦：入口的目的是“把用户送到那块配置上”，滚动只是手段，
-      // 不能因为手段不可用就让点击整个失败。
-      if (typeof panel.scrollIntoView === "function") {
-        panel.scrollIntoView({ block: "start" });
-      }
-      panel.focus();
-    });
+  /** 工作台的纠错动作进入独立配置页，并聚焦真实的环境或身份配置块。 */
+  const navigate = useCallback((next: AppPage) => {
+    setPage(next);
+    const hash = pageHash(next);
+    if (window.location.hash === hash) {
+      setPage(next);
+      return;
+    }
+    window.location.hash = hash;
   }, []);
-  const openAdminPanel = useCallback(() => revealAdminBlock("admin-panel"), [revealAdminBlock]);
-  /**
-   * 环境面板自身的折叠状态。
-   *
-   * `adminOpen` 只管外层管理区；环境面板里面还有一层 `details`，它的开合由这里持有——
-   * 否则「前往环境设置」只能展开外层，用户仍然停在折叠的“环境（N）”标题上（R1-1）。
-   * 项目还没有环境时强制展开：那时创建环境是这个面板唯一的内容，折叠起来等于藏入口。
-   */
+
+  useEffect(() => {
+    const syncPage = () => setPage(pageFromHash(window.location.hash));
+    window.addEventListener("hashchange", syncPage);
+    if (window.location.hash !== pageHash(pageFromHash(window.location.hash))) {
+      window.history.replaceState(null, "", pageHash(pageFromHash(window.location.hash)));
+    }
+    return () => window.removeEventListener("hashchange", syncPage);
+  }, []);
+  const [settingsFocusTarget, setSettingsFocusTarget] = useState<string | null>(null);
+
+  /** 环境与身份是两个配置块，入口必须精确定位，不能只切页后让用户继续寻找。 */
+  const revealAdminBlock = useCallback((anchorId: string) => {
+    setSettingsFocusTarget(anchorId);
+    navigate("environments");
+  }, [navigate]);
+  const [credentialsOpen, setCredentialsOpen] = useState(false);
+  const openAdminPanel = useCallback(() => {
+    setCredentialsOpen(true);
+    revealAdminBlock("credentials-panel");
+  }, [revealAdminBlock]);
+  /** 环境面板的折叠状态由外壳持有，纠错入口可直接展开；无环境时同样强制展开。 */
   const [environmentOpen, setEnvironmentOpen] = useState(false);
-  /**
-   * 打开环境设置：外层管理区与**内层环境面板**都要展开。
-   *
-   * 环境面板自己还有一层 `details`。只展开外层，用户点「前往环境设置」之后看到的是一个
-   * 仍折叠的“环境（N）”标题，编辑入口根本不在视野里——入口看起来点了却没有用。内层的
-   * 展开状态因此提到这里，与锚点一起处理。
-   */
+  /** 打开环境设置时同步展开环境块，保证地址编辑入口立即可见。 */
   const openEnvironmentPanel = useCallback(() => {
     setEnvironmentOpen(true);
+    setSettingsEnvironmentId(environmentId);
     revealAdminBlock("environment-panel");
-  }, [revealAdminBlock]);
-  const onAdminToggle = useCallback((event: SyntheticEvent<HTMLDetailsElement>) => {
-    setAdminOpen((event.target as HTMLDetailsElement).open);
-  }, []);
+  }, [environmentId, revealAdminBlock]);
+
+  useEffect(() => {
+    if (page !== "environments" || settingsFocusTarget === null) return;
+    const panel = document.getElementById(settingsFocusTarget);
+    if (panel === null) return;
+    if (typeof panel.scrollIntoView === "function") panel.scrollIntoView({ block: "start" });
+    panel.focus();
+    setSettingsFocusTarget(null);
+  }, [page, settingsFocusTarget, credentialsOpen, environmentOpen]);
 
   // 切换工作空间会作废项目及其下游选择；不保留上一个工作空间的 id。
   // 编辑器上报的当前用例也一并清空：编辑器卸载时会上报一次 null，但那时范围已经
@@ -240,6 +246,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   useEffect(() => {
     setProjectId(null);
     setEnvironmentId(null);
+    setSettingsEnvironmentId(null);
     setEditor(null);
     setSelectedCaseId(null);
     setEditorVersion(null);
@@ -252,9 +259,11 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
 
   useEffect(() => {
     setEnvironmentId(null);
+    setSettingsEnvironmentId(null);
     setEditor(null);
     setSelectedCaseId(null);
     setEditorVersion(null);
+    setReportRequest(null);
   }, [projectId]);
 
   // 默认选中第一个项目与第一个环境，减少无谓点击；用户改动后不再覆盖。
@@ -265,6 +274,12 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   useEffect(() => {
     if (environmentId === null && environmentList.length > 0) setEnvironmentId(environmentList[0].id);
   }, [environmentList, environmentId]);
+
+  useEffect(() => {
+    if (settingsEnvironmentId === null && environmentList.length > 0) {
+      setSettingsEnvironmentId(environmentId ?? environmentList[0].id);
+    }
+  }, [environmentId, environmentList, settingsEnvironmentId]);
 
   const openCase = useCallback((caseId: string | null, folderId: string | null = null) => {
     setEditor((current) => ({ id: caseId, folderId, nonce: (current?.nonce ?? 0) + 1 }));
@@ -505,8 +520,8 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
     <div className="app">
       <header className="app-head">
         <div className="brand">
-          <span className="eyebrow">接口自动化测试与巡检平台</span>
-          <h1>单接口执行</h1>
+          <span className="eyebrow">接口测试与巡检平台</span>
+          <h1>接口工作台</h1>
         </div>
 
         <div className="scope">
@@ -593,6 +608,22 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
         />
       ) : null}
 
+      {projectList.length > 0 ? (
+        <nav className="primary-nav" aria-label="主要功能">
+          {(Object.keys(PAGE_LABEL) as AppPage[]).map((item) => (
+            <button
+              key={item}
+              type="button"
+              className={page === item ? "nav-item nav-item-active" : "nav-item"}
+              aria-current={page === item ? "page" : undefined}
+              onClick={() => navigate(item)}
+            >
+              {PAGE_LABEL[item]}
+            </button>
+          ))}
+        </nav>
+      ) : null}
+
       {projects.loading && projects.data === null ? (
         <Loading label="正在加载项目…" />
       ) : projectList.length === 0 ? (
@@ -616,8 +647,9 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
           )}
         </main>
       ) : (
-        <div className="workspace">
-          <div className="sidebar">
+        <div className="app-pages">
+          <section className="workspace" hidden={page !== "workbench"} aria-label="接口工作台">
+            <aside className="sidebar">
             {/*
               左侧以**目录与用例**为主：这是日常动线。环境、变量、执行池与凭证是配置
               类操作，收进下面明确的次级入口，不再常驻占满侧栏——它们把用例列表挤到
@@ -646,46 +678,12 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
               refreshToken={caseRefresh}
             />
 
-            {/*
-              管理表单按范围重挂载：范围变了就是另一套资源，凭证表单里的秘密输入、
-              变量草稿、白名单草稿都不能沿用上一个项目的状态——留着它，用户在 A 项目
-              输入的秘密会显示在 B 项目，并且按 B 项目的路径提交出去。
-            */}
-            <details className="block sidebar-admin" open={adminOpen} onToggle={onAdminToggle}>
-              <summary>环境与凭证管理</summary>
-              {/* 环境编辑表单同样按范围重挂载，否则上一个项目的编辑草稿会留在新项目里。 */}
-              <EnvironmentPanel
-                key={`environment:${scope}`}
-                workspaceId={workspaceId}
-                projectId={projectId ?? ""}
-                environments={environmentList}
-                loading={environments.loading}
-                error={environments.error ? environments.error.message : null}
-                selectedId={environmentId}
-                onSelect={setEnvironmentId}
-                canEdit={canEdit(currentProject?.role ?? null)}
-                onChanged={onEnvironmentsChanged}
-                open={environmentOpen || environmentList.length === 0}
-                onOpenChange={setEnvironmentOpen}
-              />
-              <AdminPanel
-                key={`admin:${scope}`}
-                onExecutionConfigChanged={onExecutionConfigChanged}
-                workspaceId={workspaceId}
-                projectId={projectId ?? ""}
-                role={currentProject?.role ?? null}
-                environments={environmentList}
-                currentUser={{
-                  user_id: session.user.user_id,
-                  display_name: session.user.display_name,
-                }}
-                currentCase={editorVersion}
-                anchorId="admin-panel"
-              />
-            </details>
-          </div>
+              <button type="button" className="sidebar-config-link" onClick={() => navigate("environments")}>
+                环境与身份配置
+              </button>
+            </aside>
 
-          <div className="main-pane">
+            <div className="main-pane">
             {editor === null ? (
               <Empty label="从左侧选择一条用例开始编辑，或点击“＋新建用例”。" />
             ) : (
@@ -710,9 +708,95 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
                 onOpenEnvironment={openEnvironmentPanel}
                 configEpoch={configEpoch}
                 getConfigEpoch={getConfigEpoch}
+                separateHistory
               />
             )}
-          </div>
+            </div>
+          </section>
+
+          <section className="content-page" hidden={page !== "environments"} aria-label="环境配置">
+            <header className="page-title-row">
+              <div>
+                <span className="eyebrow">当前项目</span>
+                <h2>环境配置</h2>
+                <p className="caption">维护请求目标、普通变量、访问规则和身份凭证。</p>
+              </div>
+              <button type="button" onClick={() => navigate("workbench")}>返回接口工作台</button>
+            </header>
+            <div className="settings-grid">
+              <EnvironmentPanel
+                key={`environment:${scope}`}
+                workspaceId={workspaceId}
+                projectId={projectId ?? ""}
+                environments={environmentList}
+                loading={environments.loading}
+                error={environments.error ? environments.error.message : null}
+                selectedId={settingsEnvironmentId}
+                onSelect={setSettingsEnvironmentId}
+                canEdit={canEdit(currentProject?.role ?? null)}
+                onChanged={onEnvironmentsChanged}
+                open={environmentOpen || environmentList.length === 0}
+                onOpenChange={setEnvironmentOpen}
+              />
+              <AdminPanel
+                key={`admin:${scope}`}
+                onExecutionConfigChanged={onExecutionConfigChanged}
+                workspaceId={workspaceId}
+                projectId={projectId ?? ""}
+                role={currentProject?.role ?? null}
+                environments={environmentList}
+                currentUser={{
+                  user_id: session.user.user_id,
+                  display_name: session.user.display_name,
+                }}
+                currentCase={editorVersion}
+                anchorId="admin-panel"
+                credentialsAnchorId="credentials-panel"
+                credentialsOpen={credentialsOpen}
+                onCredentialsOpenChange={setCredentialsOpen}
+              />
+            </div>
+          </section>
+
+          <section hidden={page !== "tasks"} aria-label="任务中心">
+            <RunCenter
+              key={`tasks:${scope}`}
+              workspaceId={workspaceId}
+              projectId={projectId ?? ""}
+              environments={environmentList}
+              canCancel={canEdit(currentProject?.role ?? null)}
+              mode="tasks"
+              active={page === "tasks"}
+              onOpenReport={(runId) => {
+                if (projectId === null) return;
+                reportRequestToken.current += 1;
+                setReportRequest({
+                  runId,
+                  token: reportRequestToken.current,
+                  workspaceId,
+                  projectId,
+                });
+                navigate("reports");
+              }}
+            />
+          </section>
+
+          <section hidden={page !== "reports"} aria-label="测试报告">
+            <RunCenter
+              key={`reports:${scope}`}
+              workspaceId={workspaceId}
+              projectId={projectId ?? ""}
+              environments={environmentList}
+              canCancel={false}
+              mode="reports"
+              active={page === "reports"}
+              reportRequest={
+                reportRequest?.workspaceId === workspaceId && reportRequest.projectId === projectId
+                  ? reportRequest
+                  : null
+              }
+            />
+          </section>
         </div>
       )}
     </div>

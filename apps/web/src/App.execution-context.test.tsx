@@ -14,17 +14,23 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const WORKSPACE_ID = "11111111-1111-4111-8111-111111111111";
+const WORKSPACE_ID_B = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const PROJECT_ID = "22222222-2222-4222-8222-222222222222";
+const PROJECT_ID_B = "33333333-3333-4333-8333-333333333333";
 const CASE_ID = "44444444-4444-4444-8444-444444444444";
 const ENV_ID = "55555555-5555-4555-8555-555555555555";
 const RUN_ID = "77777777-7777-4777-8777-777777777777";
+const RUN_ID_B = "88888888-8888-4888-8888-888888888888";
 const USER_ID = "99999999-9999-4999-8999-999999999999";
 
 vi.mock("./session/useSession", () => ({
   useSession: () => ({
     session: {
       user: { user_id: USER_ID, username: "tester", display_name: "测试员", is_admin: true },
-      workspaces: [{ id: WORKSPACE_ID, name: "默认工作空间", role: "admin" }],
+      workspaces: [
+        { id: WORKSPACE_ID, name: "默认工作空间", role: "admin" },
+        { id: WORKSPACE_ID_B, name: "第二工作空间", role: "admin" },
+      ],
     },
     loading: false,
     error: null,
@@ -81,6 +87,8 @@ let projectVariables = { version: 1, variables: [] as { name: string; value: unk
  * 失败会把“配置变更未推进时钟”与“结论因为缺少预检而失效”两件事混在一起。
  */
 let failWrites = false;
+let preflightOverride: unknown | null = null;
+let historyRuns: unknown[] = [];
 
 const BASE = `/api/v1/workspaces/${WORKSPACE_ID}/projects/${PROJECT_ID}`;
 
@@ -158,12 +166,32 @@ function route(rawPath: string, method: string, body?: unknown): unknown {
   const path = basePath(rawPath);
   calls.push({ method, path, body });
   if (method === "GET" && path.endsWith("/projects")) {
+    if (path.includes(`/workspaces/${WORKSPACE_ID_B}/`)) {
+      return [{
+        id: PROJECT_ID_B,
+        workspace_id: WORKSPACE_ID_B,
+        key: "beta",
+        name: "项目乙",
+        status: "active",
+        role: "admin",
+        pool_id: null,
+      }];
+    }
     return [
       {
         id: PROJECT_ID,
         workspace_id: WORKSPACE_ID,
         key: "alpha",
         name: "项目甲",
+        status: "active",
+        role: "admin",
+        pool_id: null,
+      },
+      {
+        id: PROJECT_ID_B,
+        workspace_id: WORKSPACE_ID,
+        key: "beta",
+        name: "项目乙",
         status: "active",
         role: "admin",
         pool_id: null,
@@ -181,10 +209,11 @@ function route(rawPath: string, method: string, body?: unknown): unknown {
   if (method === "GET" && path.endsWith("/variables")) return projectVariables;
   if (method === "GET" && path.includes("/credentials/")) return [];
   if (method === "GET" && path.includes("/pools")) return [];
-  if (method === "GET" && path.endsWith("/runs")) return [];
+  if (method === "GET" && path.endsWith("/runs")) return historyRuns;
   if (method === "GET" && path.endsWith(`/cases/${CASE_ID}/versions`)) return [];
   if (method === "GET" && path.endsWith(`/cases/${CASE_ID}`)) return CASE_DETAIL;
   if (method === "POST" && path.endsWith("/debug-preflight")) {
+    if (preflightOverride !== null) return preflightOverride;
     // 地址缺协议时服务端不会走到白名单判断，而是直接报“环境地址不合法”并建议去改环境。
     // 这里按同一口径回答，页面看到的结论与真实服务端一致。
     if (!environment.base_url.includes("://")) {
@@ -214,7 +243,10 @@ function route(rawPath: string, method: string, body?: unknown): unknown {
   if (method === "POST" && path.endsWith("/runs")) {
     return { ...RUN_REPORT.run, state: "queued", outcome: null };
   }
-  if (method === "GET" && path.endsWith("/report")) return RUN_REPORT;
+  if (method === "GET" && path.endsWith("/report")) {
+    const runId = /\/runs\/([^/]+)\/report$/.exec(path)?.[1] ?? RUN_ID;
+    return { ...RUN_REPORT, run: { ...RUN_REPORT.run, id: runId } };
+  }
   if (method === "PATCH" && path.endsWith(`/environments/${ENV_ID}`)) {
     if (failWrites) throw new Error("环境保存失败");
     const patch = (body ?? {}) as { base_url?: string };
@@ -260,15 +292,15 @@ async function openCase(): Promise<void> {
 }
 
 /**
- * 展开侧栏的「环境与凭证管理」次级入口，返回**包含环境面板与管理面板的那个容器**。
+ * 进入独立「环境配置」页，返回**包含环境面板与管理面板的页面容器**。
  *
  * 环境编辑与凭证管理同在这个折叠区里（环境在侧栏，凭证在其下的 #admin-panel）；
  * 只取 #admin-panel 会漏掉环境面板，测出来的“改环境不失效”其实是没找到控件。
  */
 async function openAdmin(): Promise<HTMLElement> {
-  fireEvent.click(screen.getByRole("button", { name: "环境与凭证管理" }));
+  fireEvent.click(screen.getByRole("button", { name: "环境配置" }));
   await act(async () => {});
-  const panel = document.querySelector(".sidebar-admin");
+  const panel = screen.getByRole("region", { name: "环境配置" });
   if (panel === null) throw new Error("管理入口未挂载");
   return panel as HTMLElement;
 }
@@ -283,10 +315,14 @@ async function debugOnce(): Promise<HTMLElement> {
 }
 
 beforeEach(() => {
+  window.history.replaceState(null, "", "#/workbench");
   calls = [];
   environment = makeEnvironment("http://echo.test");
   projectVariables = { version: 1, variables: [] };
   failWrites = false;
+  preflightOverride = null;
+  historyRuns = [];
+  window.confirm = vi.fn(() => true);
   apiGetMock.mockReset();
   apiSendMock.mockReset();
   apiSendWithMetaMock.mockReset();
@@ -369,12 +405,12 @@ describe("执行配置变更的真实失效链", () => {
 /**
  * 环境地址不合法时的“下一步”必须是真能点的入口（ENV-03／ENV-04）。
  *
- * 走**真实 App**：真实外壳 → 真实 CaseEditor → 真实 SendBar → 真实侧栏管理区。
+ * 走**真实 App**：真实外壳 → 真实 CaseEditor → 真实 SendBar → 独立环境配置页。
  * 只测 SendBar 收到回调会调用它，证明不了外壳把它接到了环境那一段；这里断言点击之后
  * 展开的确实是含环境编辑的那个折叠区。
  */
 describe("环境地址无效时的真实入口", () => {
-  it("点“前往环境设置”必须真正展开环境面板，而不是只展开外层", async () => {
+  it("点“前往环境设置”直接进入独立配置页并展开环境面板", async () => {
     // 存量坏数据：地址缺协议，请求发不出去，但记录仍在。
     environment = makeEnvironment("target-service:8080");
     await openCase();
@@ -384,9 +420,7 @@ describe("环境地址无效时的真实入口", () => {
     expect(screen.getByText(/环境地址不合法，暂时无法确定/)).toBeTruthy();
     expect(screen.queryByText(/实际目标：target-service:8080/)).toBeNull();
 
-    const sidebar = document.querySelector(".sidebar-admin") as HTMLDetailsElement;
     const panel = document.getElementById("environment-panel") as HTMLDetailsElement;
-    expect(sidebar.open).toBe(false);
     /*
       只断言 `sidebar.open` 是不够的：外层展开后，“环境（N）”这一层仍可能是折叠的，
       用户点进来看到的还是一个没有编辑入口的空标题。这里必须断言**内层**的 open。
@@ -399,11 +433,12 @@ describe("环境地址无效时的真实入口", () => {
     fireEvent.click(entry);
     await act(async () => {});
 
-    expect(sidebar.open).toBe(true);
+    expect(screen.getByRole("region", { name: "环境配置" })).toBeTruthy();
+    expect(window.location.hash).toBe("#/environments");
     expect(panel.open).toBe(true);
 
-    // 展开管理区必须保住同一份未保存用例：草稿没有被重挂载或清空。
-    expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/echo");
+    // 进入配置页必须保住同一份未保存用例：工作台只是隐藏，编辑器没有重挂载。
+    expect((document.getElementById("request-path") as HTMLInputElement).value).toBe("/echo");
   });
 
   it("展开后确实能走到环境编辑表单（编辑入口不再藏在折叠标题下）", async () => {
@@ -458,5 +493,109 @@ describe("环境地址无效时的真实入口", () => {
     );
     // 草稿没有被清掉或重载：还是原来那一份请求内容。
     expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/echo");
+  });
+});
+
+describe("独立页面的状态归属", () => {
+  it("凭证纠错进入配置页后展开并聚焦真实凭证块", async () => {
+    preflightOverride = {
+      ready: false,
+      issues: [{ code: "credential_missing", message: "当前环境还没有可用身份。", action: "manage_credentials" }],
+      can_authorize: true,
+      auth: { required: true, state: "unavailable", profile_id: null },
+      context: null,
+    };
+    await openCase();
+
+    const entry = await screen.findByRole("button", { name: "环境与凭证管理" });
+    fireEvent.click(entry);
+    await act(async () => {});
+
+    const credentials = document.getElementById("credentials-panel") as HTMLDetailsElement;
+    expect(screen.getByRole("region", { name: "环境配置" })).toBeTruthy();
+    expect(credentials.open).toBe(true);
+    expect(document.activeElement).toBe(credentials);
+    expect((document.getElementById("request-path") as HTMLInputElement).value).toBe("/echo");
+  });
+
+  it("任务报告跳转只消费一次，往返保留新选择，再点同一任务仍可跳回", async () => {
+    historyRuns = [
+      { ...RUN_REPORT.run, id: RUN_ID, state: "finished", outcome: "passed" },
+      { ...RUN_REPORT.run, id: RUN_ID_B, state: "finished", outcome: "failed" },
+    ];
+    await openCase();
+    const selectedEnvironment = (screen.getByLabelText("执行环境") as HTMLSelectElement).value;
+
+    fireEvent.click(screen.getByRole("button", { name: "任务中心" }));
+    const rowA = (await screen.findByText(RUN_ID.slice(0, 8))).closest("tr") as HTMLElement;
+    fireEvent.click(within(rowA).getByRole("button", { name: "查看报告" }));
+    await screen.findByRole("heading", { name: `运行 ${RUN_ID.slice(0, 8)} 的报告` });
+
+    const rowB = (await screen.findByText(RUN_ID_B.slice(0, 8))).closest("tr") as HTMLElement;
+    fireEvent.click(within(rowB).getByRole("button", { name: "查看报告" }));
+    await screen.findByRole("heading", { name: `运行 ${RUN_ID_B.slice(0, 8)} 的报告` });
+
+    fireEvent.click(screen.getByRole("button", { name: "接口工作台" }));
+    fireEvent.click(screen.getByRole("button", { name: "测试报告" }));
+    expect(screen.getByRole("heading", { name: `运行 ${RUN_ID_B.slice(0, 8)} 的报告` })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "任务中心" }));
+    const rowAAgain = (await screen.findByText(RUN_ID.slice(0, 8))).closest("tr") as HTMLElement;
+    fireEvent.click(within(rowAAgain).getByRole("button", { name: "查看报告" }));
+    await screen.findByRole("heading", { name: `运行 ${RUN_ID.slice(0, 8)} 的报告` });
+
+    fireEvent.click(screen.getByRole("button", { name: "接口工作台" }));
+    expect((screen.getByLabelText("执行环境") as HTMLSelectElement).value).toBe(selectedEnvironment);
+    expect(calls.filter((call) => call.method === "POST" && call.path.endsWith("/runs"))).toHaveLength(0);
+  });
+
+  it("跨项目首帧拒绝旧报告意图，不向新项目请求旧运行", async () => {
+    historyRuns = [{ ...RUN_REPORT.run, id: RUN_ID, state: "finished", outcome: "passed" }];
+    await openCase();
+    fireEvent.click(screen.getByRole("button", { name: "任务中心" }));
+    const rowA = (await screen.findByText(RUN_ID.slice(0, 8))).closest("tr") as HTMLElement;
+    fireEvent.click(within(rowA).getByRole("button", { name: "查看报告" }));
+    await screen.findByRole("heading", { name: `运行 ${RUN_ID.slice(0, 8)} 的报告` });
+
+    // 报告页隐藏着同一个编辑器；未保存草稿仍必须拦住跨项目切换。
+    fireEvent.change(document.getElementById("request-path") as HTMLInputElement, {
+      target: { value: "/changed" },
+    });
+    const projectSelect = screen.getByLabelText("项目") as HTMLSelectElement;
+    vi.mocked(window.confirm).mockReturnValueOnce(false);
+    fireEvent.change(projectSelect, { target: { value: PROJECT_ID_B } });
+    expect(projectSelect.value).toBe(PROJECT_ID);
+    expect((document.getElementById("request-path") as HTMLInputElement).value).toBe("/changed");
+
+    vi.mocked(window.confirm).mockReturnValueOnce(true);
+    fireEvent.change(projectSelect, { target: { value: PROJECT_ID_B } });
+    await waitFor(() => expect(projectSelect.value).toBe(PROJECT_ID_B));
+    expect(screen.queryByRole("heading", { name: `运行 ${RUN_ID.slice(0, 8)} 的报告` })).toBeNull();
+    expect(
+      calls.some((call) =>
+        call.method === "GET" &&
+        call.path.includes(`/projects/${PROJECT_ID_B}/runs/${RUN_ID}/report`),
+      ),
+    ).toBe(false);
+  });
+
+  it("跨工作空间首帧同样拒绝旧报告意图", async () => {
+    historyRuns = [{ ...RUN_REPORT.run, id: RUN_ID, state: "finished", outcome: "passed" }];
+    await openCase();
+    fireEvent.click(screen.getByRole("button", { name: "任务中心" }));
+    const rowA = (await screen.findByText(RUN_ID.slice(0, 8))).closest("tr") as HTMLElement;
+    fireEvent.click(within(rowA).getByRole("button", { name: "查看报告" }));
+    await screen.findByRole("heading", { name: `运行 ${RUN_ID.slice(0, 8)} 的报告` });
+
+    fireEvent.change(screen.getByLabelText("工作空间"), { target: { value: WORKSPACE_ID_B } });
+    await waitFor(() => expect((screen.getByLabelText("工作空间") as HTMLSelectElement).value).toBe(WORKSPACE_ID_B));
+    await waitFor(() => expect((screen.getByLabelText("项目") as HTMLSelectElement).value).toBe(PROJECT_ID_B));
+    expect(screen.queryByRole("heading", { name: `运行 ${RUN_ID.slice(0, 8)} 的报告` })).toBeNull();
+    expect(
+      calls.some((call) =>
+        call.method === "GET" &&
+        call.path.includes(`/workspaces/${WORKSPACE_ID_B}/projects/${PROJECT_ID_B}/runs/${RUN_ID}/report`),
+      ),
+    ).toBe(false);
   });
 });
