@@ -18,6 +18,7 @@ const STEP_LABELS: Record<LocatorStep["kind"], string> = {
   key: "字段",
   index: "下标",
   repeat_key: "重复键",
+  row: "参数行",
 };
 
 /** 把定位步骤渲染为中文路径，例如 `data.items[0].price` 或 `query.tag 第 2 次`。 */
@@ -32,6 +33,8 @@ export function describeSelector(selector: LocatorStep[]): string {
           return `[${step.index}]`;
         case "repeat_key":
           return `${step.key}（第 ${step.occurrence + 1} 次）`;
+        case "row":
+          return `参数行 ${step.row_id.slice(0, 8)}…`;
         default: {
           const exhaustive: never = step;
           throw new AssertionFormError(`未知定位步骤：${String(exhaustive)}`);

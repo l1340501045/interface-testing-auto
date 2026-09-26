@@ -11,25 +11,33 @@
  * 3. **不可等价的命令不写入草稿**。含不支持选项时明确拒绝导入，避免生成一条看起来能发
  *    送、实际语义不同的请求。
  */
-import { useState } from "react";
+import { useId, useState } from "react";
 
 import { ErrorText, Hint } from "../components/Feedback";
+import { useLeaveReport } from "../hooks/leaveGuard";
 
 export function CurlImport({
   onImport,
   disabled,
   loading,
+  idPrefix = "",
+  pendingKey,
 }: {
   /** 解析并填入编辑器；返回错误信息表示未能导入。 */
   onImport: (text: string) => Promise<{ error: string | null; warnings: string[] }>;
   disabled: boolean;
   loading: boolean;
+  idPrefix?: string;
+  pendingKey?: string;
 }) {
+  const localId = useId();
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [imported, setImported] = useState(false);
+  // 网络忙碌由 CaseEditor 的主登记负责；这里只登记未应用原文，避免保存完成帧的重复 busy。
+  useLeaveReport(pendingKey ?? `curl:${localId}`, { dirty: text !== "" && !imported, busy: false });
 
   async function run() {
     setError(null);
@@ -55,14 +63,14 @@ export function CurlImport({
       </button>
       {open ? (
         <div className="curl-panel">
-          <label htmlFor="curl-text">粘贴 cURL 命令（只解析文本，不发送请求）</label>
+          <label htmlFor={`${idPrefix ? `${idPrefix}-` : ""}curl-text`}>粘贴 cURL 命令（只解析文本，不发送请求）</label>
           <textarea
-            id="curl-text"
+            id={`${idPrefix ? `${idPrefix}-` : ""}curl-text`}
             rows={3}
             value={text}
             readOnly={disabled}
             placeholder="curl -X POST 'https://example.test/orders?tag=a&tag=b' -H 'Content-Type: application/json' -d '{...}'"
-            onChange={(event) => setText(event.target.value)}
+            onChange={(event) => { setText(event.target.value); setImported(false); }}
           />
           <div className="actions">
             <button type="button" onClick={() => void run()} disabled={disabled || loading}>

@@ -204,14 +204,12 @@ def test_preflight_rejects_invalid_assertions_like_execution(
     # 非法断言给不出来源证明：这份配置根本没有可执行的形态。
     assert body["context"] is None
 
-    run = start_run(
-        client, account, project, {"environment_id": environment["id"], "debug_snapshot": snapshot}
+    run = client.post(
+        f"{project_base(account, project)}/runs",
+        json={"environment_id": environment["id"], "debug_snapshot": snapshot},
     )
-    assert _run_once(project["pool_id"]) == "error"
-    report = get_report(client, account, project, run["id"])
-    assert report["response"] is None
-    # 执行期是同一个原因码（配置错误），预检没有报出一个更好听的结论。
-    assert report["run"]["reason_category"] == "configuration"
+    assert run.status_code == 400, run.text
+    assert run.json()["code"] == "case_invalid"
 
 
 def test_grant_selection_uses_the_internal_digest_not_the_public_fingerprint(

@@ -16,7 +16,7 @@ from .assertion_catalog import (
     validate_parameters,
 )
 
-_STEP_KINDS = {"key", "index", "repeat_key"}
+_STEP_KINDS = {"key", "index", "repeat_key", "row"}
 _SEVERITIES = {"error", "warning"}
 _MAX_ASSERTIONS = 100
 
@@ -41,6 +41,17 @@ def _step(step: Any) -> dict[str, Any]:
         if not isinstance(index, int) or isinstance(index, bool) or index < 0:
             raise AssertionSpecError("数组下标必须是非负整数")
         return {"kind": "index", "index": index}
+    if kind == "row":
+        row_id = step.get("row_id")
+        if not isinstance(row_id, str):
+            raise AssertionSpecError("稳定行定位缺少 row_id")
+        try:
+            normalized = str(uuid.UUID(row_id))
+        except ValueError as error:
+            raise AssertionSpecError("稳定行定位的 row_id 不是有效 UUID") from error
+        if row_id.lower() != normalized:
+            raise AssertionSpecError("稳定行定位的 row_id 必须使用标准 UUID 格式")
+        return {"kind": "row", "row_id": normalized}
     occurrence = step.get("occurrence", 0)
     if not isinstance(occurrence, int) or isinstance(occurrence, bool) or occurrence < 0:
         raise AssertionSpecError("重复键序号必须是非负整数")
@@ -130,7 +141,9 @@ def validate_assertion(raw: dict[str, Any], index: int) -> dict[str, Any]:
     }
 
 
-def validate_assertions(items: Any) -> list[dict[str, Any]]:
+def validate_assertions(
+    items: Any, request: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
     if items is None:
         return []
     if not isinstance(items, list):
@@ -141,6 +154,14 @@ def validate_assertions(items: Any) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for index, raw in enumerate(items):
         item = validate_assertion(raw, index)
+        row_steps = [step for step in item["selector"] if step["kind"] == "row"]
+        if row_steps:
+            if item["target_source"] not in {"request.query", "request.header"}:
+                raise AssertionSpecError("稳定行定位只允许用于 request.query 或 request.header")
+            if item["selector"][0]["kind"] != "row" or len(row_steps) != 1:
+                raise AssertionSpecError("稳定行定位必须且只能作为字段定位的第一步")
+            if request is None or request.get("schema_version") != 2:
+                raise AssertionSpecError("稳定行定位只能与 schema_version: 2 请求一起使用")
         if item["id"] in seen:
             raise AssertionSpecError(f"断言标识重复：{item['id']}")
         seen.add(item["id"])

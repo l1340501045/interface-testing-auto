@@ -8,6 +8,7 @@
  * 调试与“保存并执行”两条路互不干扰。
  */
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { StrictMode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const WORKSPACE_ID = "11111111-1111-4111-8111-111111111111";
@@ -63,6 +64,7 @@ let preflightBody: unknown = {
   },
 };
 let reportBody: unknown = null;
+let curlPreviewGate: { promise: Promise<unknown>; resolve: (value: unknown) => void } | null = null;
 
 const CASE_DETAIL = {
   id: CASE_ID,
@@ -94,6 +96,7 @@ function route(method: string, path: string, body: unknown, headers?: Record<str
   if (method === "GET" && path.includes("/runs/") && path.endsWith("/report")) return reportBody;
   if (method === "GET" && path.includes("/runs")) return [];
   if (method === "POST" && path.endsWith("/imports/curl/preview")) {
+    if (curlPreviewGate !== null) return curlPreviewGate.promise;
     // 与真实预览接口同形：draft / sendable / warnings / unsupported / auth_hint。
     // 含未知选项的命令按“无法保证等价”拒绝导入（sendable=false），草稿不被改写。
     const text = (body as { text?: string } | undefined)?.text ?? "";
@@ -123,8 +126,9 @@ function route(method: string, path: string, body: unknown, headers?: Record<str
   throw new Error(`测试未覆盖的请求：${method} ${path}`);
 }
 
-function renderEditor(props: { projectRole?: string | null } = {}) {
-  return render(
+function renderEditor(props: { projectRole?: string | null; strict?: boolean } = {}) {
+  const { strict = false, ...editorProps } = props;
+  const editor = (
     <CaseEditor
       workspaceId={WORKSPACE_ID}
       projectId={PROJECT_ID}
@@ -146,12 +150,13 @@ function renderEditor(props: { projectRole?: string | null } = {}) {
       onClose={() => {}}
       folders={[]}
       currentUserId="u-1"
-      {...props}
-    />,
+      {...editorProps}
+    />
   );
+  return render(strict ? <StrictMode>{editor}</StrictMode> : editor);
 }
 
-async function renderLoaded(props: { projectRole?: string | null } = {}) {
+async function renderLoaded(props: { projectRole?: string | null; strict?: boolean } = {}) {
   renderEditor(props);
   await waitFor(() =>
     expect((screen.getByLabelText("用例名称") as HTMLInputElement).value).toBe("查询订单"),
@@ -163,8 +168,10 @@ function callsTo(path: string, method: string): Call[] {
 }
 
 beforeEach(() => {
+  CASE_DETAIL.request.query_params[0].value = "a";
   calls = [];
   reportBody = null;
+  curlPreviewGate = null;
   preflightBody = {
     ready: true,
     issues: [],
@@ -330,6 +337,40 @@ describe("请求调试工作台", () => {
     expect(body.debug_snapshot.request.path).toBe("/orders");
   });
 
+  it("v1 直接显示启停、说明和行旁条件，实际操作时才升级 v2", async () => {
+    await renderLoaded();
+    expect(screen.queryByText("有未保存修改")).toBeNull();
+    const enabled = screen.getByLabelText("发送") as HTMLInputElement;
+    expect(enabled.checked).toBe(true);
+    expect(screen.getByLabelText("查询参数说明 1")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "＋添加断言" })).toBeTruthy();
+
+    fireEvent.click(enabled);
+    expect(screen.getByText("有未保存修改")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")).toHaveLength(1));
+    const payload = callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")[0].body as { debug_snapshot: { request: { schema_version?: number; query_params: { row_id?: string; enabled?: boolean }[] } } };
+    expect(payload.debug_snapshot.request.schema_version).toBe(2);
+    expect(payload.debug_snapshot.request.query_params[0].row_id).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(payload.debug_snapshot.request.query_params[0].enabled).toBe(false);
+  });
+
+  it("先填值后填名称、非法 Header 都保持整棵编辑器可纠正", async () => {
+    await renderLoaded();
+    fireEvent.click(screen.getByRole("tab", { name: /请求头/ }));
+    fireEvent.click(screen.getByRole("button", { name: "＋添加请求头" }));
+    fireEvent.change(screen.getByLabelText("请求头值 1"), { target: { value: "first-value" } });
+    expect(screen.getByLabelText("用例名称")).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText("请求头名称 1"), { target: { value: "bad header" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    expect(await screen.findByText(/不是合法的请求头名称/)).toBeTruthy();
+    expect(screen.getByLabelText("请求头值 1")).toHaveProperty("value", "first-value");
+
+    fireEvent.change(screen.getByLabelText("请求头名称 1"), { target: { value: "X-Good" } });
+    expect(screen.queryByText(/页面崩溃/)).toBeNull();
+  });
+
   it("导入 cURL 在地址行工具栏里可达，解析成功只填入编辑器", async () => {
     // 它原先排在响应与样例长表单之后，首屏找不到——而导入是新请求的第一步。
     await renderLoaded();
@@ -365,6 +406,58 @@ describe("请求调试工作台", () => {
       "curl --bogus http://echo.test/echo",
     );
     expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")).toEqual([]);
+  });
+
+  it("StrictMode 重复 setup/cleanup 后 cURL 解析仍属于当前编辑器", async () => {
+    await renderLoaded({ strict: true });
+    const toolbar = document.querySelector(".send-bar") as HTMLElement;
+    fireEvent.click(within(toolbar).getByRole("button", { name: "导入 cURL" }));
+    fireEvent.change(within(toolbar).getByLabelText(/粘贴 cURL 命令/), { target: { value: "curl http://echo.test/echo" } });
+    fireEvent.click(within(toolbar).getByRole("button", { name: "解析并填入编辑器" }));
+
+    await waitFor(() => expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/imports/curl/preview"), "POST")).toHaveLength(1));
+    expect(screen.queryByText(/编辑器已关闭/)).toBeNull();
+    await waitFor(() => expect(within(toolbar).getByRole("button", { name: "导入 cURL" })).toBeTruthy());
+  });
+
+  it("cURL 等待期间升级 v2，迟到应用仍保持 v2 与新行身份", async () => {
+    await renderLoaded();
+    let resolvePreview!: (value: unknown) => void;
+    const promise = new Promise<unknown>((resolve) => { resolvePreview = resolve; });
+    curlPreviewGate = { promise, resolve: resolvePreview };
+    window.confirm = vi.fn(() => true);
+
+    const toolbar = document.querySelector(".send-bar") as HTMLElement;
+    fireEvent.click(within(toolbar).getByRole("button", { name: "导入 cURL" }));
+    fireEvent.change(within(toolbar).getByLabelText(/粘贴 cURL 命令/), { target: { value: "curl http://echo.test/new" } });
+    fireEvent.click(within(toolbar).getByRole("button", { name: "解析并填入编辑器" }));
+    await waitFor(() => expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/imports/curl/preview"), "POST")).toHaveLength(1));
+
+    fireEvent.change(screen.getByLabelText("查询参数值 1"), { target: { value: "during" } });
+    resolvePreview({
+      draft: { ...CASE_DETAIL.request, path: "/new", query_params: [{ name: "fresh", value: "1" }] },
+      sendable: true,
+      warnings: [],
+      unsupported: [],
+      auth_hint: null,
+    });
+    await waitFor(() => expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/new"));
+
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")).toHaveLength(1));
+    const payload = callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")[0].body as { debug_snapshot: { request: { schema_version?: number; query_params: { row_id?: string }[] } } };
+    expect(payload.debug_snapshot.request.schema_version).toBe(2);
+    expect(payload.debug_snapshot.request.query_params[0].row_id).toBeTruthy();
+  });
+
+  it("v1 原始文本编辑期间修改路径不会重建行身份或丢未应用输入", async () => {
+    CASE_DETAIL.request.query_params[0].value = "A\r\nB";
+    await renderLoaded();
+    fireEvent.click(screen.getByRole("button", { name: "编辑原始文本" }));
+    const raw = screen.getByLabelText("查询参数值 1转义文本") as HTMLInputElement;
+    fireEvent.change(raw, { target: { value: "A\\r\\nB-edited" } });
+    fireEvent.change(screen.getByLabelText("路径"), { target: { value: "/changed" } });
+    expect(screen.getByDisplayValue("A\\r\\nB-edited")).toBe(raw);
   });
 
   it("响应区在空状态也有自己的标签，样例与预期字段归入「字段与断言」", async () => {

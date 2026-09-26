@@ -114,6 +114,10 @@ export function formatSelector(selector: LocatorStep[]): string {
   if (selector.length === 0) return "$";
   let text = "";
   for (const step of selector) {
+    if (step.kind === "row") {
+      text += `${text === "" ? "" : "."}行(${step.row_id.slice(0, 8)}…)`;
+      continue;
+    }
     if (step.kind === "index") {
       text += `[${step.index}]`;
       continue;

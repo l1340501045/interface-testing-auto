@@ -19,7 +19,8 @@ export type ValueLiteral =
 export type LocatorStep =
   | { kind: "key"; key: string }
   | { kind: "index"; index: number }
-  | { kind: "repeat_key"; key: string; occurrence: number };
+  | { kind: "repeat_key"; key: string; occurrence: number }
+  | { kind: "row"; row_id: string };
 
 export type TargetSource =
   | "request.path"
@@ -93,12 +94,9 @@ export interface Folder {
   archived_at: string | null;
 }
 
-/** 请求定义：目标地址由环境决定，用例不携带绝对地址。 */
-export interface RequestSpec {
+interface RequestSpecBase {
   method: string;
   path: string;
-  query_params: NameValuePair[];
-  headers: NameValuePair[];
   body_type: "none" | "json" | "text" | "form";
   body: string;
   imported_origin?: string;
@@ -111,6 +109,29 @@ export interface RequestSpec {
    */
   auth_required?: boolean;
 }
+
+/** 旧请求保持原始形态；读取时不自动补元数据。 */
+export interface RequestSpecV1 extends RequestSpecBase {
+  schema_version?: never;
+  query_params: NameValuePair[];
+  headers: NameValuePair[];
+}
+
+/** v2 请求行拥有稳定身份、启停和说明。 */
+export interface RequestRowV2 extends NameValuePair {
+  row_id: string;
+  enabled: boolean;
+  description: string;
+}
+
+export interface RequestSpecV2 extends RequestSpecBase {
+  schema_version: 2;
+  query_params: RequestRowV2[];
+  headers: RequestRowV2[];
+}
+
+/** 请求定义：目标地址由环境决定，用例不携带绝对地址。 */
+export type RequestSpec = RequestSpecV1 | RequestSpecV2;
 
 export interface NameValuePair {
   name: string;

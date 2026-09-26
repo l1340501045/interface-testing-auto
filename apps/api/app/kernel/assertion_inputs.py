@@ -39,8 +39,14 @@ class SourceRoots:
     def add_direct(self, source: str, value: Any) -> None:
         self.roots[source] = {"mode": "direct", "value": value}
 
-    def add_tree(self, source: str, root: Any) -> None:
-        self.roots[source] = {"mode": "tree", "root": root}
+    def add_tree(
+        self, source: str, root: Any, *, row_indices: dict[str, int] | None = None
+    ) -> None:
+        self.roots[source] = {
+            "mode": "tree",
+            "root": root,
+            "row_indices": dict(row_indices or {}),
+        }
 
     def add_omitted(self, source: str, reason: str) -> None:
         """登记一个**被明确省略**的来源；不进入 `roots`，因此取不到值。"""
@@ -62,7 +68,7 @@ class SourceRoots:
                 raise FieldLocatorError(f"来源 {source} 不接受字段定位")
             return True, entry["value"]
         try:
-            result = locate(entry["root"], selector)
+            result = locate(entry["root"], selector, entry.get("row_indices"))
         except FieldLocatorError:
             return False, None
         return result.found, result.value
@@ -84,7 +90,7 @@ class SourceRoots:
             return None
         if entry["mode"] == "direct":
             return (source,) if not selector else None
-        resolved = structural_path(entry["root"], selector)
+        resolved = structural_path(entry["root"], selector, entry.get("row_indices"))
         if resolved is None:
             return None
         return (source, *resolved)
@@ -168,7 +174,9 @@ def _repeat_key_matches(arr: list, key: str) -> list[tuple[int, Any, Any]]:
     return matches
 
 
-def structural_path(root: Any, selector: list[dict]) -> tuple | None:
+def structural_path(
+    root: Any, selector: list[dict], row_indices: dict[str, int] | None = None
+) -> tuple | None:
     """按定位步骤走一遍真实结构，返回命中的字段名／下标序列。
 
     与 `locate` 用同一套取值语义（含 `repeat_key` 与 `get` 的缺省），只是额外把
@@ -208,6 +216,12 @@ def structural_path(root: Any, selector: list[dict]) -> tuple | None:
             index, value_coord, value = matches[occurrence]
             current = value
             path.extend([index, value_coord])
+        elif kind == "row":
+            index = (row_indices or {}).get(step.get("row_id"))
+            if index is None or not isinstance(current, list) or index >= len(current):
+                return None
+            current = current[index]
+            path.append(index)
         else:
             return None
     return tuple(path)

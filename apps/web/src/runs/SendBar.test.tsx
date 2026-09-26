@@ -47,12 +47,12 @@ function blockedPreflight(code: string, action: DebugPreflight["issues"][number]
   };
 }
 
-function renderSendBar(preflight: DebugPreflight | null) {
+function renderSendBar(preflight: DebugPreflight | null, request: RawRequest = REQUEST) {
   const onOpenAdmin = vi.fn();
   const onOpenEnvironment = vi.fn();
   render(
     <SendBar
-      request={REQUEST}
+      request={request}
       environments={[ENVIRONMENT]}
       selectedEnvironmentId={ENV_ID}
       onSelectEnvironment={vi.fn()}
@@ -107,5 +107,14 @@ describe("环境地址无效时的发送栏", () => {
     expect(screen.queryByRole("button", { name: "修改请求内容" })).toBeNull();
     // 地址本身没被判为不合法，预览照常显示。
     expect(screen.getByText(/实际目标：target-service:8080\/orders/)).toBeTruthy();
+  });
+
+  it("仅停用 Query 含变量时不显示地址变量提示", () => {
+    renderSendBar(null, {
+      ...REQUEST,
+      schema_version: 2,
+      query_params: [{ row_id: "11111111-1111-7111-8111-111111111111", name: "disabled", value: "{{missing}}", enabled: false, description: "" }],
+    });
+    expect(screen.queryByText(/含 \{\{变量\}\}/)).toBeNull();
   });
 });

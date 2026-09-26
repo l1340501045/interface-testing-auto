@@ -10,7 +10,7 @@
  * 外壳读聚合结果决定要不要先问一次。登记表只是一个布尔汇总，不承载表单内容，
  * 因此秘密不会因为离开保护而被复制到别处。
  */
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { createContext, useContext, useLayoutEffect, useMemo, useState, type ReactNode } from "react";
 
 export interface LeaveState {
   /** 内容与基线不同，尚未保存。 */
@@ -35,10 +35,14 @@ export interface LeaveAggregate extends LeaveState {
    * 掉它，才问得出“除了它以外还有没有别的表单要丢”。
    */
   without: (key: string) => LeaveState;
+  /** 只汇总指定登记键；多标签关闭时冻结目标集合后据此读取最新状态。 */
+  only: (keys: readonly string[]) => LeaveState;
+  matching: (prefixes: readonly string[]) => LeaveState;
+  descendants: (prefix: string) => LeaveState;
 }
 
 const RegistryContext = createContext<Registry | null>(null);
-const NOTHING_TO_LEAVE: LeaveAggregate = { dirty: false, busy: false, without: () => ({ dirty: false, busy: false }) };
+const NOTHING_TO_LEAVE: LeaveAggregate = { dirty: false, busy: false, without: () => ({ dirty: false, busy: false }), only: () => ({ dirty: false, busy: false }), matching: () => ({ dirty: false, busy: false }), descendants: () => ({ dirty: false, busy: false }) };
 const AggregateContext = createContext<LeaveAggregate>(NOTHING_TO_LEAVE);
 
 export function LeaveGuardProvider({ children }: { children: ReactNode }) {
@@ -68,10 +72,10 @@ export function LeaveGuardProvider({ children }: { children: ReactNode }) {
   );
 
   const aggregate = useMemo<LeaveAggregate>(() => {
-    const summarize = (exclude: string | null): LeaveState =>
+    const summarize = (exclude: string | null, include: ReadonlySet<string> | null = null): LeaveState =>
       Object.entries(entries).reduce<LeaveState>(
         (accumulated, [key, item]) =>
-          key === exclude
+          key === exclude || (include !== null && !include.has(key))
             ? accumulated
             : {
                 dirty: accumulated.dirty || item.dirty,
@@ -79,7 +83,19 @@ export function LeaveGuardProvider({ children }: { children: ReactNode }) {
               },
         { dirty: false, busy: false },
       );
-    return { ...summarize(null), without: (key) => summarize(key) };
+    return {
+      ...summarize(null),
+      without: (key) => summarize(key),
+      only: (keys) => summarize(null, new Set(keys)),
+      matching: (prefixes) => {
+        const keys = Object.keys(entries).filter((key) => prefixes.some((prefix) => key === prefix || key.startsWith(`${prefix}:`)));
+        return summarize(null, new Set(keys));
+      },
+      descendants: (prefix) => {
+        const keys = Object.keys(entries).filter((key) => key.startsWith(`${prefix}:`));
+        return summarize(null, new Set(keys));
+      },
+    };
   }, [entries]);
 
   return (
@@ -99,7 +115,7 @@ export function useLeaveReport(key: string, state: LeaveState): void {
   const registry = useContext(RegistryContext);
   const { dirty, busy } = state;
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (registry === null) return;
     registry.report(key, { dirty, busy });
     return () => registry.clear(key);

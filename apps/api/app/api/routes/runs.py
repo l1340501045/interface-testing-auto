@@ -31,6 +31,7 @@ from ...services.run_coordinator import (
 )
 from .. import deps
 from ..errors import bad_request, conflict, forbidden, not_found
+from ..request_contract import has_row_locator, is_v2, require_v2_capability
 from ..schemas import (
     AssertionResultOut,
     DebugPreflightOut,
@@ -83,6 +84,7 @@ def start_run(
     payload: RunCreate,
     response: Response,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    request_contract: str | None = Header(default=None, alias="X-Request-Contract"),
     scope: deps.ProjectScope = _EXECUTE_SCOPE,
     settings: Settings = Depends(deps.get_settings_dep),
     session: Session = Depends(get_db),
@@ -90,6 +92,10 @@ def start_run(
     if (payload.case_version_id is None) == (payload.debug_snapshot is None):
         raise bad_request(
             "target_required", "请选择已发布用例版本或提供调试快照，二者只能有一个。"
+        )
+    if payload.debug_snapshot is not None:
+        require_v2_capability(
+            request_contract, needed=is_v2(payload.debug_snapshot.request)
         )
     try:
         run = create_run(
@@ -125,6 +131,7 @@ def start_run(
 )
 def debug_snapshot_digest(
     payload: DebugSnapshot,
+    request_contract: str | None = Header(default=None, alias="X-Request-Contract"),
     scope: deps.ProjectScope = _EXECUTE_SCOPE,
 ) -> DebugSnapshotDigestOut:
     """计算调试快照摘要，供身份管理员据此签发一次性授权。
@@ -133,6 +140,7 @@ def debug_snapshot_digest(
     步骤算出，管理员签发的授权与实际执行的内容因此指向同一份快照。计算摘要本身
     不构成权限提升——签发授权仍需要 `manage_secrets` 管理角色。
     """
+    require_v2_capability(request_contract, needed=is_v2(payload.request))
     try:
         digest = digest_for_debug_snapshot(
             RunRequest(environment_id=uuid.uuid4(), debug_snapshot=payload.model_dump())
@@ -148,6 +156,7 @@ def debug_snapshot_digest(
 )
 def debug_preflight(
     payload: DebugPreflightRequest,
+    request_contract: str | None = Header(default=None, alias="X-Request-Contract"),
     scope: deps.ProjectScope = _EXECUTE_SCOPE,
     settings: Settings = Depends(deps.get_settings_dep),
     session: Session = Depends(get_db),
@@ -158,6 +167,9 @@ def debug_preflight(
     `manage_secrets`：普通编辑者拿不到 `GET credentials/*`，页面因此无法给出
     “到底缺什么”。这里返回脱敏结论与建议动作，真正发送前仍按权威规则重新检查。
     """
+    require_v2_capability(
+        request_contract, needed=is_v2(payload.debug_snapshot.request)
+    )
     result = preflight(
         session,
         settings,
@@ -296,12 +308,18 @@ def _report_context(
 )
 def get_report(
     run_id: uuid.UUID,
+    request_contract: str | None = Header(default=None, alias="X-Request-Contract"),
     scope: deps.ProjectScope = _VIEW_SCOPE,
     settings: Settings = Depends(deps.get_settings_dep),
     session: Session = Depends(get_db),
 ) -> RunReportOut:
     """脱敏报告：请求与响应证据来自最后一次尝试，秘密已被遮蔽。"""
     run = _get_run(session, scope, run_id)
+    snapshot = run.snapshot or {}
+    require_v2_capability(
+        request_contract,
+        needed=has_row_locator(snapshot.get("assertions")),
+    )
     attempts = list(
         session.scalars(
             select(RunStepAttempt)

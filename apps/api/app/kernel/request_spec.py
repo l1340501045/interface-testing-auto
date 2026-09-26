@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl, quote, quote_plus, urlencode, urlsplit
@@ -25,6 +26,8 @@ from .variables import (
 _METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
 _BODY_TYPES = {"none", "json", "text", "form"}
 _MAX_BODY_BYTES = 5 * 1024 * 1024
+_MAX_V2_ROWS = 500
+_MAX_DESCRIPTION_CHARS = 1024
 
 # 路径段里可以原样保留的字符：RFC 3986 的 pchar 加上路径分隔符。
 _PATH_SAFE = "/%:@!$&*+,;=-._~"
@@ -64,6 +67,9 @@ class PreparedRequest:
     # `final_path` 在 URL 里的编码形态（不含查询串），与 `urlsplit(url).path`
     # 逐字符一致——环境带基础路径时也一致。
     url_path: str = ""
+    # v2 用户行在最终实际集合中的稳定坐标。认证注入与自动 Content-Type 没有 row_id。
+    query_row_indices: dict[str, int] = field(default_factory=dict)
+    header_row_indices: dict[str, int] = field(default_factory=dict)
 
     def headers_as_pairs(self) -> list[dict[str, str]]:
         """保持重复请求头的顺序，供字段定位与证据脱敏使用。"""
@@ -128,6 +134,12 @@ def _pairs(items: Any, field_name: str) -> list[dict[str, str]]:
     for item in items:
         if not isinstance(item, dict):
             raise RequestSpecError(f"{field_name} 的每一项必须是对象")
+        extra = set(item) - {"name", "value"}
+        if extra:
+            raise RequestSpecError(
+                f"无版本标记的 {field_name} 行包含 v1 不支持的字段："
+                f"{'、'.join(sorted(extra))}；行元数据需要 schema_version: 2"
+            )
         name = item.get("name")
         value = item.get("value", "")
         if not isinstance(name, str) or not name:
@@ -135,6 +147,69 @@ def _pairs(items: Any, field_name: str) -> list[dict[str, str]]:
         if not isinstance(value, str):
             raise RequestSpecError(f"{field_name} 中 {name} 的值必须是文本")
         result.append({"name": name, "value": value})
+    return result
+
+
+def _v2_pairs(
+    items: Any, field_name: str, seen_row_ids: set[str]
+) -> list[dict[str, Any]]:
+    if items is None:
+        return []
+    if not isinstance(items, list):
+        raise RequestSpecError(f"{field_name} 必须是数组")
+    result: list[dict[str, Any]] = []
+    required = {"row_id", "name", "value", "enabled", "description"}
+    for item in items:
+        if not isinstance(item, dict):
+            raise RequestSpecError(f"{field_name} 的每一项必须是对象")
+        missing = required - set(item)
+        extra = set(item) - required
+        if missing or extra:
+            details: list[str] = []
+            if missing:
+                details.append(f"缺少 {'、'.join(sorted(missing))}")
+            if extra:
+                details.append(f"包含未知字段 {'、'.join(sorted(extra))}")
+            raise RequestSpecError(f"{field_name} 的 v2 行字段不完整：{'；'.join(details)}")
+        raw_row_id = item["row_id"]
+        if not isinstance(raw_row_id, str):
+            raise RequestSpecError(f"{field_name} 的 row_id 必须是 UUID 字符串")
+        try:
+            row_id = str(uuid.UUID(raw_row_id))
+        except ValueError as error:
+            raise RequestSpecError(f"{field_name} 的 row_id 不是有效 UUID") from error
+        if raw_row_id.lower() != row_id:
+            raise RequestSpecError(f"{field_name} 的 row_id 必须使用标准 UUID 格式")
+        if row_id in seen_row_ids:
+            raise RequestSpecError(f"请求内 row_id 重复：{row_id}")
+        seen_row_ids.add(row_id)
+        name = item["name"]
+        value = item["value"]
+        enabled = item["enabled"]
+        description = item["description"]
+        if not isinstance(name, str) or not name:
+            raise RequestSpecError(f"{field_name} 的项缺少名称")
+        if field_name == "headers" and _HEADER_NAME.fullmatch(name) is None:
+            raise RequestSpecError("v2 请求头名称不是合法的 HTTP token")
+        if not isinstance(value, str):
+            raise RequestSpecError(f"{field_name} 中的值必须是文本")
+        if not isinstance(enabled, bool):
+            raise RequestSpecError(f"{field_name} 的 enabled 必须是布尔值")
+        if not isinstance(description, str):
+            raise RequestSpecError(f"{field_name} 的 description 必须是文本")
+        if len(description) > _MAX_DESCRIPTION_CHARS:
+            raise RequestSpecError(
+                f"{field_name} 的 description 超过 {_MAX_DESCRIPTION_CHARS} 字符上限"
+            )
+        result.append(
+            {
+                "row_id": row_id,
+                "name": name,
+                "value": value,
+                "enabled": enabled,
+                "description": description,
+            }
+        )
     return result
 
 
@@ -166,11 +241,20 @@ def validate_request(spec: dict[str, Any]) -> dict[str, Any]:
         "body",
         "imported_origin",
         "auth_required",
+        "schema_version",
     }
 
     extra = set(spec) - allowed
     if extra:
         raise RequestSpecError(f"请求定义包含未知字段：{'、'.join(sorted(extra))}")
+
+    schema_version = spec.get("schema_version")
+    if "schema_version" in spec and (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != 2
+    ):
+        raise RequestSpecError(f"不支持的请求协议版本：{schema_version!r}")
 
     method = _text(spec.get("method", "GET"), "method").upper()
     if method not in _METHODS:
@@ -201,14 +285,26 @@ def validate_request(spec: dict[str, Any]) -> dict[str, Any]:
         if len(body.encode("utf-8")) > _MAX_BODY_BYTES:
             raise RequestSpecError("正文超过 5 MiB 上限")
 
+    if schema_version == 2:
+        seen_row_ids: set[str] = set()
+        query_params = _v2_pairs(spec.get("query_params"), "query_params", seen_row_ids)
+        headers = _v2_pairs(spec.get("headers"), "headers", seen_row_ids)
+        if len(query_params) + len(headers) > _MAX_V2_ROWS:
+            raise RequestSpecError(f"v2 Query 与 Header 合计最多 {_MAX_V2_ROWS} 行")
+    else:
+        query_params = _pairs(spec.get("query_params"), "query_params")
+        headers = _pairs(spec.get("headers"), "headers")
+
     normalized: dict[str, Any] = {
         "method": method,
         "path": path,
-        "query_params": _pairs(spec.get("query_params"), "query_params"),
-        "headers": _pairs(spec.get("headers"), "headers"),
+        "query_params": query_params,
+        "headers": headers,
         "body_type": body_type,
         "body": body,
     }
+    if schema_version == 2:
+        normalized["schema_version"] = 2
     imported = spec.get("imported_origin")
     if imported is not None:
         normalized["imported_origin"] = _text(imported, "imported_origin")
@@ -239,11 +335,16 @@ def _auth_required(spec: dict[str, Any]) -> bool:
 
 
 def _resolve_pairs(
-    pairs: list[dict[str, str]], resolver: VariableResolver
-) -> list[dict[str, str]]:
+    pairs: list[dict[str, Any]], resolver: VariableResolver
+) -> list[dict[str, Any]]:
     return [
-        {"name": pair["name"], "value": resolver.resolve_text(pair["value"])}
+        {
+            "name": pair["name"],
+            "value": resolver.resolve_text(pair["value"]),
+            **({"row_id": pair["row_id"]} if "row_id" in pair else {}),
+        }
         for pair in pairs
+        if pair.get("enabled", True)
     ]
 
 
@@ -425,6 +526,9 @@ def prepare(
 
     base = base_url.rstrip("/")
     query_pairs = [(item["name"], item["value"]) for item in query]
+    query_row_indices = {
+        item["row_id"]: index for index, item in enumerate(query) if "row_id" in item
+    }
     # 重复参数必须保留原始顺序与出现次数，不能折叠成 dict。
     url = join_url(base, path, query_pairs)
     # 完整最终路径与最终 URL 共用**同一份**数据、同一条拼接规则：环境基础路径取
@@ -433,6 +537,9 @@ def prepare(
     base_path = urlsplit(base).path
 
     final_headers = [(item["name"], item["value"]) for item in headers]
+    header_row_indices = {
+        item["row_id"]: index for index, item in enumerate(headers) if "row_id" in item
+    }
     content: bytes | None = None
     if body_type == "json":
         content = body.encode("utf-8")
@@ -468,6 +575,8 @@ def prepare(
         relative_path=path,
         final_path=f"{base_path}{path}",
         url_path=f"{base_path}{quote(path, safe=_PATH_SAFE)}",
+        query_row_indices=query_row_indices,
+        header_row_indices=header_row_indices,
     )
 
 

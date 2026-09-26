@@ -4,6 +4,7 @@
 - {"kind": "key", "key": "字段名"}           —— 对象字段（真实字段名，可含点/括号/空格）
 - {"kind": "index", "index": 0}              —— 数组下标
 - {"kind": "repeat_key", "key": "x", "occurrence": 0} —— 同名重复项（header/query 数组）
+- {"kind": "row", "row_id": "UUID"}               —— v2 请求行稳定身份
 
 返回 (found, value)：found=False 表示字段缺失（区别于值为 null）。
 """
@@ -61,7 +62,9 @@ def _get_repeat_key(arr: list, key: str, occurrence: int) -> LocateResult:
     return LocateResult(found=True, value=matches[occurrence])
 
 
-def locate(root: Any, path: list[dict]) -> LocateResult:
+def locate(
+    root: Any, path: list[dict], row_indices: dict[str, int] | None = None
+) -> LocateResult:
     """沿 path 步骤数组逐级取值。"""
     current = root
     for step in path:
@@ -74,6 +77,11 @@ def locate(root: Any, path: list[dict]) -> LocateResult:
             result = _get_index(current, int(step.get("index")))
         elif kind == "repeat_key":
             result = _get_repeat_key(current, step.get("key"), int(step.get("occurrence", 0)))
+        elif kind == "row":
+            index = (row_indices or {}).get(step.get("row_id"))
+            if index is None:
+                return LocateResult(found=False)
+            result = _get_index(current, index)
         else:
             raise FieldLocatorError(f"未知定位步骤：{kind!r}")
         if not result.found:

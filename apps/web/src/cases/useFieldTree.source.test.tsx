@@ -79,18 +79,27 @@ function route(path: string, method: string, body: unknown): unknown {
 }
 
 const onChange = vi.fn();
+const TYPES = [{
+  id: "equals",
+  label: "等于",
+  group: "通用",
+  applies_to: ["string", "integer", "number"],
+  params_schema: { expected: { control: "value" as const, type: "string", label: "期望值" } },
+  summary: "等于期望值",
+  operator_version: 1,
+}];
 
 /** 真实字段树 Hook + 真实字段面板。 */
-function Harness({ text, sourceKey }: { text: string; sourceKey: string }) {
+function Harness({ text, sourceKey, enabled = true }: { text: string; sourceKey: string; enabled?: boolean }) {
   // `bodySourceKey` 与正文一起构成来源身份，与 CaseEditor / ResponseFieldPanel 的用法一致。
-  const tree = useFieldTree("ws", "p", text, sourceKey);
+  const tree = useFieldTree("ws", "p", text, sourceKey, enabled);
   return (
     <FieldTreePanel
       title="响应正文字段"
       tree={tree}
       sourceKey={sourceKey}
       targetSource="response.body"
-      types={[]}
+      types={TYPES}
       typesError={null}
       workspaceId="ws"
       projectId="p"
@@ -213,5 +222,29 @@ describe("新来源加载期间不开放旧字段树", () => {
     await expandToId();
     selectDataId();
     expect(detailText()).toContain("string");
+  });
+
+  it("隐藏同一来源只暂停新读取，保留已加载树与未应用字段表单", async () => {
+    const text = '{"data":{"id":1}}';
+    bodies[text] = treeFor("integer", "1");
+    const { rerender } = render(<Harness text={text} sourceKey="same" />);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    });
+    await expandToId();
+    selectDataId();
+    expect(detailText()).toContain("integer");
+    fireEvent.click(screen.getByRole("button", { name: "＋添加断言" }));
+    fireEvent.change(screen.getByLabelText("断言类型"), { target: { value: "equals" } });
+    fireEvent.change(screen.getByLabelText("期望值"), { target: { value: "未应用条件" } });
+
+    rerender(<Harness text={text} sourceKey="same" enabled={false} />);
+    expect(screen.getByRole("button", { name: "id" })).toBeTruthy();
+    expect(detailText()).toContain("integer");
+    expect(screen.getByDisplayValue("未应用条件")).toBeTruthy();
+
+    rerender(<Harness text={text} sourceKey="same" enabled />);
+    expect(screen.getByDisplayValue("未应用条件")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "id" })).toBeTruthy();
   });
 });

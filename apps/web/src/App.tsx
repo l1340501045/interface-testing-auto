@@ -4,9 +4,9 @@
  * 范围（工作空间、项目、环境）只保存在组件状态里，任何一次范围切换都会清空
  * 下游选择，避免把上一个项目的用例或环境带到当前项目显示。
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 
-import { ApiError, apiSend } from "./api/client";
+import { ApiError, apiSend, invalidateClientSession } from "./api/client";
 import type { SessionInfo } from "./api/types";
 import { AdminPanel } from "./admin/AdminPanel";
 import { CaseBrowser } from "./cases/CaseBrowser";
@@ -14,6 +14,7 @@ import { CaseEditor } from "./cases/CaseEditor";
 import { useFolders } from "./cases/useCases";
 import { Empty, ErrorText, Hint, Loading } from "./components/Feedback";
 import { LeaveGuardProvider, useLeaveAggregate, useLeaveReport } from "./hooks/leaveGuard";
+import type { LeaveState } from "./hooks/leaveGuard";
 import { PAGE_LABEL, pageFromHash, pageHash, type AppPage } from "./navigation";
 import { EnvironmentPanel } from "./projects/EnvironmentPanel";
 import { useEnvironments, useProjects } from "./projects/useProjects";
@@ -44,9 +45,20 @@ function canEdit(role: string | null): boolean {
  * null，不会把上一次新建用的目录串到另一条用例上。
  */
 interface EditorTarget {
+  tabId: string;
   id: string | null;
   folderId: string | null;
   nonce: number;
+  environmentId: string | null;
+  name: string;
+  method: string;
+  dirty: boolean;
+  busy: boolean;
+}
+
+function newTabId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 /**
@@ -119,7 +131,23 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   const [environmentId, setEnvironmentId] = useState<string | null>(null);
   /** 配置页正在浏览的环境；与工作台实际发送使用的环境严格分离。 */
   const [settingsEnvironmentId, setSettingsEnvironmentId] = useState<string | null>(null);
-  const [editor, setEditor] = useState<EditorTarget | null>(null);
+  const [editors, setEditors] = useState<EditorTarget[]>([]);
+  const [activeEditorId, setActiveEditorId] = useState<string | null>(null);
+  const editor = editors.find((item) => item.tabId === activeEditorId) ?? null;
+  const liveEditors = useRef(editors);
+  const liveActiveEditorId = useRef(activeEditorId);
+  liveEditors.current = editors;
+  liveActiveEditorId.current = activeEditorId;
+  const closeControllers = useRef(new Map<string, { save: () => Promise<boolean>; state: () => LeaveState }>());
+  const [closeDialog, setCloseDialog] = useState<{ tabIds: string[]; attemptId: number; saving: boolean } | null>(null);
+  const closeAttemptRef = useRef(0);
+  const closeSavingAttemptRef = useRef<number | null>(null);
+  const workspaceTabRefs = useRef(new Map<string, HTMLButtonElement>());
+  const workspaceTabScrollRef = useRef<HTMLDivElement | null>(null);
+  const newRequestButtonRef = useRef<HTMLButtonElement | null>(null);
+  const closeDialogCancelRef = useRef<HTMLButtonElement | null>(null);
+  const closeDialogReturnFocusRef = useRef<HTMLElement | null>(null);
+  const closeDialogWasOpenRef = useRef(false);
   const [selectedCaseId, setSelectedCaseId] = useState<string | null>(null);
   const [reportRequest, setReportRequest] = useState<{
     runId: string;
@@ -128,6 +156,50 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
     projectId: string;
   } | null>(null);
   const reportRequestToken = useRef(0);
+
+  const revealActiveTab = useCallback(() => {
+    if (activeEditorId === null) return;
+    const scroller = workspaceTabScrollRef.current;
+    const tab = workspaceTabRefs.current.get(activeEditorId);
+    if (scroller === null || tab === undefined) return;
+    const viewport = scroller.getBoundingClientRect();
+    const item = tab.getBoundingClientRect();
+    if (item.left < viewport.left) scroller.scrollLeft -= viewport.left - item.left;
+    else if (item.right > viewport.right) scroller.scrollLeft += item.right - viewport.right;
+  }, [activeEditorId]);
+
+  useLayoutEffect(() => {
+    revealActiveTab();
+  }, [revealActiveTab, editor?.name, editor?.method, editor?.dirty, editor?.busy]);
+
+  useEffect(() => {
+    const scroller = workspaceTabScrollRef.current;
+    if (scroller === null) return;
+    const handleResize = () => revealActiveTab();
+    window.addEventListener("resize", handleResize);
+    if (typeof ResizeObserver === "undefined") return () => window.removeEventListener("resize", handleResize);
+    const observer = new ResizeObserver(handleResize);
+    observer.observe(scroller);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", handleResize);
+    };
+  }, [revealActiveTab]);
+
+  useEffect(() => {
+    if (closeDialog !== null) {
+      closeDialogWasOpenRef.current = true;
+      closeDialogCancelRef.current?.focus();
+      return;
+    }
+    if (!closeDialogWasOpenRef.current) return;
+    closeDialogWasOpenRef.current = false;
+    const previous = closeDialogReturnFocusRef.current;
+    closeDialogReturnFocusRef.current = null;
+    if (previous?.isConnected && !(previous instanceof HTMLButtonElement && previous.disabled)) previous.focus();
+    else newRequestButtonRef.current?.focus();
+  }, [closeDialog]);
+
   const [caseRefresh, setCaseRefresh] = useState(0);
   /**
    * 目录清单的刷新序号。目录与用例分属两个资源：新建／归档目录只该重拉目录，
@@ -210,6 +282,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
     return () => window.removeEventListener("hashchange", syncPage);
   }, []);
   const [settingsFocusTarget, setSettingsFocusTarget] = useState<string | null>(null);
+  const [settingsSourceTabId, setSettingsSourceTabId] = useState<string | null>(null);
 
   /** 环境与身份是两个配置块，入口必须精确定位，不能只切页后让用户继续寻找。 */
   const revealAdminBlock = useCallback((anchorId: string) => {
@@ -217,16 +290,18 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
     navigate("environments");
   }, [navigate]);
   const [credentialsOpen, setCredentialsOpen] = useState(false);
-  const openAdminPanel = useCallback(() => {
+  const openAdminPanel = useCallback((sourceTabId?: string) => {
+    setSettingsSourceTabId(sourceTabId ?? null);
     setCredentialsOpen(true);
     revealAdminBlock("credentials-panel");
   }, [revealAdminBlock]);
   /** 环境面板的折叠状态由外壳持有，纠错入口可直接展开；无环境时同样强制展开。 */
   const [environmentOpen, setEnvironmentOpen] = useState(false);
   /** 打开环境设置时同步展开环境块，保证地址编辑入口立即可见。 */
-  const openEnvironmentPanel = useCallback(() => {
+  const openEnvironmentPanel = useCallback((sourceTabId?: string, sourceEnvironmentId?: string | null) => {
+    setSettingsSourceTabId(sourceTabId ?? null);
     setEnvironmentOpen(true);
-    setSettingsEnvironmentId(environmentId);
+    setSettingsEnvironmentId(sourceEnvironmentId ?? environmentId);
     revealAdminBlock("environment-panel");
   }, [environmentId, revealAdminBlock]);
 
@@ -247,7 +322,8 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
     setProjectId(null);
     setEnvironmentId(null);
     setSettingsEnvironmentId(null);
-    setEditor(null);
+    setEditors([]);
+    setActiveEditorId(null);
     setSelectedCaseId(null);
     setEditorVersion(null);
     setProjectError(null);
@@ -260,7 +336,8 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   useEffect(() => {
     setEnvironmentId(null);
     setSettingsEnvironmentId(null);
-    setEditor(null);
+    setEditors([]);
+    setActiveEditorId(null);
     setSelectedCaseId(null);
     setEditorVersion(null);
     setReportRequest(null);
@@ -282,9 +359,32 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   }, [environmentId, environmentList, settingsEnvironmentId]);
 
   const openCase = useCallback((caseId: string | null, folderId: string | null = null) => {
-    setEditor((current) => ({ id: caseId, folderId, nonce: (current?.nonce ?? 0) + 1 }));
+    const existing = caseId === null ? undefined : editors.find((item) => item.id === caseId);
+    if (existing) {
+      setActiveEditorId(existing.tabId);
+      setSelectedCaseId(existing.id);
+      return;
+    }
+    if (editors.length >= 20) {
+      window.alert("当前项目最多打开 20 个请求，请先关闭一个标签。");
+      return;
+    }
+    const tabId = newTabId();
+    const target: EditorTarget = {
+      tabId,
+      id: caseId,
+      folderId,
+      nonce: Date.now(),
+      environmentId,
+      name: caseId === null ? "新请求" : `用例 ${caseId.slice(0, 8)}…`,
+      method: "GET",
+      dirty: false,
+      busy: false,
+    };
+    setEditors((current) => [...current, target]);
+    setActiveEditorId(tabId);
     setSelectedCaseId(caseId);
-  }, []);
+  }, [editors, environmentId]);
 
   /**
    * 离开登记表的最新汇总。
@@ -315,10 +415,11 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
       // 草稿会把这次切换判成“有未保存修改”，弹一个无所指的确认框。
       const state = except === undefined ? current : current.without(except);
       if (!state.dirty && !state.busy) return true;
-      const message = state.busy
-        ? "当前有正在进行的操作，离开会丢失尚未看到的结果。确定离开吗？"
-        : "当前有未保存的修改（表单或用例），离开后这些修改会丢失。确定离开吗？";
-      return window.confirm(message);
+      if (state.busy) {
+        window.alert("当前有保存、发布或受理结果待确认；普通切换不能丢弃该操作，请先回到标签处理。只有明确退出登录可清除本地确认依据。");
+        return false;
+      }
+      return window.confirm("当前有未保存的修改（表单或用例），离开后这些修改会丢失。确定离开吗？");
     },
     [],
   );
@@ -337,11 +438,10 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
 
   const changeCase = useCallback(
     (caseId: string | null) => {
-      if (!confirmLeaveEditor()) return;
       // 选中已有用例时不带目录：它的归属由详情决定。只有新建才继承当前目录。
       openCase(caseId, null);
     },
-    [confirmLeaveEditor, openCase],
+    [openCase],
   );
 
   /**
@@ -352,22 +452,140 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
    */
   const createCase = useCallback(
     (folderId: string | null) => {
-      if (!confirmLeaveEditor()) return;
       openCase(null, folderId);
     },
-    [confirmLeaveEditor, openCase],
+    [openCase],
   );
 
-  const closeEditor = useCallback(() => {
-    if (!confirmLeaveEditor()) return;
-    setEditor(null);
-    setSelectedCaseId(null);
-  }, [confirmLeaveEditor]);
+  const removeClosedTargets = useCallback((tabIds: readonly string[]) => {
+    const latestEditors = liveEditors.current;
+    const remaining = latestEditors.filter((item) => !tabIds.includes(item.tabId));
+    setEditors((current) => current.filter((item) => !tabIds.includes(item.tabId)));
+    const latestActive = liveActiveEditorId.current;
+    if (latestActive !== null && tabIds.includes(latestActive)) {
+      const next = remaining.at(-1) ?? null;
+      setActiveEditorId(next?.tabId ?? null);
+      setSelectedCaseId(next?.id ?? null);
+    }
+  }, []);
+
+  const finishCloseEditors = useCallback(async (tabIds: readonly string[], mode: "save" | "discard", attemptId: number) => {
+    if (closeAttemptRef.current !== attemptId) return;
+    const targets = liveEditors.current.filter((item) => tabIds.includes(item.tabId));
+    if (mode === "discard") {
+      const state = liveLeaveState.current.matching(targets.map((item) => `case-tab:${item.tabId}`));
+      if (closeSavingAttemptRef.current === attemptId || state.busy || targets.some((item) => closeControllers.current.get(item.tabId)?.state().busy)) {
+        window.alert("保存仍在进行，不能放弃并关闭；可以取消本次关闭，保存结果仍会保留。");
+        return;
+      }
+    }
+    if (mode === "save") {
+        closeSavingAttemptRef.current = attemptId;
+        setCloseDialog((current) => current?.attemptId === attemptId ? { ...current, saving: true } : current);
+        for (const target of targets) {
+          const controller = closeControllers.current.get(target.tabId);
+          if (controller === undefined) {
+            closeSavingAttemptRef.current = null;
+            setCloseDialog((current) => current?.attemptId === attemptId ? { ...current, saving: false } : current);
+            window.alert("保存未完成或保存期间出现了新输入，目标标签均保留；已经成功的服务端保存不会回滚。");
+            return;
+          }
+          const saved = await controller.save();
+          if (closeAttemptRef.current !== attemptId) {
+            if (closeSavingAttemptRef.current === attemptId) closeSavingAttemptRef.current = null;
+            return;
+          }
+          if (!saved) {
+            closeSavingAttemptRef.current = null;
+            setCloseDialog((current) => current?.attemptId === attemptId ? { ...current, saving: false } : current);
+            window.alert("保存未完成或保存期间出现了新输入，目标标签均保留；已经成功的服务端保存不会回滚。");
+            return;
+          }
+          const root = controller.state();
+          const child = liveLeaveState.current.descendants(`case-tab:${target.tabId}`);
+          if (root.busy || root.dirty || child.busy || child.dirty) {
+            closeSavingAttemptRef.current = null;
+            setCloseDialog((current) => current?.attemptId === attemptId ? { ...current, saving: false } : current);
+            window.alert("保存完成后又出现新输入或新操作，目标标签均保留；已经成功的服务端保存不会回滚。");
+            return;
+          }
+        }
+        if (closeAttemptRef.current !== attemptId) return;
+        const latestTargetState = targets.reduce(
+          (state, item) => {
+            const root = closeControllers.current.get(item.tabId)?.state() ?? { dirty: true, busy: true };
+            const child = liveLeaveState.current.descendants(`case-tab:${item.tabId}`);
+            return { dirty: state.dirty || root.dirty || child.dirty, busy: state.busy || root.busy || child.busy };
+          },
+          { dirty: false, busy: false },
+        );
+        if (latestTargetState.busy || latestTargetState.dirty) {
+          closeSavingAttemptRef.current = null;
+          setCloseDialog((current) => current?.attemptId === attemptId ? { ...current, saving: false } : current);
+          window.alert("仍有尚未应用的 cURL、断言或批量输入，请先回到对应标签应用或明确放弃。");
+          return;
+        }
+        closeSavingAttemptRef.current = null;
+    }
+    if (closeAttemptRef.current !== attemptId) return;
+    setCloseDialog(null);
+    removeClosedTargets(tabIds);
+  }, [removeClosedTargets]);
+
+  const cancelCloseDialog = useCallback(() => {
+    closeAttemptRef.current += 1;
+    setCloseDialog(null);
+  }, []);
+
+  const requestCloseEditors = useCallback((tabIds: readonly string[]) => {
+    const targets = liveEditors.current.filter((item) => tabIds.includes(item.tabId));
+    const state = liveLeaveState.current.matching(targets.map((item) => `case-tab:${item.tabId}`));
+    if (state.busy || targets.some((item) => closeControllers.current.get(item.tabId)?.state().busy)) {
+      window.alert("目标标签仍有保存、发布或受理结果待确认，请等待或回到标签处理后再关闭。");
+      return;
+    }
+    if (!state.dirty && targets.every((item) => !closeControllers.current.get(item.tabId)?.state().dirty)) {
+      removeClosedTargets(tabIds);
+      return;
+    }
+    closeDialogReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    closeAttemptRef.current += 1;
+    setCloseDialog({ tabIds: [...tabIds], attemptId: closeAttemptRef.current, saving: false });
+  }, [removeClosedTargets]);
+
+  const closeEditor = useCallback((tabId = activeEditorId) => {
+    if (tabId !== null) requestCloseEditors([tabId]);
+  }, [activeEditorId, requestCloseEditors]);
+
+  const handleCloseDialogKeyDown = useCallback((event: KeyboardEvent<HTMLElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelCloseDialog();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = Array.from(
+      event.currentTarget.querySelectorAll<HTMLElement>('button:not([disabled]), select:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'),
+    );
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }, [cancelCloseDialog]);
 
   const requestLogout = useCallback(() => {
-    if (!confirmLeaveEditor()) return;
+    const current = liveLeaveState.current;
+    if (current.busy && !window.confirm("仍有操作的受理结果未知。退出会清除本地标签，但不会取消远端运行；之后需要重新登录并到任务中心核对。仍要退出吗？")) return;
+    if (!current.busy && current.dirty && !window.confirm("仍有未保存修改，退出会清除这些本地内容。仍要退出吗？")) return;
+    invalidateClientSession();
     onLogout();
-  }, [confirmLeaveEditor, onLogout]);
+  }, [onLogout]);
 
   /**
    * 保存成功后的选中：只认发起保存时所在的范围。
@@ -377,12 +595,15 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
    * 回调都把发起时的 scope 关进闭包，回来时与当前范围对不上就直接丢弃。
    */
   const onCaseSaved = useCallback(
-    (caseId?: string) => {
+    (tabId: string, caseId?: string) => {
       if (liveScope.current !== scope) return;
       setCaseRefresh((value) => value + 1);
-      if (caseId) setSelectedCaseId(caseId);
+      if (caseId) {
+        setEditors((current) => current.map((item) => item.tabId === tabId ? { ...item, id: caseId } : item));
+        if (liveActiveEditorId.current === tabId) setSelectedCaseId(caseId);
+      }
     },
-    [scope],
+    [scope, activeEditorId],
   );
 
   /**
@@ -616,7 +837,10 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
               type="button"
               className={page === item ? "nav-item nav-item-active" : "nav-item"}
               aria-current={page === item ? "page" : undefined}
-              onClick={() => navigate(item)}
+              onClick={() => {
+                if (item === "environments") setSettingsSourceTabId(null);
+                navigate(item);
+              }}
             >
               {PAGE_LABEL[item]}
             </button>
@@ -678,39 +902,88 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
               refreshToken={caseRefresh}
             />
 
-              <button type="button" className="sidebar-config-link" onClick={() => navigate("environments")}>
+              <button type="button" className="sidebar-config-link" onClick={() => { setSettingsSourceTabId(null); navigate("environments"); }}>
                 环境与身份配置
               </button>
             </aside>
 
             <div className="main-pane">
-            {editor === null ? (
-              <Empty label="从左侧选择一条用例开始编辑，或点击“＋新建用例”。" />
-            ) : (
-              <CaseEditor
-                key={editor.nonce}
-                workspaceId={workspaceId}
-                projectId={projectId ?? ""}
-                caseSummaryId={editor.id}
-                environments={environmentList}
-                selectedEnvironmentId={environmentId}
-                onSelectEnvironment={setEnvironmentId}
-                onSaved={onCaseSaved}
-                onVersionsChanged={onCaseVersionsChanged}
-                onClose={closeEditor}
-                onCurrentVersion={onEditorVersion}
-                folders={folders.data ?? []}
-                foldersLoading={folders.loading}
-                initialFolderId={editor.folderId}
-                projectRole={currentProject?.role ?? null}
-                currentUserId={session.user.user_id}
-                onOpenAdmin={openAdminPanel}
-                onOpenEnvironment={openEnvironmentPanel}
-                configEpoch={configEpoch}
-                getConfigEpoch={getConfigEpoch}
-                separateHistory
-              />
-            )}
+              <div className="workspace-tabs">
+                <div ref={workspaceTabScrollRef} className="workspace-tab-scroll" role="tablist" aria-label="已打开的请求">
+                  {editors.map((item) => (
+                    <button
+                      key={item.tabId}
+                      type="button"
+                      role="tab"
+                      aria-selected={item.tabId === activeEditorId}
+                      aria-label={`${item.method} ${item.name}`}
+                      className={item.tabId === activeEditorId ? "workspace-tab workspace-tab-active" : "workspace-tab"}
+                      title={`${item.method} ${item.name}`}
+                      ref={(node) => {
+                        if (node === null) workspaceTabRefs.current.delete(item.tabId);
+                        else workspaceTabRefs.current.set(item.tabId, node);
+                      }}
+                      onClick={() => {
+                        setActiveEditorId(item.tabId);
+                        setSelectedCaseId(item.id);
+                      }}
+                    >
+                      <span className="workspace-tab-method">{item.method}</span>
+                      <span className="workspace-tab-name">{item.name}</span>
+                      {item.dirty ? <span aria-label="有未保存修改">●</span> : null}
+                      {item.busy ? <span aria-label="操作进行中">处理中</span> : null}
+                    </button>
+                  ))}
+                </div>
+                <div className="workspace-tab-actions" aria-label="请求标签操作">
+                  <span className={editors.length >= 20 ? "tab-limit tab-limit-reached" : "tab-limit"}>
+                    已打开 {editors.length}/20{editors.length >= 20 ? "，已达上限" : ""}
+                  </span>
+                  <button ref={newRequestButtonRef} type="button" title={editors.length >= 20 ? "已达到 20 个标签上限，请先关闭标签" : undefined} onClick={() => createCase(null)} disabled={editors.length >= 20 || !canEdit(currentProject?.role ?? null)}>＋新请求</button>
+                  {editor ? <button type="button" onClick={() => closeEditor()}>关闭当前</button> : null}
+                  {editors.length > 1 ? <button type="button" onClick={() => requestCloseEditors(editors.filter((item) => item.tabId !== activeEditorId).map((item) => item.tabId))}>关闭其他</button> : null}
+                  {editors.length > 0 ? <button type="button" onClick={() => requestCloseEditors(editors.map((item) => item.tabId))}>关闭全部</button> : null}
+                </div>
+              </div>
+              {editors.length === 0 ? <Empty label="从左侧选择一条用例开始编辑，或点击“＋新请求”。" /> : null}
+              {editors.map((item) => {
+                const active = item.tabId === activeEditorId;
+                return (
+                  <div key={item.tabId} hidden={!active} aria-hidden={!active} className="workspace-editor">
+                    <CaseEditor
+                      key={item.nonce}
+                      workspaceId={workspaceId}
+                      projectId={projectId ?? ""}
+                      caseSummaryId={item.id}
+                      environments={environmentList}
+                      selectedEnvironmentId={item.environmentId}
+                      onSelectEnvironment={(next) => setEditors((current) => current.map((tab) => tab.tabId === item.tabId ? { ...tab, environmentId: next } : tab))}
+                      onSaved={(caseId) => onCaseSaved(item.tabId, caseId)}
+                      onVersionsChanged={onCaseVersionsChanged}
+                      onClose={() => closeEditor(item.tabId)}
+                      onCurrentVersion={active ? onEditorVersion : undefined}
+                      folders={folders.data ?? []}
+                      foldersLoading={folders.loading}
+                      initialFolderId={item.folderId}
+                      projectRole={currentProject?.role ?? null}
+                      currentUserId={session.user.user_id}
+                      onOpenAdmin={() => openAdminPanel(item.tabId)}
+                      onOpenEnvironment={() => openEnvironmentPanel(item.tabId, item.environmentId)}
+                      configEpoch={configEpoch}
+                      getConfigEpoch={getConfigEpoch}
+                      separateHistory
+                      active={active && page === "workbench"}
+                      leaveKey={`case-tab:${item.tabId}`}
+                      onTabMeta={(meta) => setEditors((current) => current.map((tab) => tab.tabId === item.tabId && (tab.name !== meta.name || tab.method !== meta.method || tab.dirty !== meta.dirty || tab.busy !== meta.busy) ? { ...tab, ...meta } : tab))}
+                      domIdPrefix={`tab-${item.tabId}`}
+                      onRegisterCloseSave={(action) => {
+                        if (action === null) closeControllers.current.delete(item.tabId);
+                        else closeControllers.current.set(item.tabId, action);
+                      }}
+                    />
+                  </div>
+                );
+              })}
             </div>
           </section>
 
@@ -721,7 +994,15 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
                 <h2>环境配置</h2>
                 <p className="caption">维护请求目标、普通变量、访问规则和身份凭证。</p>
               </div>
-              <button type="button" onClick={() => navigate("workbench")}>返回接口工作台</button>
+              <button type="button" onClick={() => {
+                const source = editors.find((item) => item.tabId === settingsSourceTabId);
+                if (source) {
+                  setActiveEditorId(source.tabId);
+                  setSelectedCaseId(source.id);
+                }
+                setSettingsSourceTabId(null);
+                navigate("workbench");
+              }}>返回接口工作台</button>
             </header>
             <div className="settings-grid">
               <EnvironmentPanel
@@ -799,6 +1080,33 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
           </section>
         </div>
       )}
+      {closeDialog ? (
+        <div className="dialog-backdrop">
+          <section className="close-dialog" role="dialog" aria-modal="true" aria-labelledby="close-dialog-title" onKeyDown={handleCloseDialogKeyDown}>
+            <h2 id="close-dialog-title">关闭请求标签</h2>
+            <p>以下标签包含尚未保存或尚未应用的内容，请选择一种处理方式。</p>
+            <ul className="close-dialog-list">
+              {liveEditors.current.filter((item) => closeDialog.tabIds.includes(item.tabId)).map((item) => {
+                const root = closeControllers.current.get(item.tabId)?.state() ?? { dirty: item.dirty, busy: item.busy };
+                const child = liveLeaveState.current.descendants(`case-tab:${item.tabId}`);
+                const status = root.busy || child.busy
+                  ? "操作进行中"
+                  : child.dirty
+                    ? "有尚未应用的输入"
+                    : root.dirty
+                      ? "有未保存修改"
+                      : "可以关闭";
+                return <li key={item.tabId}><strong>{item.method} {item.name}</strong><span>{status}</span></li>;
+              })}
+            </ul>
+            <div className="actions">
+              <button type="button" className="primary" disabled={closeDialog.saving} onClick={() => void finishCloseEditors(closeDialog.tabIds, "save", closeDialog.attemptId)}>{closeDialog.saving ? "正在保存…" : "保存并关闭"}</button>
+              <button type="button" className="danger" disabled={closeDialog.saving} onClick={() => void finishCloseEditors(closeDialog.tabIds, "discard", closeDialog.attemptId)}>放弃修改并关闭</button>
+              <button ref={closeDialogCancelRef} type="button" onClick={cancelCloseDialog}>取消</button>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </div>
   );
 }

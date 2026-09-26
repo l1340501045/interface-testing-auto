@@ -185,6 +185,26 @@ label { font-size: 12px; color: #52667c; }
   overflow-y: auto;
 }
 .main-pane { padding: 14px 18px 48px; min-width: 0; }
+.workspace-tabs { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 2px 0 10px; }
+.workspace-tab-scroll { min-width: 0; display: flex; align-items: center; gap: 6px; overflow-x: auto; overscroll-behavior-inline: contain; scrollbar-gutter: stable; padding: 2px 0 5px; }
+.workspace-tab-actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; white-space: nowrap; }
+.workspace-tab-actions button { flex: 0 0 auto; white-space: nowrap; }
+.tab-limit { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.tab-limit-reached { color: #9a3412; font-weight: 700; }
+.workspace-tab { display: inline-flex; align-items: center; gap: 6px; max-width: 240px; flex: 0 0 auto; }
+.workspace-tab-active { border-color: var(--accent); background: var(--accent-bg); }
+.workspace-tab-method { font-size: 11px; font-weight: 700; color: var(--muted); }
+.workspace-tab-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-editor[hidden] { display: none; }
+.dialog-backdrop { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 24px; background: rgba(15, 23, 42, .42); }
+.close-dialog { width: min(640px, 100%); max-height: calc(100vh - 48px); overflow: hidden; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; padding: 20px; border: 1px solid var(--line); border-radius: 12px; background: #fff; box-shadow: 0 18px 50px rgba(15, 23, 42, .24); }
+.close-dialog h2 { margin-top: 0; }
+.close-dialog-list { min-height: 0; overflow-y: auto; display: grid; gap: 8px; margin: 0; padding: 0 4px 0 0; list-style: none; }
+.close-dialog li { display: flex; justify-content: space-between; gap: 12px; padding: 8px 10px; border: 1px solid var(--line-soft); border-radius: 8px; }
+.close-dialog li strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.close-dialog li span { flex: 0 0 auto; white-space: nowrap; }
+.close-dialog > .actions { flex-wrap: nowrap; padding-top: 12px; margin-top: 0; border-top: 1px solid var(--line-soft); background: #fff; }
+.close-dialog > .actions button { flex: 0 0 auto; white-space: nowrap; }
 .sidebar-config-link { margin-top: auto; text-align: left; background: #f8fafc; }
 
 .content-page { max-width: 1440px; margin: 0 auto; padding: 22px 28px 56px; }
@@ -394,8 +414,15 @@ details.block > summary { cursor: pointer; font-weight: 500; font-size: 14px; }
 .request-line select { min-width: 96px; }
 
 .kv-block { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
-.kv-row { display: flex; gap: 6px; width: 100%; }
+.kv-row { display: grid; grid-template-columns: auto minmax(120px, 1fr) minmax(160px, 1.4fr) minmax(120px, 1fr) auto auto; align-items: start; gap: 6px; width: 100%; }
 .kv-row input { flex: 1; }
+.kv-row-disabled { opacity: .68; }
+.kv-enabled { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.raw-text-summary, .raw-text-editor { display: flex; align-items: center; gap: 5px; min-width: 0; flex-wrap: wrap; }
+.raw-text-summary code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+.batch-import { margin-top: 10px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; }
+.batch-import textarea { width: 100%; margin: 8px 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.batch-preview { max-height: 260px; overflow: auto; padding: 8px; background: #f8fafc; }
 .kv-block > button { font-size: 13px; }
 .body-editor { display: flex; flex-direction: column; gap: 5px; }
 

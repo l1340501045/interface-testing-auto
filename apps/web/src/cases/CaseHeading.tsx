@@ -29,6 +29,7 @@ export function CaseHeading({
   onSave,
   onPublish,
   onClose,
+  idPrefix = "case",
 }: {
   name: string;
   onNameChange: (next: string) => void;
@@ -48,25 +49,26 @@ export function CaseHeading({
   onSave: () => void;
   onPublish: () => void;
   onClose: () => void;
+  idPrefix?: string;
 }) {
   return (
     <header className="case-head">
-      <label className="visually-hidden" htmlFor="case-name">
+      <label className="visually-hidden" htmlFor={`${idPrefix}-name`}>
         用例名称
       </label>
       <input
-        id="case-name"
+        id={`${idPrefix}-name`}
         className="case-name-input"
         value={name}
         readOnly={readOnly}
         placeholder="未命名用例"
         onChange={(event) => onNameChange(event.target.value)}
       />
-      <label className="visually-hidden" htmlFor="case-folder">
+      <label className="visually-hidden" htmlFor={`${idPrefix}-folder`}>
         所属目录
       </label>
       <select
-        id="case-folder"
+        id={`${idPrefix}-folder`}
         className="case-folder-select"
         value={folderId ?? ""}
         disabled={readOnly}

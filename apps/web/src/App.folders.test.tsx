@@ -276,7 +276,9 @@ function pickFolder(browser: HTMLElement, name: string) {
 }
 
 function folderSelect(): HTMLSelectElement {
-  return screen.getByLabelText("所属目录") as HTMLSelectElement;
+  const active = document.querySelector<HTMLElement>(".workspace-editor:not([hidden])");
+  if (active === null) throw new Error("没有活动请求标签");
+  return within(active).getByLabelText("所属目录") as HTMLSelectElement;
 }
 
 /** 选择器上当前显示的那一项。用来判定失效目录是如实显示成失效，还是被伪装成未分组。 */
@@ -333,6 +335,8 @@ describe("用例目录承载用例的闭环", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "保存草稿" }));
     await waitFor(() => expect(writes.filter((item) => item.method === "PATCH")).toHaveLength(1));
+    await waitFor(() => expect(screen.queryByText("有未保存修改")).toBeNull());
+    await waitFor(() => expect(screen.queryByLabelText("操作进行中")).toBeNull());
     expect(writes[0].body.folder_id).toBe(FOLDER_B);
     // A 的过滤列表里已经没有它了。
     await waitFor(() => expect(browserList(browser)).toEqual([]));
@@ -355,7 +359,7 @@ describe("用例目录承载用例的闭环", () => {
     await waitFor(() => expect(browserList(browser)).toEqual(["已归入 A 的用例"]));
   });
 
-  it("只改目录不碰别的字段，也算未保存修改：切换用例前先确认", async () => {
+  it("只改目录不碰别的字段，也算未保存修改：开新标签后原标签仍保留", async () => {
     cases = [
       {
         id: NEW_CASE_ID,
@@ -372,11 +376,11 @@ describe("用例目录承载用例的闭环", () => {
     await waitFor(() => expect(folderSelect().value).toBe(FOLDER_A));
 
     fireEvent.change(folderSelect(), { target: { value: FOLDER_B } });
-    vi.mocked(window.confirm).mockReturnValue(false);
-    // 再点一次“新建”会重建编辑器：没有脱离保护的话，这次只改目录的改动会静默丢掉。
+    // 再点一次“新建”只新增标签，不卸载原编辑器。
     fireEvent.click(within(browser).getByRole("button", { name: "＋新建用例" }));
 
-    await waitFor(() => expect(window.confirm).toHaveBeenCalled());
+    expect(window.confirm).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("tab", { name: /待分组的用例/ }));
     expect(folderSelect().value).toBe(FOLDER_B);
     expect(screen.getByText("有未保存修改")).toBeTruthy();
   });

@@ -438,7 +438,7 @@ describe("环境地址无效时的真实入口", () => {
     expect(panel.open).toBe(true);
 
     // 进入配置页必须保住同一份未保存用例：工作台只是隐藏，编辑器没有重挂载。
-    expect((document.getElementById("request-path") as HTMLInputElement).value).toBe("/echo");
+    expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/echo");
   });
 
   it("展开后确实能走到环境编辑表单（编辑入口不再藏在折叠标题下）", async () => {
@@ -515,7 +515,7 @@ describe("独立页面的状态归属", () => {
     expect(screen.getByRole("region", { name: "环境配置" })).toBeTruthy();
     expect(credentials.open).toBe(true);
     expect(document.activeElement).toBe(credentials);
-    expect((document.getElementById("request-path") as HTMLInputElement).value).toBe("/echo");
+    expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/echo");
   });
 
   it("任务报告跳转只消费一次，往返保留新选择，再点同一任务仍可跳回", async () => {
@@ -558,14 +558,14 @@ describe("独立页面的状态归属", () => {
     await screen.findByRole("heading", { name: `运行 ${RUN_ID.slice(0, 8)} 的报告` });
 
     // 报告页隐藏着同一个编辑器；未保存草稿仍必须拦住跨项目切换。
-    fireEvent.change(document.getElementById("request-path") as HTMLInputElement, {
+    fireEvent.change(screen.getByLabelText("路径") as HTMLInputElement, {
       target: { value: "/changed" },
     });
     const projectSelect = screen.getByLabelText("项目") as HTMLSelectElement;
     vi.mocked(window.confirm).mockReturnValueOnce(false);
     fireEvent.change(projectSelect, { target: { value: PROJECT_ID_B } });
     expect(projectSelect.value).toBe(PROJECT_ID);
-    expect((document.getElementById("request-path") as HTMLInputElement).value).toBe("/changed");
+    expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/changed");
 
     vi.mocked(window.confirm).mockReturnValueOnce(true);
     fireEvent.change(projectSelect, { target: { value: PROJECT_ID_B } });
