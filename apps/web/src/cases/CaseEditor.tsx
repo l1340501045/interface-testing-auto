@@ -121,6 +121,7 @@ export function CaseEditor({
   projectRole = null,
   currentUserId = null,
   onOpenAdmin,
+  onOpenEnvironment,
   configEpoch = 0,
   getConfigEpoch,
 }: {
@@ -165,6 +166,13 @@ export function CaseEditor({
   currentUserId?: string | null;
   /** 打开侧栏的环境与凭证管理入口；界面整理不改变原有功能的可达性。 */
   onOpenAdmin?: () => void;
+  /**
+   * 打开侧栏管理区里**环境**那一段的入口。
+   *
+   * 与 `onOpenAdmin` 分开，是因为两者要去的地方不同：地址类问题（例如环境地址缺协议）
+   * 要送到环境编辑，凭证类问题要送到凭证列表。不传时退回 `onOpenAdmin`，老调用点不受影响。
+   */
+  onOpenEnvironment?: () => void;
   /**
    * 配置世代：环境、项目变量或身份配置成功变更时由外壳递增。
    *
@@ -1141,6 +1149,7 @@ export function CaseEditor({
         preflightError={debug.preflightError}
         preflighting={debug.preflighting}
         onOpenAdmin={() => onOpenAdmin?.()}
+        onOpenEnvironment={onOpenEnvironment ? () => onOpenEnvironment() : undefined}
         canAuthorize={debug.preflight?.can_authorize ?? false}
         onSubmitAuthorization={() => void confirmAuthorization()}
         onCancelAuthorization={cancelAuthorization}

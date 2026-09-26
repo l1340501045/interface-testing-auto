@@ -186,12 +186,19 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
    * 入口，整理布局不改变任何权限。
    */
   const [adminOpen, setAdminOpen] = useState(false);
-  const openAdminPanel = useCallback(() => {
+  /**
+   * 展开侧栏管理区并滚动到指定配置块。
+   *
+   * 环境与凭证在同一个 details 里，但它们是**两个不同的块**：只认一个锚点，会把点“前往
+   * 环境设置”的用户送到下面的凭证列表，入口看起来点了却找不到要改的东西。因此锚点按
+   * 动作分开，仍复用同一段展开与聚焦逻辑。
+   */
+  const revealAdminBlock = useCallback((anchorId: string) => {
     // 先展开再滚动：折叠的 details 里滚动不到任何内容，点了“环境与凭证管理”却停在
     // 一个空标题上，比没有入口更让人困惑。
     setAdminOpen(true);
     window.requestAnimationFrame(() => {
-      const panel = document.getElementById("admin-panel");
+      const panel = document.getElementById(anchorId);
       if (panel === null) return;
       // `scrollIntoView` 不是所有宿主都实现（测试用的 jsdom、部分嵌入式 webview）。
       // 缺失时跳过滚动但保留聚焦：入口的目的是“把用户送到那块配置上”，滚动只是手段，
@@ -202,6 +209,26 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
       panel.focus();
     });
   }, []);
+  const openAdminPanel = useCallback(() => revealAdminBlock("admin-panel"), [revealAdminBlock]);
+  /**
+   * 环境面板自身的折叠状态。
+   *
+   * `adminOpen` 只管外层管理区；环境面板里面还有一层 `details`，它的开合由这里持有——
+   * 否则「前往环境设置」只能展开外层，用户仍然停在折叠的“环境（N）”标题上（R1-1）。
+   * 项目还没有环境时强制展开：那时创建环境是这个面板唯一的内容，折叠起来等于藏入口。
+   */
+  const [environmentOpen, setEnvironmentOpen] = useState(false);
+  /**
+   * 打开环境设置：外层管理区与**内层环境面板**都要展开。
+   *
+   * 环境面板自己还有一层 `details`。只展开外层，用户点「前往环境设置」之后看到的是一个
+   * 仍折叠的“环境（N）”标题，编辑入口根本不在视野里——入口看起来点了却没有用。内层的
+   * 展开状态因此提到这里，与锚点一起处理。
+   */
+  const openEnvironmentPanel = useCallback(() => {
+    setEnvironmentOpen(true);
+    revealAdminBlock("environment-panel");
+  }, [revealAdminBlock]);
   const onAdminToggle = useCallback((event: SyntheticEvent<HTMLDetailsElement>) => {
     setAdminOpen((event.target as HTMLDetailsElement).open);
   }, []);
@@ -638,6 +665,8 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
                 onSelect={setEnvironmentId}
                 canEdit={canEdit(currentProject?.role ?? null)}
                 onChanged={onEnvironmentsChanged}
+                open={environmentOpen || environmentList.length === 0}
+                onOpenChange={setEnvironmentOpen}
               />
               <AdminPanel
                 key={`admin:${scope}`}
@@ -678,6 +707,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
                 projectRole={currentProject?.role ?? null}
                 currentUserId={session.user.user_id}
                 onOpenAdmin={openAdminPanel}
+                onOpenEnvironment={openEnvironmentPanel}
                 configEpoch={configEpoch}
                 getConfigEpoch={getConfigEpoch}
               />

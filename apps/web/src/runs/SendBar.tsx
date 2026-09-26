@@ -94,6 +94,7 @@ export function SendBar({
   preflightError,
   preflighting,
   onOpenAdmin,
+  onOpenEnvironment,
   canAuthorize,
   onSubmitAuthorization,
   onCancelAuthorization,
@@ -119,6 +120,13 @@ export function SendBar({
   preflightError: string | null;
   preflighting: boolean;
   onOpenAdmin: () => void;
+  /**
+   * 打开环境设置。
+   *
+   * 地址类问题（`configure_environment`）的下一步是去改环境地址，凭证类问题的下一步是
+   * 去凭证列表——两者不是同一个地方。缺省时退回 `onOpenAdmin`，因此老调用点不需要改动。
+   */
+  onOpenEnvironment?: () => void;
   canAuthorize: boolean;
   /** 等待用户确认本次授权（此时普通发送入口不出现）。 */
   onSubmitAuthorization: () => void;
@@ -164,6 +172,16 @@ export function SendBar({
   const authorizationIssues = preflight !== null && !preflight.ready
     ? preflight.issues.filter((issue) => authorizationActions.has(issue.action))
     : [];
+
+  /**
+   * 环境地址本身不合法时，地址预览**不能**再以“实际目标”的口吻展示。
+   *
+   * 预览是把环境地址与路径拼起来的字符串，地址缺协议时这个拼接结果根本不是一个能发出的
+   * 目标。此时仍写着“实际目标：echo:8080/orders”，等于给用户一个不存在的结论。
+   */
+  const invalidEnvironment =
+    preflight?.issues.some((issue) => issue.code === "environment_url_invalid") ?? false;
+  const openEnvironment = onOpenEnvironment ?? onOpenAdmin;
 
   return (
     <div className="send-bar">
@@ -222,8 +240,11 @@ export function SendBar({
       </div>
 
       <p className="caption address-preview">
-        实际目标：{preview === null ? "尚未选择执行环境" : preview}
-        {hasVariables ? "（含 {{变量}}，解析后的地址可能不同，这里只是预览）" : ""}
+        {invalidEnvironment
+          ? "实际目标：环境地址不合法，暂时无法确定（请先在环境设置里修正该环境的地址）。"
+          : `实际目标：${preview === null ? "尚未选择执行环境" : preview}${
+              hasVariables ? "（含 {{变量}}，解析后的地址可能不同，这里只是预览）" : ""
+            }`}
       </p>
       {request.imported_origin && environment !== null ? (
         <Hint>
@@ -243,7 +264,17 @@ export function SendBar({
           {contentIssues.map((issue) => (
             <li key={issue.code}>
               <span>{issue.message}</span>
-              <span className="caption">建议：{actionLabel(issue.action)}</span>
+              {issue.action === "configure_environment" ? (
+                /*
+                  环境类问题给**真能点的下一步**：只写一句“建议：前往环境设置”，用户还得自己
+                  去侧栏里找那一段。按钮复用外壳已有的展开入口，不新建第二套管理界面。
+                */
+                <button type="button" className="link" onClick={openEnvironment}>
+                  {actionLabel(issue.action)}
+                </button>
+              ) : (
+                <span className="caption">建议：{actionLabel(issue.action)}</span>
+              )}
             </li>
           ))}
         </ul>
