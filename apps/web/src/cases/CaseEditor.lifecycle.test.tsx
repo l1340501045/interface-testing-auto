@@ -669,16 +669,23 @@ describe("F7 报告按运行与读取世代隔离", () => {
     gated.add("report:" + RUN_2);
     fireEvent.click(sendButton());
     await waitFor(() => expect(runPosts()).toHaveLength(2));
+    // 先证明 r2 已受理且它自己的报告读取确实进入挂起窗口；不能只看到 POST 就假定
+    // 后续读取已经发出。CI 并发负载下这两次提交之间存在真实调度间隙。
+    await waitFor(() =>
+      expect(screen.getByRole("region", { name: "响应" }).textContent).toContain(RUN_2.slice(0, 8)),
+    );
+    await waitFor(() => expect(heldCount("report:" + RUN_2)).toBeGreaterThan(0));
+
+    // 这条场景的前提是 r2 报告**持续**不可用。只拒绝当前 bucket 后立刻恢复成功，
+    // 下一次并发读取／轮询就会拿到终态并合理收起取消按钮，测试测到的是替身时序而非产品。
+    failingReports.add(RUN_2);
     await act(async () => {
-      const bucket = gates.get("report:" + RUN_2) ?? [];
-      gates.set("report:" + RUN_2, []);
-      gated.delete("report:" + RUN_2);
-      for (const item of bucket) item.reject(new NetworkError("报告不可用"));
+      releaseError("report:" + RUN_2, new NetworkError("报告不可用"));
     });
-    await act(async () => {});
 
     const response = screen.getByRole("region", { name: "响应" });
     // 标题指向 r2，正文不得显示 r1 的结论。
+    await waitFor(() => expect(response.textContent).toContain("报告读取失败"));
     expect(response.textContent).toContain(RUN_2.slice(0, 8));
     expect(response.textContent).not.toContain("201");
     // 报告读失败也要有取消入口：run_id 是已知的。
