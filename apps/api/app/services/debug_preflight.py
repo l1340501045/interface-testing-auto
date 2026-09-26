@@ -123,7 +123,7 @@ def preflight(
         # 断言按执行期的同一份校验过一遍，但**不用校验结果改写 assertions**：调试快照
         # 摘要是对提交的原始数组算的，换成规范化后的副本会让既有授权全部失配。这里
         # 只借它回答“这份配置能不能执行”，不改变任何参与摘要的内容。
-        validate_assertions(assertions)
+        validate_assertions(assertions, request)
     except AssertionSpecError as error:
         return PreflightResult(
             ready=False,

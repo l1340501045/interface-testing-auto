@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import uuid
 
-from app.kernel.assertions import AssertionOutcome
+from app.kernel.assertion_inputs import SourceRoots, pairs_root, paths_containing
+from app.kernel.assertions import AssertionContext, AssertionOutcome
 from app.kernel.fieldlocator import locate
 from app.kernel.lossless_json import loads
 from app.services.executor import (
     AssertionRecord,
     JobClaim,
+    _evaluate_assertions,
     _persist_assertion_results,
     _sanitize_selector,
     describe_selector,
@@ -74,11 +76,11 @@ def _persist(assertions: list[dict], secrets: list[str]) -> list[dict]:
     return [item.target for item in session.added]
 
 
-def _assertion(selector: list[dict]) -> dict:
+def _assertion(selector: list[dict], source: str = "response.body") -> dict:
     return {
         "id": str(uuid.uuid4()),
         "type": "equals",
-        "target_source": "response.body",
+        "target_source": source,
         "selector": selector,
         "parameters": {},
     }
@@ -191,3 +193,79 @@ def test_masked_selector_still_locates_and_unmasked_is_not_required_to() -> None
     assert cleaned == selector
     assert locate(tree, cleaned).value["id"].text == "2"
     assert describe_selector(cleaned) == "data.items[1]"
+
+
+# —— v2 稳定行：显示、结构身份与敏感策略 ——
+
+
+def test_persisted_row_targets_stay_distinct_and_cover_whole_or_orphaned_rows() -> None:
+    first = "11111111-1111-4111-8111-111111111111"
+    second = "22222222-2222-4222-8222-222222222222"
+    assertions = [
+        _assertion(
+            [_step("row", row_id=first), _step("key", key="value")],
+            "request.query",
+        ),
+        _assertion(
+            [_step("row", row_id=second), _step("key", key="value")],
+            "request.query",
+        ),
+        _assertion([_step("row", row_id=first)], "request.query"),
+        # 孤立与否由实际 SourceRoots 决定；报告仍必须保留原稳定目标。
+        _assertion([_step("row", row_id=str(uuid.uuid4()))], "request.query"),
+        _assertion([_step("key", key="data"), _step("index", index=2)]),
+        _assertion([_step("repeat_key", key="tag", occurrence=1)]),
+    ]
+
+    targets = _persist(assertions, [])
+
+    assert targets[0]["path"] == f"row({first}).value"
+    assert targets[1]["path"] == f"row({second}).value"
+    assert targets[0]["path"] != targets[1]["path"]
+    assert targets[2]["path"] == f"row({first})"
+    assert targets[3]["path"].startswith("row(")
+    assert targets[4]["path"] == "data[2]"
+    assert targets[5]["path"] == ".tag#1"
+
+
+def test_persisted_valid_row_id_survives_secret_substring_but_dynamic_fields_do_not() -> None:
+    row_id = "11111111-1111-4111-8111-111111111111"
+    selector = [_step("row", row_id=row_id, note="1111"), _step("key", key="1111")]
+
+    target = _persist([_assertion(selector, "request.query")], ["1111"])[0]
+
+    assert target["selector"][0] == {"kind": "row", "row_id": row_id, "note": "***"}
+    assert target["selector"][1] == {"kind": "key", "key": "***"}
+    assert uuid.UUID(target["selector"][0]["row_id"]) == uuid.UUID(row_id)
+
+
+def test_invalid_unvalidated_row_id_is_still_treated_as_dynamic_text() -> None:
+    cleaned = _sanitize_selector([_step("row", row_id="secret-row")], ["secret"])
+    assert cleaned == [{"kind": "row", "row_id": "***-row"}]
+
+
+def test_assertion_on_a_sensitive_value_through_row_alias_is_policy_rejected() -> None:
+    row_id = str(uuid.uuid4())
+    roots = SourceRoots()
+    roots.add_tree(
+        "request.query",
+        pairs_root([{"name": "token", "value": "credential-secret"}]),
+        row_indices={row_id: 0},
+    )
+    ctx = AssertionContext()
+    ctx.sensitive_paths |= paths_containing(roots, ["credential-secret"])
+    assertion = {
+        **_assertion(
+            [_step("row", row_id=row_id), _step("key", key="value")],
+            "request.query",
+        ),
+        "type": "exists",
+        "parameters": {},
+        "severity": "error",
+        "enabled": True,
+    }
+
+    records = _evaluate_assertions([assertion], "pre_request", roots, ctx)
+
+    assert records[0].outcome.status == "error"
+    assert records[0].outcome.reason_code == "policy_rejected"

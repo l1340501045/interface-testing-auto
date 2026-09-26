@@ -222,6 +222,9 @@ def describe_selector(selector: list[dict]) -> str:
             label = f"{label}[{step.get('index')}]"
         elif kind == "repeat_key":
             label = f"{label}.{step.get('key')}#{step.get('occurrence', 0)}"
+        elif kind == "row":
+            row = f"row({step.get('row_id')})"
+            label = f"{label}.{row}" if label else row
     return label
 
 
@@ -257,8 +260,16 @@ def _build_request_roots(prepared: PreparedRequest, request: dict) -> SourceRoot
     roots.add_direct("request.text", prepared.body_text())
     # 查询参数与请求头一样取**实际发出的那一份**：变量已解析、认证注入已并入。
     # 用请求定义里的原始模板会核对一个没发出去的虚构值。
-    roots.add_tree("request.query", pairs_root(prepared.query_as_pairs()))
-    roots.add_tree("request.header", pairs_root(prepared.headers_as_pairs()))
+    roots.add_tree(
+        "request.query",
+        pairs_root(prepared.query_as_pairs()),
+        row_indices=prepared.query_row_indices,
+    )
+    roots.add_tree(
+        "request.header",
+        pairs_root(prepared.headers_as_pairs()),
+        row_indices=prepared.header_row_indices,
+    )
     if request.get("body_type") == "json":
         tree = json_root(prepared.body_text())
         if tree is not None:
@@ -319,6 +330,8 @@ def _assertion_path(item: dict) -> tuple:
             path.append(step.get("key"))
         elif kind == "index":
             path.append(step.get("index"))
+        elif kind == "row":
+            path.append(step.get("row_id"))
         else:
             raise AssertionConfigError(f"未知定位步骤：{kind!r}")
     return tuple(path)
@@ -753,11 +766,14 @@ def _sanitize_selector(selector: list[dict], secrets: list[str]) -> list[dict]:
     """按定位步骤的**判别联合契约**脱敏，而不是把整个步骤当普通结构递归。
 
     步骤形如 `{"kind":"key","key":…}`／`{"kind":"index","index":…}`／
-    `{"kind":"repeat_key","key":…,"occurrence":…}`。其中：
+    `{"kind":"repeat_key","key":…,"occurrence":…}`／
+    `{"kind":"row","row_id":…}`。其中：
 
     - `kind`（枚举）、`index`（数字下标）、`occurrence`（重复项序号）来自服务端
       常量与结构位置，不是用户内容，也不是可读文本——数字索引的语义必须原样保留，
       否则 `[0]` 与 `[1]` 会变成同一个定位；
+    - 已校验 row 步骤中的标准 UUID `row_id` 是请求写入前已知的结构身份，与数字
+      下标一样原样保留；它不从凭证、响应或变量派生；
     - `key` 是**用户／响应派生**的字段名，秘密整个作为字段名出现时就落在它上面，
       必须照常遮蔽。
 
@@ -772,9 +788,19 @@ def _sanitize_selector(selector: list[dict], secrets: list[str]) -> list[dict]:
             steps.append(_sanitize_evidence(step, secrets))
             continue
         cleaned: dict = {}
+        is_valid_row = False
+        if step.get("kind") == "row" and isinstance(step.get("row_id"), str):
+            try:
+                normalized_row_id = str(uuid.UUID(step["row_id"]))
+            except ValueError:
+                pass
+            else:
+                is_valid_row = step["row_id"].lower() == normalized_row_id
         for name, value in step.items():
             if name == "key":
                 cleaned[name] = _sanitize(str(value), secrets)
+            elif name == "row_id" and is_valid_row:
+                cleaned[name] = value
             elif name in ("kind", "index", "occurrence"):
                 cleaned[name] = value
             else:
@@ -1214,7 +1240,7 @@ def _execute(session: Session, settings: Settings, claim: JobClaim) -> str:
         # 已经在队列里的运行。
         _recheck_current_facts(session, run, environment)
         request = validate_request(snapshot.get("request") or {})
-        assertions = validate_assertions(snapshot.get("assertions") or [])
+        assertions = validate_assertions(snapshot.get("assertions") or [], request)
         target = _authorized_target(guard, environment, request)
         # 环境冻结的差异检查放在策略检查**之后**：改成生产、改到白名单之外这类拒绝
         # 比“配置和提交时不一样”具体得多，用户按提示要做的处理也不同。两者都不发

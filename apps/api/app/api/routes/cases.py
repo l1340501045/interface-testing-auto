@@ -32,6 +32,7 @@ from ...kernel.valueliteral import ValueLiteral, ValueLiteralError
 from ...models import Case, CaseAssertion, CaseVersion, Folder
 from .. import deps
 from ..errors import ApiError, bad_request, conflict, not_found
+from ..request_contract import is_v2, require_v2_capability
 from ..schemas import (
     AssertionPreviewOut,
     AssertionPreviewRequest,
@@ -180,14 +181,16 @@ def list_cases(
 def create_case(
     payload: CaseCreate,
     response: Response,
+    request_contract: str | None = Header(default=None, alias="X-Request-Contract"),
     scope: deps.ProjectScope = _EDIT_SCOPE,
     session: Session = Depends(get_db),
 ) -> CaseOut:
+    require_v2_capability(request_contract, needed=is_v2(payload.request))
     if payload.folder_id is not None:
         _resolve_folder(session, scope, payload.folder_id)
     try:
         spec = request_spec.validate_request(payload.request)
-        assertions = validate_assertions(payload.assertions)
+        assertions = validate_assertions(payload.assertions, spec)
     except (request_spec.RequestSpecError, AssertionSpecError) as error:
         raise bad_request("invalid_case", str(error)) from error
 
@@ -211,10 +214,12 @@ def create_case(
 def get_case(
     case_id: uuid.UUID,
     response: Response,
+    request_contract: str | None = Header(default=None, alias="X-Request-Contract"),
     scope: deps.ProjectScope = _VIEW_SCOPE,
     session: Session = Depends(get_db),
 ) -> CaseOut:
     case = _get_case(session, scope, case_id)
+    require_v2_capability(request_contract, needed=is_v2(case.request))
     response.headers["ETag"] = _etag(case.rev)
     return _case_out(session, case)
 
@@ -227,11 +232,36 @@ def update_case(
     payload: CaseUpdate,
     response: Response,
     if_match: str | None = Header(default=None, alias="If-Match"),
+    request_contract: str | None = Header(default=None, alias="X-Request-Contract"),
     scope: deps.ProjectScope = _EDIT_SCOPE,
     session: Session = Depends(get_db),
 ) -> CaseOut:
     case = _get_case_locked(session, scope, case_id)
     _check_precondition(if_match, case.rev)
+    existing_v2 = is_v2(case.request)
+    submitted_v2 = payload.request is not None and is_v2(payload.request)
+    require_v2_capability(request_contract, needed=existing_v2 or submitted_v2)
+    if existing_v2 and payload.request is not None and not submitted_v2:
+        raise conflict(
+            "request_contract_downgrade",
+            "已升级的请求不能覆盖为 v1；请保留 schema_version: 2 及完整行字段。",
+        )
+
+    try:
+        next_request = (
+            request_spec.validate_request(payload.request)
+            if payload.request is not None
+            else request_spec.validate_request(case.request)
+        )
+        next_assertions = (
+            validate_assertions(payload.assertions, next_request)
+            if payload.assertions is not None
+            else validate_assertions(case.assertions, next_request)
+        )
+    except request_spec.RequestSpecError as error:
+        raise bad_request("invalid_case", str(error)) from error
+    except AssertionSpecError as error:
+        raise bad_request("invalid_assertion", str(error)) from error
 
     if payload.name is not None:
         case.name = payload.name
@@ -245,15 +275,9 @@ def update_case(
         else:
             case.folder_id = _resolve_folder(session, scope, payload.folder_id).id
     if payload.request is not None:
-        try:
-            case.request = request_spec.validate_request(payload.request)
-        except request_spec.RequestSpecError as error:
-            raise bad_request("invalid_case", str(error)) from error
+        case.request = next_request
     if payload.assertions is not None:
-        try:
-            case.assertions = validate_assertions(payload.assertions)
-        except AssertionSpecError as error:
-            raise bad_request("invalid_assertion", str(error)) from error
+        case.assertions = next_assertions
 
     case.rev += 1
     deps.commit(session)
@@ -296,6 +320,7 @@ def _snapshot_hash(case: Case) -> str:
 def publish_case(
     case_id: uuid.UUID,
     payload: CasePublish,
+    request_contract: str | None = Header(default=None, alias="X-Request-Contract"),
     scope: deps.ProjectScope = _EDIT_SCOPE,
     session: Session = Depends(get_db),
 ) -> CaseVersionOut:
@@ -304,6 +329,7 @@ def publish_case(
     # 改成 v4”之间的窗口会让 v4 被悄悄发布出去，而页面上显示的是 v3 的内容。
     # 条件更新与快照写入在同一行锁内完成，两个窗口各有一条测试。
     case = _get_case_locked(session, scope, case_id)
+    require_v2_capability(request_contract, needed=is_v2(case.request))
     if case.rev != payload.draft_rev:
         raise conflict(
             "draft_rev_conflict",
@@ -312,7 +338,7 @@ def publish_case(
     # 发布前重新校验，避免历史草稿带着已失效的配置被固化。
     try:
         spec = request_spec.validate_request(case.request)
-        assertions = validate_assertions(case.assertions)
+        assertions = validate_assertions(case.assertions, spec)
     except (request_spec.RequestSpecError, AssertionSpecError) as error:
         raise bad_request("invalid_case", str(error)) from error
 
@@ -323,6 +349,7 @@ def publish_case(
         case_id=case.id,
         version=version,
         request=spec,
+        schema_version=2 if is_v2(spec) else 1,
         side_effect=payload.side_effect,
         snapshot_hash=_snapshot_hash(case),
         created_by=scope.principal.user_id,

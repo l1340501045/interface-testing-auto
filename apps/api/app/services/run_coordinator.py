@@ -16,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..config import Settings
+from ..kernel.assertion_spec import AssertionSpecError, validate_assertions
 from ..kernel.environment_url import EnvironmentUrlError, check_base_url
 from ..kernel.request_spec import RequestSpecError, validate_request
 from ..kernel.target_policy import TargetGuard, TargetPolicyError
@@ -89,9 +90,11 @@ def digest_for_debug_snapshot(payload: RunRequest) -> str:
     snapshot = payload.debug_snapshot or {}
     try:
         request = validate_request(snapshot.get("request", {}))
-    except RequestSpecError as error:
+        assertions = list(snapshot.get("assertions", []))
+        validate_assertions(assertions, request)
+    except (RequestSpecError, AssertionSpecError) as error:
         raise RunRejected("case_invalid", f"调试请求定义无效：{error}") from error
-    return debug_snapshot_digest(request, list(snapshot.get("assertions", [])))
+    return debug_snapshot_digest(request, assertions)
 
 
 def resolve_pool(session: Session, settings: Settings, environment: Environment) -> ResolvedPool:
@@ -200,7 +203,10 @@ def _load_source(
             request = validate_request(version.request)
         except RequestSpecError as error:
             raise RunRejected("case_invalid", f"用例版本请求定义无效：{error}") from error
-        assertions = _load_version_assertions(session, version.id)
+        try:
+            assertions = validate_assertions(_load_version_assertions(session, version.id), request)
+        except AssertionSpecError as error:
+            raise RunRejected("case_invalid", f"用例版本断言配置无效：{error}") from error
         return "case_version", version.id, request, assertions
 
     snapshot = payload.debug_snapshot or {}
@@ -208,7 +214,11 @@ def _load_source(
         request = validate_request(snapshot.get("request", {}))
     except RequestSpecError as error:
         raise RunRejected("case_invalid", f"调试请求定义无效：{error}") from error
-    assertions = list(snapshot.get("assertions", []))
+    try:
+        assertions = list(snapshot.get("assertions", []))
+        validate_assertions(assertions, request)
+    except AssertionSpecError as error:
+        raise RunRejected("case_invalid", f"调试断言配置无效：{error}") from error
     return "debug_snapshot", None, request, assertions
 
 
