@@ -301,6 +301,11 @@ class RunOut(ApiModel):
     created_at: datetime
 
 
+class RunStepInterpretationOut(ApiModel):
+    outcome: Literal["completed_unchecked"]
+    reason_code: Literal["legacy_unchecked_mapping"]
+
+
 class RunStepOut(ApiModel):
     step_key: str
     attempt_no: int
@@ -308,6 +313,7 @@ class RunStepOut(ApiModel):
     outcome: str | None
     elapsed_ms: int | None
     error_code: str | None
+    interpretation: RunStepInterpretationOut | None = None
 
 
 class AssertionResultOut(ApiModel):

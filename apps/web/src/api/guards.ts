@@ -426,6 +426,10 @@ export function toRunList(raw: unknown): RunSummary[] {
 function toRunStep(raw: unknown, field: string): RunStep {
   const record = asRecord(raw, field);
   const elapsed = record.elapsed_ms;
+  const interpretation = record.interpretation;
+  const validInterpretation = isRecord(interpretation)
+    && interpretation.outcome === "completed_unchecked"
+    && interpretation.reason_code === "legacy_unchecked_mapping";
   return {
     step_key: asString(record.step_key, `${field}.step_key`),
     attempt_no: asNumber(record.attempt_no, `${field}.attempt_no`),
@@ -433,6 +437,14 @@ function toRunStep(raw: unknown, field: string): RunStep {
     outcome: asNullableString(record.outcome, `${field}.outcome`),
     elapsed_ms: elapsed === null || elapsed === undefined ? null : asNumber(elapsed, `${field}.elapsed_ms`),
     error_code: asNullableString(record.error_code, `${field}.error_code`),
+    // 解释字段是增量兼容信息：旧 API 缺失、未知版本或损坏对象都只表示“不可采信”，
+    // 不能让原本合法的历史报告整体读取失败，更不能猜成通过。
+    interpretation: validInterpretation
+      ? {
+          outcome: "completed_unchecked",
+          reason_code: "legacy_unchecked_mapping",
+        }
+      : null,
   };
 }
 
