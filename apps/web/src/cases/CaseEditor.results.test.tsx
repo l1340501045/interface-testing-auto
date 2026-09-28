@@ -200,7 +200,9 @@ function routes(path: string): unknown {
  * 因此要先切标签——不是为了让测试通过而保留重复控件。
  */
 function openAssertionTab(): void {
-  fireEvent.click(screen.getByRole("tab", { name: /^断言/ }));
+  const tab = document.getElementById("request-tab-assertions");
+  if (!(tab instanceof HTMLElement)) throw new Error("断言标签未挂载");
+  fireEvent.click(tab);
 }
 
 /**
@@ -210,7 +212,17 @@ function openAssertionTab(): void {
  * 这一步等价于用户在项目历史里点「查看报告」。
  */
 async function selectHistoryRun(): Promise<void> {
-  const button = await screen.findByRole("button", { name: "查看报告" });
+  const trigger = Array.from(document.querySelectorAll<HTMLElement>('.ant-collapse-header[role="button"]'))
+    .find((candidate) => candidate.textContent?.trim() === "版本执行与发布记录");
+  if (trigger === undefined) throw new Error("版本执行与发布记录入口未挂载");
+  if (trigger.getAttribute("aria-expanded") !== "true") {
+    fireEvent.click(trigger);
+    await waitFor(() => expect(trigger.getAttribute("aria-expanded")).toBe("true"));
+  }
+  const button = document.querySelector('[data-testid="run-panel"] button');
+  if (!(button instanceof HTMLButtonElement) || button.textContent?.trim() !== "查看报告") {
+    throw new Error("历史运行查看报告入口未挂载");
+  }
   fireEvent.click(button);
   await act(async () => {});
 }

@@ -9,6 +9,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
+import { antSelectedValue, selectAntOption } from "./test/antd";
 
 /**
  * 会话状态可改：工作空间角色决定“有没有新建项目的入口”，工作空间列表决定能不能切换。
@@ -18,6 +19,7 @@ const fixtures = vi.hoisted(() => ({
   workspaceId: "11111111-1111-4111-8111-111111111111",
   workspaceB: "45454545-4545-4545-8545-454545454545",
   workspaces: [] as { id: string; name: string; role: string }[],
+  logout: vi.fn(async () => undefined),
 }));
 
 const WORKSPACE_ID = fixtures.workspaceId;
@@ -42,7 +44,7 @@ vi.mock("./session/useSession", () => ({
     error: null,
     expired: false,
     login: vi.fn(),
-    logout: vi.fn(),
+    logout: fixtures.logout,
   }),
 }));
 
@@ -209,6 +211,7 @@ beforeEach(() => {
   caseSaveGate = null;
   caseSaveByName.clear();
   fixtures.workspaces = [{ id: WORKSPACE_ID, name: "默认工作空间", role: "admin" }];
+  fixtures.logout.mockClear();
   apiGetMock.mockImplementation((async (path: string) => routes(path)) as never);
   apiSendMock.mockImplementation((async (path: string, method: string, body: unknown) =>
     routes(path, method, body)) as never);
@@ -220,14 +223,22 @@ beforeEach(() => {
     else if (caseSaveGate !== null) await caseSaveGate.promise;
     return { data, etag: '"1"' };
   }) as never);
-  // 每条用例换一个全新的确认框替身：调用次数要能按用例清零，否则“这次有没有弹确认”
-  // 这类断言会读到上一条用例留下的调用记录。
-  window.confirm = vi.fn(() => true);
-  window.alert = vi.fn();
 });
 
 /** 新建项目表单里项目键那一栏的标签；两个 describe 都要按它定位。 */
 const KEY_LABEL = "项目键（字母、数字、下划线或短横线）";
+
+async function cancelLeave(): Promise<void> {
+  const dialog = await screen.findByRole("dialog", { name: "确认离开" });
+  fireEvent.click(within(dialog).getByRole("button", { name: "取消" }));
+  await waitFor(() => expect(screen.queryByRole("dialog", { name: "确认离开" })).toBeNull());
+}
+
+async function continueLeave(): Promise<void> {
+  const dialog = await screen.findByRole("dialog", { name: "确认离开" });
+  fireEvent.click(within(dialog).getByRole("button", { name: "继续离开" }));
+  await waitFor(() => expect(screen.queryByRole("dialog", { name: "确认离开" })).toBeNull());
+}
 
 describe("未保存内容的离开保护", () => {
 
@@ -238,8 +249,8 @@ describe("未保存内容的离开保护", () => {
    */
   async function renderShell() {
     render(<App />);
-    const select = (await screen.findByLabelText("项目")) as HTMLSelectElement;
-    await waitFor(() => expect(select.value).toBe(PROJECT_A));
+    await screen.findByLabelText("项目");
+    await waitFor(() => expect(antSelectedValue("项目")).toBe(PROJECT_A));
     // 选中项目之后，外壳还要跑一次“重置下游选择”的副作用（会把编辑器清空）。
     // 不等这部分副作用落定就点击，用户操作会和它排进同一批更新而互相覆盖：
     // 症状是点“新建”后编辑器又被立刻关闭，看起来像产品没反应。
@@ -269,7 +280,7 @@ describe("未保存内容的离开保护", () => {
     const tabs = document.querySelector<HTMLElement>(".workspace-tabs");
     if (tabs === null) throw new Error("没有请求标签栏");
     await waitFor(() => expect(within(tabs).getAllByRole("tab")).toHaveLength(2));
-    expect(window.confirm).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "确认离开" })).toBeNull();
     fireEvent.click(screen.getByRole("tab", { name: /尚未保存的用例/ }));
     expect(activeCaseName().value).toBe("尚未保存的用例");
   });
@@ -285,27 +296,14 @@ describe("未保存内容的离开保护", () => {
     expect(activeCaseName().value).toBe("第二个草稿");
   });
 
-  it("活动标签名称变长时只调整标签容器滚动且不抢输入焦点", async () => {
+  it("活动标签名称变长时保持选中且不抢输入焦点", async () => {
     await openDirtyNewCase();
-    const scroller = document.querySelector<HTMLElement>(".workspace-tab-scroll");
-    if (scroller === null) throw new Error("没有标签滚动容器");
-    const tab = within(scroller).getByRole("tab", { selected: true });
-    let itemRight = 180;
-    let viewportRight = 200;
-    vi.spyOn(scroller, "getBoundingClientRect").mockImplementation(() => ({ left: 0, right: viewportRight, top: 0, bottom: 40, width: viewportRight, height: 40, x: 0, y: 0, toJSON: () => ({}) } as DOMRect));
-    vi.spyOn(tab, "getBoundingClientRect").mockImplementation(() => ({ left: 80, right: itemRight, top: 0, bottom: 38, width: itemRight - 80, height: 38, x: 80, y: 0, toJSON: () => ({}) } as DOMRect));
-    scroller.scrollLeft = 0;
-
     const input = activeCaseName();
     input.focus();
-    itemRight = 280;
     fireEvent.change(input, { target: { value: "这是一个会让活动标签宽度明显增长的完整请求名称" } });
 
-    await waitFor(() => expect(scroller.scrollLeft).toBe(80));
+    await waitFor(() => expect(screen.getByRole("tab", { selected: true, name: /完整请求名称/ })).toBeTruthy());
     expect(document.activeElement).toBe(input);
-    viewportRight = 150;
-    window.dispatchEvent(new Event("resize"));
-    expect(scroller.scrollLeft).toBe(210);
     expect(window.scrollX).toBe(0);
   });
 
@@ -338,16 +336,21 @@ describe("未保存内容的离开保护", () => {
     opener.focus();
     fireEvent.click(opener);
     const dialog = await screen.findByRole("dialog", { name: "关闭请求标签" });
-    const save = within(dialog).getByRole("button", { name: "保存并关闭" });
+    expect(within(dialog).getByRole("button", { name: "保存并关闭" })).toBeTruthy();
     expect(within(dialog).getByRole("button", { name: "放弃修改并关闭" })).toBeTruthy();
     const cancel = within(dialog).getByRole("button", { name: "取消" });
+    const close = dialog.querySelector<HTMLButtonElement>(".ant-modal-close");
+    if (close === null) throw new Error("关闭对话框缺少组件库关闭入口");
     await waitFor(() => expect(document.activeElement).toBe(cancel));
+    const closeList = within(dialog).getByRole("list", { name: "待关闭的请求标签" });
+    expect(closeList.tabIndex).toBe(0);
+    expect(closeList.textContent).toContain("尚未保存的用例");
     fireEvent.keyDown(cancel, { key: "Tab" });
-    expect(document.activeElement).toBe(save);
-    fireEvent.keyDown(save, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(close);
+    fireEvent.keyDown(close, { key: "Tab", shiftKey: true });
     expect(document.activeElement).toBe(cancel);
-    fireEvent.keyDown(dialog, { key: "Escape" });
-    expect(screen.queryByRole("dialog", { name: "关闭请求标签" })).toBeNull();
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "关闭请求标签" })).toBeNull());
     expect(activeCaseName().value).toBe("尚未保存的用例");
     await waitFor(() => expect(document.activeElement).toBe(opener));
   });
@@ -392,7 +395,7 @@ describe("未保存内容的离开保护", () => {
     await waitFor(() => expect(apiSendWithMetaMock).toHaveBeenCalledTimes(1));
     expect((within(dialog).getByRole("button", { name: "放弃修改并关闭" }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(within(dialog).getByRole("button", { name: "取消" }));
-    expect(screen.queryByRole("dialog", { name: "关闭请求标签" })).toBeNull();
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "关闭请求标签" })).toBeNull());
 
     release();
     await waitFor(() => expect(screen.getByRole("tab", { name: /取消目标 A/ })).toBeTruthy());
@@ -412,7 +415,31 @@ describe("未保存内容的离开保护", () => {
     fireEvent.click(screen.getByRole("button", { name: "接口工作台" }));
     expect(screen.getByLabelText("用例名称")).toBe(draft);
     expect(draft.value).toBe("尚未保存的用例");
-    expect(window.confirm).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "确认离开" })).toBeNull();
+  });
+
+  it("有未保存内容时退出使用受控确认，取消保留草稿，确认后才退出", async () => {
+    await openDirtyNewCase();
+    fireEvent.click(screen.getByRole("button", { name: "退出登录" }));
+    const first = await screen.findByRole("dialog", { name: "确认离开" });
+    expect(first.textContent).toContain("未保存修改");
+    const firstCancel = within(first).getByRole("button", { name: "取消" });
+    const firstClose = first.querySelector<HTMLButtonElement>(".ant-modal-close");
+    if (firstClose === null) throw new Error("确认离开对话框缺少组件库关闭入口");
+    firstCancel.focus();
+    expect(document.activeElement).toBe(firstCancel);
+    fireEvent.keyDown(firstCancel, { key: "Tab" });
+    expect(document.activeElement).toBe(firstClose);
+    fireEvent.keyDown(firstClose, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(firstCancel);
+    fireEvent.click(firstCancel);
+    expect(fixtures.logout).not.toHaveBeenCalled();
+    expect(activeCaseName().value).toBe("尚未保存的用例");
+
+    fireEvent.click(screen.getByRole("button", { name: "退出登录" }));
+    const second = await screen.findByRole("dialog", { name: "确认离开" });
+    fireEvent.click(within(second).getByRole("button", { name: "继续离开" }));
+    await waitFor(() => expect(fixtures.logout).toHaveBeenCalledTimes(1));
   });
 
   it("配置页浏览另一个环境不会改变工作台执行目标", async () => {
@@ -422,47 +449,39 @@ describe("未保存内容的离开保护", () => {
     ];
     await openDirtyNewCase();
     const draft = screen.getByLabelText("用例名称") as HTMLInputElement;
-    await waitFor(() => expect((screen.getByLabelText("执行环境") as HTMLSelectElement).value).toBe(ENV_ID));
+    await waitFor(() => expect(antSelectedValue("执行环境")).toBe(ENV_ID));
 
     fireEvent.click(screen.getByRole("button", { name: "环境配置" }));
-    fireEvent.click(screen.getByText("环境（2）"));
-    fireEvent.click(screen.getByRole("button", { name: "环境 B" }));
+    fireEvent.click(await screen.findByText("环境（2）"));
+    fireEvent.click(await screen.findByRole("button", { name: "环境 B" }));
     fireEvent.click(screen.getByRole("button", { name: "返回接口工作台" }));
 
     expect(screen.getByLabelText("用例名称")).toBe(draft);
     expect(draft.value).toBe("尚未保存的用例");
-    expect((screen.getByLabelText("执行环境") as HTMLSelectElement).value).toBe(ENV_ID);
+    expect(antSelectedValue("执行环境")).toBe(ENV_ID);
     expect(casePosts).toHaveLength(0);
     expect(postCalls).toHaveLength(0);
 
-    fireEvent.change(screen.getByLabelText("执行环境"), {
-      target: { value: "66666666-6666-4666-8666-666666666666" },
-    });
-    expect((screen.getByLabelText("执行环境") as HTMLSelectElement).value).toBe(
-      "66666666-6666-4666-8666-666666666666",
-    );
+    await selectAntOption("执行环境", "环境 B（测试）");
+    expect(antSelectedValue("执行环境")).toBe("66666666-6666-4666-8666-666666666666");
   });
 
   it("切换项目会带走编辑器，因此同样要确认；拒绝后仍停在原项目", async () => {
     await openDirtyNewCase();
-    const projectSelect = screen.getByLabelText("项目") as HTMLSelectElement;
-    expect(projectSelect.value).toBe(PROJECT_A);
+    expect(antSelectedValue("项目")).toBe(PROJECT_A);
 
-    vi.mocked(window.confirm).mockReturnValue(false);
-    fireEvent.change(projectSelect, { target: { value: PROJECT_B } });
-
-    await waitFor(() => expect(window.confirm).toHaveBeenCalled());
-    expect((screen.getByLabelText("项目") as HTMLSelectElement).value).toBe(PROJECT_A);
+    await selectAntOption("项目", "项目乙");
+    await cancelLeave();
+    expect(antSelectedValue("项目")).toBe(PROJECT_A);
     expect((screen.getByLabelText("用例名称") as HTMLInputElement).value).toBe("尚未保存的用例");
   });
 
   it("没有未保存修改时切换项目不打扰用户", async () => {
     await renderShell();
-    const projectSelect = screen.getByLabelText("项目") as HTMLSelectElement;
-    fireEvent.change(projectSelect, { target: { value: PROJECT_B } });
+    await selectAntOption("项目", "项目乙");
 
-    await waitFor(() => expect((screen.getByLabelText("项目") as HTMLSelectElement).value).toBe(PROJECT_B));
-    expect(window.confirm).not.toHaveBeenCalled();
+    await waitFor(() => expect(antSelectedValue("项目")).toBe(PROJECT_B));
+    expect(screen.queryByRole("dialog", { name: "确认离开" })).toBeNull();
   });
 
   /**
@@ -485,16 +504,16 @@ describe("未保存内容的离开保护", () => {
     await renderShell();
 
     fireEvent.click(screen.getByRole("button", { name: "环境配置" }));
-    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    fireEvent.click(await screen.findByRole("button", { name: "环境（1）" }));
+    fireEvent.click(await screen.findByRole("button", { name: "本地测试环境" }));
+    fireEvent.click(await screen.findByRole("button", { name: "编辑" }));
     fireEvent.change(screen.getByLabelText("值"), { target: { value: "2" } });
     await act(async () => {});
 
-    vi.mocked(window.confirm).mockReturnValue(false);
-    fireEvent.change(screen.getByLabelText("项目"), { target: { value: PROJECT_B } });
-
-    await waitFor(() => expect(window.confirm).toHaveBeenCalled());
+    await selectAntOption("项目", "项目乙");
+    await cancelLeave();
     // 拒绝离开后仍停在原项目，刚改的值还在输入框里。
-    expect((screen.getByLabelText("项目") as HTMLSelectElement).value).toBe(PROJECT_A);
+    expect(antSelectedValue("项目")).toBe(PROJECT_A);
     expect((screen.getByLabelText("值") as HTMLInputElement).value).toBe("2");
   });
 
@@ -511,11 +530,9 @@ describe("未保存内容的离开保护", () => {
     fireEvent.change(screen.getByLabelText("项目名称"), { target: { value: "项目丙" } });
     createdId = CREATED_1;
 
-    vi.mocked(window.confirm).mockReturnValue(true);
     fireEvent.click(screen.getByRole("button", { name: "创建项目" }));
-
-    await waitFor(() => expect(window.confirm).toHaveBeenCalled());
-    await waitFor(() => expect((screen.getByLabelText("项目") as HTMLSelectElement).value).toBe(CREATED_1));
+    await continueLeave();
+    await waitFor(() => expect(antSelectedValue("项目")).toBe(CREATED_1));
     // 编辑器被卸载，那条没保存的名称真的丢了：所以这次确认是必要的。
     expect(screen.queryByLabelText("用例名称")).toBeNull();
   });
@@ -558,12 +575,11 @@ describe("新建项目入口", () => {
     }) as never);
   });
 
-  async function renderShell(): Promise<HTMLSelectElement> {
+  async function renderShell(): Promise<void> {
     render(<App />);
-    const select = (await screen.findByLabelText("项目")) as HTMLSelectElement;
-    await waitFor(() => expect(select.value).toBe(PROJECT_A));
+    await screen.findByLabelText("项目");
+    await waitFor(() => expect(antSelectedValue("项目")).toBe(PROJECT_A));
     await act(async () => {});
-    return select;
   }
 
   function fillCreateForm(projectKey: string, projectName: string) {
@@ -573,7 +589,7 @@ describe("新建项目入口", () => {
 
   it("已有项目时仍能新建：第二个项目也被正确选中，并且只看到属于它的数据", async () => {
     casesByProject[PROJECT_A] = [caseRow(CASE_2, "项目甲的用例")];
-    const select = await renderShell();
+    await renderShell();
     // 用例名也会出现在凭证授权的“用例”下拉里，所以断言限定在用例目录内。
     /**
      * 用例目录按工作空间／项目重挂载（选中的目录属于当前范围，不能带到下一个项目），
@@ -591,10 +607,10 @@ describe("新建项目入口", () => {
     fillCreateForm("gamma", "项目丙");
     fireEvent.click(screen.getByRole("button", { name: "创建项目" }));
 
-    await waitFor(() => expect(select.value).toBe(CREATED_1));
+    await waitFor(() => expect(antSelectedValue("项目")).toBe(CREATED_1));
     // 屏幕上没有别的未保存内容：切到新项目不该弹确认框。创建表单自己的草稿不算——
     // 它刚被清掉、结果也已经看到了（真实页面上这里曾弹出一个无所指的确认框）。
-    expect(window.confirm).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "确认离开" })).toBeNull();
     expect(postCalls).toEqual([
       { path: `/workspaces/${WORKSPACE_ID}/projects`, body: { key: "gamma", name: "项目丙" } },
     ]);
@@ -609,20 +625,18 @@ describe("新建项目入口", () => {
     fillCreateForm("delta", "项目丁");
     fireEvent.click(screen.getByRole("button", { name: "创建项目" }));
 
-    await waitFor(() => expect(select.value).toBe(CREATED_2));
+    await waitFor(() => expect(antSelectedValue("项目")).toBe(CREATED_2));
     expect(postCalls[1]).toEqual({
       path: `/workspaces/${WORKSPACE_ID}/projects`,
       body: { key: "delta", name: "项目丁" },
     });
     expect(await within(browserNow()).findByText("项目丁的用例")).toBeTruthy();
     expect(within(browserNow()).queryByText("项目丙的用例")).toBeNull();
-    // 四个项目都在选择器里，顺序与创建顺序一致。
-    expect(Array.from(select.options).map((option) => option.value)).toEqual([
-      PROJECT_A,
-      PROJECT_B,
-      CREATED_1,
-      CREATED_2,
-    ]);
+    // 四个项目都在真实选择器里。
+    fireEvent.mouseDown(screen.getByRole("combobox", { name: "项目" }));
+    for (const name of ["项目甲", "项目乙", "项目丙", "项目丁"]) {
+      expect((await screen.findAllByText(name)).length).toBeGreaterThan(0);
+    }
   });
 
   it("查看者看不到新建项目的入口，也看不到可提交的表单", async () => {
@@ -651,8 +665,8 @@ describe("新建项目入口", () => {
       { id: WORKSPACE_B, name: "第二工作空间", role: "admin" },
     ];
     projectsByWorkspace[WORKSPACE_B] = [project("beta", "项目乙", WORKSPACE_B, PROJECT_B)];
-    const select = await renderShell();
-    expect(select.value).toBe(PROJECT_A);
+    await renderShell();
+    expect(antSelectedValue("项目")).toBe(PROJECT_A);
 
     fireEvent.click(screen.getByRole("button", { name: "＋新建项目" }));
     fillCreateForm("gamma", "项目丙");
@@ -662,16 +676,16 @@ describe("新建项目入口", () => {
     await waitFor(() => expect(postCalls).toHaveLength(1));
 
     // 普通范围切换不得用确认绕过在途操作；安全退出才有明确例外。
-    fireEvent.change(screen.getByLabelText("工作空间"), { target: { value: WORKSPACE_B } });
-    await waitFor(() => expect(window.alert).toHaveBeenCalledWith(expect.stringContaining("普通切换不能丢弃")));
-    expect((screen.getByLabelText("工作空间") as HTMLSelectElement).value).toBe(WORKSPACE_ID);
+    await selectAntOption("工作空间", "第二工作空间");
+    await screen.findByText(/普通切换不能丢弃/);
+    expect(antSelectedValue("工作空间")).toBe(WORKSPACE_ID);
 
     // 原操作完成后才允许普通切换；新工作空间不被旧范围锁住。
     releaseCreate?.();
     await waitFor(() => expect(screen.queryByText("创建中…")).toBeNull());
-    fireEvent.change(screen.getByLabelText("工作空间"), { target: { value: WORKSPACE_B } });
+    await selectAntOption("工作空间", "第二工作空间");
     await waitFor(() =>
-      expect((screen.getByLabelText("项目") as HTMLSelectElement).value).toBe(PROJECT_B),
+      expect(antSelectedValue("项目")).toBe(PROJECT_B),
     );
     fireEvent.click(screen.getByRole("button", { name: "＋新建项目" }));
     fillCreateForm("epsilon", "项目戊");
@@ -680,7 +694,7 @@ describe("新建项目入口", () => {
     await act(async () => {
       releaseCreate?.();
     });
-    expect((screen.getByLabelText("项目") as HTMLSelectElement).value).toBe(PROJECT_B);
+    expect(antSelectedValue("项目")).toBe(PROJECT_B);
     expect((screen.getByLabelText(KEY_LABEL) as HTMLInputElement).value).toBe("epsilon");
     expect((screen.getByLabelText("项目名称") as HTMLInputElement).value).toBe("项目戊");
     expect(screen.queryByText(/创建项目失败/)).toBeNull();
@@ -708,7 +722,7 @@ describe("新建项目入口", () => {
    */
   it("创建请求在飞时才编辑的用例，放行响应后仍要先确认；取消后新输入还在", async () => {
     casesByProject[PROJECT_A] = [caseRow(CASE_2, "项目甲的用例")];
-    const select = await renderShell();
+    await renderShell();
 
     // 打开一条干净的用例：此时屏幕上没有任何未保存内容。
     const browser = screen.getByLabelText("用例目录");
@@ -730,17 +744,17 @@ describe("新建项目入口", () => {
     fireEvent.change(nameField, { target: { value: "提交后才改的名字" } });
     await act(async () => {});
 
-    vi.mocked(window.confirm).mockReturnValue(false);
     await act(async () => {
       releaseCreate?.();
     });
 
     // 必须问过一次，而且问的是“表单没保存”而不是“有正在进行的操作”：创建本身已经结束，
     // 挡路的是刚输入的草稿。
-    await waitFor(() => expect(window.confirm).toHaveBeenCalled());
-    expect(vi.mocked(window.confirm).mock.calls[0]?.[0]).toContain("未保存的修改");
+    const leaveDialog = await screen.findByRole("dialog", { name: "确认离开" });
+    expect(leaveDialog.textContent).toContain("未保存的修改");
+    fireEvent.click(within(leaveDialog).getByRole("button", { name: "取消" }));
     // 取消：不切项目、编辑器还在、刚敲进去的名字原样保留。
-    expect(select.value).toBe(PROJECT_A);
+    expect(antSelectedValue("项目")).toBe(PROJECT_A);
     expect((screen.getByLabelText("用例名称") as HTMLInputElement).value).toBe("提交后才改的名字");
 
     // 项目本身确实建出来了，只是这次切换被用户拒掉；重新发起时确认一次就能正常切过去，
@@ -752,9 +766,9 @@ describe("新建项目入口", () => {
     ]);
     fireEvent.change(screen.getByLabelText("用例名称"), { target: { value: "" } });
     await act(async () => {});
-    vi.mocked(window.confirm).mockReturnValue(true);
-    fireEvent.change(select, { target: { value: CREATED_1 } });
-    await waitFor(() => expect(select.value).toBe(CREATED_1));
+    await selectAntOption("项目", "项目丙");
+    await continueLeave();
+    await waitFor(() => expect(antSelectedValue("项目")).toBe(CREATED_1));
   });
 });
 
@@ -774,18 +788,18 @@ describe("用例目录的范围归属", () => {
     casesByProject[PROJECT_B] = [caseRow(CREATED_CASE, "乙项目的用例")];
 
     render(<App />);
-    const projectSelect = (await screen.findByLabelText("项目")) as HTMLSelectElement;
-    await waitFor(() => expect(projectSelect.value).toBe(PROJECT_A));
+    await screen.findByLabelText("项目");
+    await waitFor(() => expect(antSelectedValue("项目")).toBe(PROJECT_A));
     await act(async () => {});
 
     // 在 A 项目里选中目录：列表按它过滤。
-    fireEvent.click(within(screen.getByLabelText("用例目录")).getByRole("button", { name: "A 模块" }));
+    fireEvent.click(within(screen.getByLabelText("用例目录")).getByText("A 模块"));
     await waitFor(() =>
       expect(within(screen.getByLabelText("用例目录")).getByText("甲项目目录里的用例")).toBeTruthy(),
     );
 
-    fireEvent.change(projectSelect, { target: { value: PROJECT_B } });
-    await waitFor(() => expect(projectSelect.value).toBe(PROJECT_B));
+    await selectAntOption("项目", "项目乙");
+    await waitFor(() => expect(antSelectedValue("项目")).toBe(PROJECT_B));
     await act(async () => {});
 
     // B 的列表按 B 自己的范围拉取：未分组的那条也在，说明没有沿用 A 的目录过滤。
@@ -793,9 +807,11 @@ describe("用例目录的范围归属", () => {
 
     // 新建用例：归属是「未分组」，不会把 A 的目录带进 B 项目。
     fireEvent.click(within(screen.getByLabelText("用例目录")).getByRole("button", { name: "＋新建用例" }));
-    const folderSelect = (await screen.findByLabelText("所属目录")) as HTMLSelectElement;
-    expect(folderSelect.value).toBe("");
-    expect(Array.from(folderSelect.options).map((option) => option.textContent)).toEqual(["未分组", "B 模块"]);
+    await screen.findByLabelText("所属目录");
+    expect(antSelectedValue("所属目录")).toBe("");
+    fireEvent.mouseDown(screen.getByRole("combobox", { name: "所属目录" }));
+    expect(screen.getByRole("option", { name: "未分组" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "B 模块" })).toBeTruthy();
 
     fireEvent.change(await screen.findByLabelText("用例名称"), { target: { value: "乙项目的新用例" } });
     fireEvent.click(screen.getByRole("button", { name: "创建用例" }));

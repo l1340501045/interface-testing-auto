@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { antSelectedValue, selectAntOption } from "./test/antd";
 
 const WS = "11111111-1111-4111-8111-111111111111";
 const A = "22222222-2222-4222-8222-222222222222";
@@ -61,15 +62,13 @@ beforeEach(() => {
   vi.mocked(apiGet).mockReset().mockImplementation((async (path: string, parse: (raw: unknown) => unknown) => parse(raw(path, "GET", undefined))) as never);
   vi.mocked(apiSend).mockReset().mockImplementation((async (path: string, method: string, body: unknown, parse: (raw: unknown) => unknown, options?: { headers?: Record<string, string> }) => parse(raw(path, method, body, options?.headers))) as never);
   vi.mocked(apiSendWithMeta).mockReset();
-  window.alert = vi.fn();
-  window.confirm = vi.fn(() => true);
 });
 
 describe("unknown 的普通范围保护", () => {
   it("普通切项目不能丢 unknown，确认仍使用原 body 与键", async () => {
     render(<App />);
-    const project = await screen.findByLabelText("项目") as HTMLSelectElement;
-    await waitFor(() => expect(project.value).toBe(A));
+    await screen.findByLabelText("项目");
+    await waitFor(() => expect(antSelectedValue("项目")).toBe(A));
     await act(async () => {});
     const browser = screen.getByRole("complementary", { name: "用例目录" });
     fireEvent.click(await within(browser).findByRole("button", { name: /unknown 用例/ }));
@@ -78,9 +77,9 @@ describe("unknown 的普通范围保护", () => {
     fireEvent.click(screen.getByRole("button", { name: "保存并执行" }));
     const confirm = await screen.findByRole("button", { name: "确认原操作" });
 
-    fireEvent.change(project, { target: { value: B } });
-    expect(project.value).toBe(A);
-    expect(window.alert).toHaveBeenCalled();
+    await selectAntOption("项目", "项目乙");
+    expect(antSelectedValue("项目")).toBe(A);
+    expect(screen.getByText(/普通切换不能丢弃/)).toBeTruthy();
     expect(confirm).toBeTruthy();
 
     fireEvent.click(confirm);

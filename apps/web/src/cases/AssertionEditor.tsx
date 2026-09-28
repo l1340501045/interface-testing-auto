@@ -5,6 +5,7 @@
  * 试算是纯计算，不发被测请求，也不产生正式运行报告。
  */
 import { useMemo, useState } from "react";
+import { Button, Checkbox, Form, Input, Select, Space } from "antd";
 
 import { ApiError, apiSend, projectPath } from "../api/client";
 import { describeValue } from "../api/literals";
@@ -92,43 +93,33 @@ function renderControl(
   const label = field.label ?? name;
   if (field.control === "switch") {
     return (
-      <span className="param-switch" key={name}>
-        <input id={id} type="checkbox" checked={value === true} onChange={(e) => onChange(e.target.checked)} />
-        <label htmlFor={id}>{label}</label>
-      </span>
+      <Form.Item className="param-switch" key={name}>
+        <Checkbox id={id} checked={value === true} onChange={(e) => onChange(e.target.checked)}>{label}</Checkbox>
+      </Form.Item>
     );
   }
   if (field.control === "select") {
     return (
-      <span className="param" key={name}>
-        <label htmlFor={id}>{label}</label>
-        <select id={id} value={typeof value === "string" ? value : ""} onChange={(e) => onChange(e.target.value)}>
-          {(field.options ?? []).map((option) => (
-            <option key={option} value={option}>
-              {option}
-            </option>
-          ))}
-        </select>
-      </span>
+      <Form.Item className="param" key={name} label={label} htmlFor={id}>
+        <Select id={id} aria-label={label} value={typeof value === "string" ? value : ""} data-selected-value={typeof value === "string" ? value : ""} onChange={onChange} options={(field.options ?? []).map((option) => ({ value: option, label: option }))} />
+      </Form.Item>
     );
   }
   if (field.control === "value_list") {
     return (
-      <span className="param" key={name}>
-        <label htmlFor={id}>{label}（每行一个）</label>
-        <textarea
+      <Form.Item className="param" key={name} label={`${label}（每行一个）`} htmlFor={id}>
+        <Input.TextArea
           id={id}
           rows={3}
           value={typeof value === "string" ? value : ""}
           onChange={(e) => onChange(e.target.value)}
         />
-      </span>
+      </Form.Item>
     );
   }
   return (
-    <span className="param" key={name}>
-      <label htmlFor={id}>{label}</label>
-      <input
+    <Form.Item className="param" key={name} label={label} htmlFor={id}>
+      <Input
         id={id}
         // 数字用文本框而不是 number 输入框：number 输入框会经 Number 取值，
         // 长整数在提交前就已经失真。
@@ -137,7 +128,7 @@ function renderControl(
         value={typeof value === "string" ? value : ""}
         onChange={(e) => onChange(e.target.value)}
       />
-    </span>
+    </Form.Item>
   );
 }
 
@@ -251,27 +242,23 @@ export function AssertionEditor({
   const groups = groupsOf(candidates);
 
   return (
-    <div className="assertion-editor">
+    <Form className="assertion-editor" layout="vertical" component="div">
       <p className="caption">
         检查位置：{field.targetSource} · {describeSelector(field.selector)} · 字段类型 {field.fieldType}
         {editing ? "（修改既有断言）" : ""}
       </p>
 
-      <span className="param">
-        <label htmlFor={`${idPrefix}-type`}>断言类型</label>
-        <select id={`${idPrefix}-type`} value={selected} onChange={(e) => chooseType(e.target.value)}>
-          <option value="">请选择</option>
-          {groups.map((group) => (
-            <optgroup key={group.group} label={group.group}>
-              {group.items.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.label}
-                </option>
-              ))}
-            </optgroup>
-          ))}
-        </select>
-      </span>
+      <Form.Item className="param" label="断言类型" htmlFor={`${idPrefix}-type`}>
+        <Select
+          id={`${idPrefix}-type`}
+          aria-label="断言类型"
+          value={selected || undefined}
+          placeholder="请选择"
+          data-selected-value={selected}
+          onChange={chooseType}
+          options={groups.map((group) => ({ label: group.group, options: group.items.map((item) => ({ value: item.id, label: item.label })) }))}
+        />
+      </Form.Item>
 
       {type ? <p className="caption">{type.summary}</p> : null}
 
@@ -290,33 +277,29 @@ export function AssertionEditor({
       ) : null}
 
       <div className="param-row">
-        <span className="param">
-          <label htmlFor={`${idPrefix}-severity`}>严重级别</label>
-          <select
+        <Form.Item className="param" label="严重级别" htmlFor={`${idPrefix}-severity`}>
+          <Select
             id={`${idPrefix}-severity`}
             value={severity}
-            onChange={(e) => setSeverity(e.target.value === "warning" ? "warning" : "error")}
-          >
-            <option value="error">失败即判定用例不通过</option>
-            <option value="warning">仅提示，不判定失败</option>
-          </select>
-        </span>
+            aria-label="严重级别"
+            data-selected-value={severity}
+            onChange={(value: "error" | "warning") => setSeverity(value)}
+            options={[{ value: "error", label: "失败即判定用例不通过" }, { value: "warning", label: "仅提示，不判定失败" }]}
+          />
+        </Form.Item>
         {field.fieldType === "string" || field.fieldType === "integer" ? (
-          <span className="param">
-            <label htmlFor={`${idPrefix}-compare`}>比较方式</label>
-            <select
+          <Form.Item className="param" label="比较方式" htmlFor={`${idPrefix}-compare`}>
+            <Select
               id={`${idPrefix}-compare`}
               value={compareAs ?? ""}
-              onChange={(e) => {
-                const next = e.target.value;
+              aria-label="比较方式"
+              data-selected-value={compareAs ?? ""}
+              onChange={(next: string) => {
                 setCompareAs(next === "number" || next === "integer" ? next : null);
               }}
-            >
-              <option value="">按字段自身类型</option>
-              <option value="number">按数字比较</option>
-              <option value="integer">按整数比较</option>
-            </select>
-          </span>
+              options={[{ value: "", label: "按字段自身类型" }, { value: "number", label: "按数字比较" }, { value: "integer", label: "按整数比较" }]}
+            />
+          </Form.Item>
         ) : null}
       </div>
 
@@ -335,22 +318,22 @@ export function AssertionEditor({
         </p>
       ) : null}
 
-      <div className="actions">
-        <button type="button" onClick={submit}>
+      <Space className="actions">
+        <Button htmlType="button" type="primary" onClick={submit}>
           {editing ? "保存这条断言" : "添加这条断言"}
-        </button>
-        <button type="button" onClick={() => void runPreview()} disabled={busy || sample === null}>
+        </Button>
+        <Button htmlType="button" onClick={() => void runPreview()} disabled={busy || sample === null}>
           {busy ? "试算中…" : "用当前样例试算"}
-        </button>
-        <button type="button" onClick={onCancel}>
+        </Button>
+        <Button htmlType="button" onClick={onCancel}>
           取消
-        </button>
-      </div>
+        </Button>
+      </Space>
       <p className="caption">
         {sample === null
           ? "当前字段没有可用的标量样例（对象、数组或响应尚未返回），暂不能试算；配置仍可保存，执行时按真实响应核对。"
           : "试算不发送被测请求，也不写入正式报告；执行时才用本次运行的真实请求与响应核对。"}
       </p>
-    </div>
+    </Form>
   );
 }

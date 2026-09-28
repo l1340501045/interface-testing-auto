@@ -9,9 +9,10 @@
  * 网络失败与断言失败在报告里是不同类别，这里按类别如实呈现。
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Button, Collapse, Descriptions, Empty, Space, Table, Tag } from "antd";
 
 import { ApiError, apiSend, projectPath } from "../api/client";
-import type { CaseVersion, RunReport } from "../api/types";
+import type { CaseVersion, RunReport, RunSummary } from "../api/types";
 import { ErrorText, Hint, Loading, StatusTag } from "../components/Feedback";
 import { describeValue } from "../api/literals";
 import { isTerminal, runOutcomeLabel, runReasonLabel, runStateLabel, runTimeLabel, stepOutcomeLabel, stepStateLabel, useRunReport, useRuns } from "./useRuns";
@@ -47,15 +48,11 @@ const INITIAL_RUN_REJECTIONS = new Map<string, number>([
 export function ReportView({ report }: { report: RunReport }) {
   return (
     <div className="report">
-      <p>
-        <strong>最终结果：</strong>
-        {runOutcomeLabel(report.run)}
-        {runReasonLabel(report.run) ? `（${runReasonLabel(report.run)}）` : ""}
-      </p>
+      <Descriptions size="small" column={1} items={[{ key: "outcome", label: "最终结果", children: `${runOutcomeLabel(report.run)}${runReasonLabel(report.run) ? `（${runReasonLabel(report.run)}）` : ""}` }]} />
 
       <h4>步骤</h4>
       {report.steps.length === 0 ? (
-        <Hint>还没有步骤记录，工作项可能仍在排队。</Hint>
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有步骤记录，工作项可能仍在排队" />
       ) : (
         <ul className="caption">
           {report.steps.map((step) => (
@@ -71,44 +68,30 @@ export function ReportView({ report }: { report: RunReport }) {
 
       <h4>断言结果</h4>
       {report.assertions.length === 0 ? (
-        <Hint>本次运行没有断言结果记录。</Hint>
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="本次运行没有断言结果记录" />
       ) : (
-        <div className="table-scroll">
-        <table className="report-table">
-          <thead>
-            <tr>
-              <th>断言</th>
-              <th>阶段</th>
-              <th>结果</th>
-              <th>期望</th>
-              <th>实际</th>
-              <th>说明</th>
-            </tr>
-          </thead>
-          <tbody>
-            {report.assertions.map((item) => (
-              <tr key={`${item.assertion_id}-${item.phase}`}>
-                <td>{item.type}</td>
-                <td>{item.phase === "pre_request" ? "发送前" : "响应后"}</td>
-                <td>
-                  <StatusTag status={item.status} />
-                </td>
-                <td>{describeValue(item.expected)}</td>
-                <td>{describeValue(item.actual)}</td>
-                <td>{item.reason_code ?? ""}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        </div>
+        <Table
+          className="report-table"
+          size="small"
+          pagination={false}
+          rowKey={(item) => `${item.assertion_id}-${item.phase}`}
+          dataSource={report.assertions}
+          columns={[
+            { title: "断言", dataIndex: "type" },
+            { title: "阶段", render: (_: unknown, item: RunReport["assertions"][number]) => item.phase === "pre_request" ? "发送前" : "响应后" },
+            { title: "结果", render: (_: unknown, item: RunReport["assertions"][number]) => <StatusTag status={item.status} /> },
+            { title: "期望", render: (_: unknown, item: RunReport["assertions"][number]) => describeValue(item.expected) },
+            { title: "实际", render: (_: unknown, item: RunReport["assertions"][number]) => describeValue(item.actual) },
+            { title: "说明", render: (_: unknown, item: RunReport["assertions"][number]) => item.reason_code ?? "" },
+          ]}
+        />
       )}
 
-      <details>
-        <summary>脱敏后的请求与响应证据</summary>
+      <Collapse items={[{ key: "evidence", label: "脱敏后的请求与响应证据", children: <>
         <pre className="evidence">{JSON.stringify(report.request, null, 2)}</pre>
         <pre className="evidence">{JSON.stringify(report.response, null, 2)}</pre>
         <p className="caption">证据中的凭证值已由服务端遮蔽，页面不保存任何密钥。</p>
-      </details>
+      </> }]} />
     </div>
   );
 }
@@ -333,18 +316,19 @@ export function RunPanel({
         这里固定<strong>已发布版本</strong>：需要先保存（内容变了还要发布）。调试当前编辑内容请用页面
         顶部的「发送」，它不写用例、不产生版本。{showHistory ? "最近记录也会显示在下方。" : "提交后的状态请到任务中心查看。"}
       </p>
-      <div className="actions">
-        <button
-          type="button"
+      <Space className="actions">
+        <Button
+          htmlType="button"
+          type="primary"
           onClick={() => void startRun()}
           disabled={busy || caseId === null || readOnly || operationBlocked || unknown !== null}
         >
           {busy ? "提交中…" : "保存并执行"}
-        </button>
+        </Button>
         {showHistory ? (
-          <button type="button" onClick={runs.reload} disabled={runs.loading}>刷新运行列表</button>
+          <Button htmlType="button" onClick={runs.reload} loading={runs.loading}>刷新运行列表</Button>
         ) : null}
-      </div>
+      </Space>
       {readOnly || !canCancel ? (
         <Hint>当前角色只能查看历史报告，不能提交或取消运行。</Hint>
       ) : null}
@@ -353,7 +337,7 @@ export function RunPanel({
       {unknown ? (
         <div className="notice">
           <p>这次版本运行是否受理仍未知；确认会提交完全相同的版本、环境和操作键。</p>
-          <button type="button" disabled={busy} onClick={() => { setBusy(true); void submitPending(unknown, "confirm").then((keep) => { if (!keep) { localOperation.current = false; releaseOperation?.(); } }).catch((cause) => setError(cause instanceof Error ? cause.message : "确认失败")).finally(() => setBusy(false)); }}>确认原操作</button>
+          <Button htmlType="button" type="primary" disabled={busy} onClick={() => { setBusy(true); void submitPending(unknown, "confirm").then((keep) => { if (!keep) { localOperation.current = false; releaseOperation?.(); } }).catch((cause) => setError(cause instanceof Error ? cause.message : "确认失败")).finally(() => setBusy(false)); }}>确认原操作</Button>
         </div>
       ) : null}
       {error ? <ErrorText message={error} /> : null}
@@ -365,40 +349,24 @@ export function RunPanel({
       ) : null}
 
       {showHistory && runs.data && runs.data.length > 0 ? (
-        <table className="report-table">
-          <thead>
-            <tr>
-              <th>运行</th>
-              <th>状态</th>
-              <th>结果</th>
-              <th>提交时间</th>
-              <th>操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {runs.data.map((run) => (
-              <tr key={run.id} className={run.id === selectedRunId ? "row-active" : undefined}>
-                <td>{run.id.slice(0, 8)}</td>
-                <td>{runStateLabel(run)}</td>
-                <td>
-                  {runOutcomeLabel(run)}
-                  {runReasonLabel(run) ? `（${runReasonLabel(run)}）` : ""}
-                </td>
-                <td><time dateTime={run.created_at} title={run.created_at}>{runTimeLabel(run.created_at)}</time></td>
-                <td className="inline-actions">
-                  <button type="button" onClick={() => onSelectRun(run.id)}>
-                    查看报告
-                  </button>
-                  {isTerminal(run) || readOnly || !canCancel ? null : (
-                    <button type="button" onClick={() => void cancelRun(run.id)}>
-                      取消
-                    </button>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <Table
+          className="report-table"
+          size="small"
+          pagination={false}
+          rowKey="id"
+          dataSource={runs.data}
+          rowClassName={(run) => run.id === selectedRunId ? "row-active" : ""}
+          columns={[
+            { title: "运行", render: (_: unknown, run: RunSummary) => run.id.slice(0, 8) },
+            { title: "状态", render: (_: unknown, run: RunSummary) => <Tag>{runStateLabel(run)}</Tag> },
+            { title: "结果", render: (_: unknown, run: RunSummary) => `${runOutcomeLabel(run)}${runReasonLabel(run) ? `（${runReasonLabel(run)}）` : ""}` },
+            { title: "提交时间", render: (_: unknown, run: RunSummary) => <time dateTime={run.created_at} title={run.created_at}>{runTimeLabel(run.created_at)}</time> },
+            { title: "操作", render: (_: unknown, run: RunSummary) => <Space size={4}>
+              <Button htmlType="button" size="small" onClick={() => onSelectRun(run.id)}>查看报告</Button>
+              {isTerminal(run) || readOnly || !canCancel ? null : <Button htmlType="button" size="small" danger aria-label="取消" onClick={() => void cancelRun(run.id)}>取消</Button>}
+            </Space> },
+          ]}
+        />
       ) : null}
 
       {showHistory && selectedRunId ? (

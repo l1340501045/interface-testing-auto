@@ -9,6 +9,7 @@
  * 不提交、也不清空已经输入的内容。服务端仍会独立校验一次——绕过页面的调用同样要挡住。
  */
 import { useRef, useState } from "react";
+import { Alert, Button, Card, Collapse, Flex, Form, Input, Select, Space, Typography } from "antd";
 
 import { ApiError, apiSend, projectPath } from "../api/client";
 import { toEnvironment } from "../api/guards";
@@ -238,92 +239,80 @@ export function EnvironmentPanel({
     }
   }
 
-  return (
-    <details
-      className="block"
-      id="environment-panel"
-      tabIndex={-1}
-      open={open}
-      onToggle={(event) => {
-        /*
-          只回报**用户操作造成的状态变化**。
-
-          React 同步 `open` 属性同样会触发 `toggle`：项目还没有环境时这一层被强制展开，
-          环境列表读回来之后属性被移除，浏览器照样发一次 `toggle`。若不加区分地回报，
-          外壳的“用户想展开”标记会被这次同步置为 true，面板从此**永远展开**、再也合不上。
-          属性值与本次渲染给出的 `open` 相同，说明这次变化来自同步而不是点击，直接忽略。
-        */
-        if (event.currentTarget.open === open) return;
-        onOpenChange(event.currentTarget.open);
-      }}
-    >
-      <summary>环境（{environments.length}）</summary>
+  const content = (
+    <Flex vertical gap="middle">
       {loading ? <Loading label="正在加载环境…" /> : null}
       {error ? <ErrorText message={error} /> : null}
       {environments.length === 0 && !loading ? (
         <Hint>当前项目还没有环境。执行前至少需要一个测试环境，其地址由执行池白名单放行。</Hint>
       ) : (
-        <ul className="env-list">
+        <Flex className="env-list" vertical gap="small">
           {environments.map((item) => (
-            <li key={item.id}>
-              <button
-                type="button"
-                className={selectedId === item.id ? "active" : undefined}
-                onClick={() => onSelect(item.id)}
-              >
-                {item.name}
-              </button>
-              <span className="caption">
+            <Card key={item.id} size="small">
+              <Space wrap>
+                <Button
+                  htmlType="button"
+                  type={selectedId === item.id ? "primary" : "default"}
+                  onClick={() => onSelect(item.id)}
+                >
+                  {item.name}
+                </Button>
+              <Typography.Text type="secondary">
                 {item.kind === "production" ? "生产" : "测试"} · {item.base_url}
                 {item.status === "archived" ? " · 已停用" : ""}
                 {item.pool_id ? "" : " · 未绑定执行池"}
-              </span>
-              <span className="caption">{summarize(item.variables)}</span>
+              </Typography.Text>
+              <Typography.Text type="secondary">{summarize(item.variables)}</Typography.Text>
               {canEdit ? (
-                <button type="button" onClick={() => startEdit(item)} disabled={busy}>
+                <Button htmlType="button" onClick={() => startEdit(item)} disabled={busy}>
                   编辑
-                </button>
+                </Button>
               ) : null}
+              </Space>
               {editingId === item.id ? (
-                <div className="env-edit">
-                  <label htmlFor="env-edit-name">环境名称</label>
-                  <input
-                    id="env-edit-name"
-                    value={draftName}
-                    onChange={(event) => setDraftName(event.target.value)}
-                  />
-                  <label htmlFor="env-edit-url">服务地址</label>
-                  <input
-                    id="env-edit-url"
-                    value={draftUrl}
+                <Form className="env-edit" layout="vertical">
+                  <Form.Item label="环境名称" htmlFor="env-edit-name">
+                    <Input
+                      id="env-edit-name"
+                      value={draftName}
+                      disabled={busy}
+                      onChange={(event) => setDraftName(event.target.value)}
+                    />
+                  </Form.Item>
+                  <Form.Item label="服务地址" htmlFor="env-edit-url">
+                    <Input
+                      id="env-edit-url"
+                      value={draftUrl}
                     /* 保存期间锁定地址：不锁定的话，请求返回时输入可能已经被改成另一个值，
                        迟到的地址错误就会标在用户刚写的地址上。锁定后这份错误必然属于它校验
                        的那一份输入。同表单的变量编辑器同样在 busy 时禁用。 */
-                    disabled={busy}
-                    aria-invalid={draftUrlError !== null}
-                    aria-describedby={draftUrlError !== null ? "env-edit-url-error" : undefined}
-                    placeholder={ENVIRONMENT_URL_EXAMPLE}
-                    onChange={(event) => {
-                      setDraftUrl(event.target.value);
-                      setDraftUrlError(null);
-                    }}
-                  />
+                      disabled={busy}
+                      aria-invalid={draftUrlError !== null}
+                      aria-describedby={draftUrlError !== null ? "env-edit-url-error" : undefined}
+                      placeholder={ENVIRONMENT_URL_EXAMPLE}
+                      onChange={(event) => {
+                        setDraftUrl(event.target.value);
+                        setDraftUrlError(null);
+                      }}
+                    />
+                  </Form.Item>
                   {draftUrlError !== null ? (
                     <p className="error" id="env-edit-url-error">
                       {draftUrlError}
                     </p>
                   ) : (
-                    <p className="caption">{URL_HINT}</p>
+                    <Typography.Text type="secondary">{URL_HINT}</Typography.Text>
                   )}
-                  <label htmlFor="env-edit-status">状态</label>
-                  <select
-                    id="env-edit-status"
-                    value={draftStatus}
-                    onChange={(event) => setDraftStatus(event.target.value)}
-                  >
-                    <option value="active">启用</option>
-                    <option value="archived">停用</option>
-                  </select>
+                  <Form.Item label="状态" htmlFor="env-edit-status">
+                    <Select
+                      id="env-edit-status"
+                      data-selected-value={draftStatus}
+                      value={draftStatus}
+                      disabled={busy}
+                      options={[{ value: "active", label: "启用" }, { value: "archived", label: "停用" }]}
+                      onChange={setDraftStatus}
+                    />
+                  </Form.Item>
                   <h4>环境普通变量</h4>
                   <VariableRowsEditor
                     rows={draftRows}
@@ -331,59 +320,75 @@ export function EnvironmentPanel({
                     onChange={setDraftRows}
                     emptyHint="该环境还没有普通变量。"
                   />
-                  <div className="actions">
-                    <button type="button" onClick={() => void saveEdit(item)} disabled={busy}>
+                  <Space className="actions">
+                    <Button type="primary" htmlType="button" onClick={() => void saveEdit(item)} disabled={busy}>
                       {busy ? "保存中…" : "保存环境"}
-                    </button>
-                    <button
-                      type="button"
+                    </Button>
+                    <Button
+                      htmlType="button"
                       onClick={() => {
                         if (!busyRef.current) setEditingId(null);
                       }}
                       disabled={busy}
                     >
                       取消
-                    </button>
-                  </div>
-                </div>
+                    </Button>
+                  </Space>
+                </Form>
               ) : null}
-            </li>
+            </Card>
           ))}
-        </ul>
+        </Flex>
       )}
       {canEdit ? (
-        <div className="env-create">
-          <label htmlFor="env-name">新环境名称</label>
-          <input id="env-name" value={name} onChange={(event) => setName(event.target.value)} />
-          <label htmlFor="env-url">新环境地址</label>
-          <input
-            id="env-url"
-            value={baseUrl}
+        <Card size="small" title="创建测试环境">
+          <Form className="env-create" layout="vertical">
+            <Form.Item label="新环境名称" htmlFor="env-name">
+              <Input id="env-name" value={name} disabled={busy} onChange={(event) => setName(event.target.value)} />
+            </Form.Item>
+            <Form.Item label="新环境地址" htmlFor="env-url">
+              <Input
+                id="env-url"
+                value={baseUrl}
             /* 与编辑表单同一条规则：保存期间锁定地址，迟到的地址错误只属于它校验的那一份输入。 */
-            disabled={busy}
-            aria-invalid={createUrlError !== null}
-            aria-describedby={createUrlError !== null ? "env-url-error" : undefined}
-            placeholder={ENVIRONMENT_URL_EXAMPLE}
-            onChange={(event) => {
-              setBaseUrl(event.target.value);
-              setCreateUrlError(null);
-            }}
-          />
+                disabled={busy}
+                aria-invalid={createUrlError !== null}
+                aria-describedby={createUrlError !== null ? "env-url-error" : undefined}
+                placeholder={ENVIRONMENT_URL_EXAMPLE}
+                onChange={(event) => {
+                  setBaseUrl(event.target.value);
+                  setCreateUrlError(null);
+                }}
+              />
+            </Form.Item>
           {createUrlError !== null ? (
             <p className="error" id="env-url-error">
               {createUrlError}
             </p>
           ) : (
-            <p className="caption">{URL_HINT}</p>
+            <Typography.Text type="secondary">{URL_HINT}</Typography.Text>
           )}
-          <button type="button" onClick={() => void create()} disabled={busy}>
-            创建测试环境
-          </button>
-          <p className="caption">本阶段不启用生产环境；创建生产环境会被服务端拒绝。</p>
-        </div>
+            <Form.Item>
+              <Button type="primary" htmlType="button" onClick={() => void create()} disabled={busy}>
+                创建测试环境
+              </Button>
+            </Form.Item>
+            <Alert type="info" showIcon title="本阶段不启用生产环境；创建生产环境会被服务端拒绝。" />
+          </Form>
+        </Card>
       ) : null}
       {message ? <Hint>{message}</Hint> : null}
       {failure ? <ErrorText message={failure} /> : null}
-    </details>
+    </Flex>
+  );
+
+  return (
+    <div className="block" id="environment-panel" tabIndex={-1}>
+      <Collapse
+        activeKey={open ? ["environment"] : []}
+        onChange={(keys) => onOpenChange(Array.isArray(keys) ? keys.includes("environment") : keys === "environment")}
+        items={[{ key: "environment", label: `环境（${environments.length}）`, children: content }]}
+      />
+    </div>
   );
 }

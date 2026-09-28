@@ -13,6 +13,7 @@
  * 而选中它保存会被服务端按“目录不存在”拒绝——界面看起来正常，保存却失败。
  */
 import { useState } from "react";
+import { Button, Collapse, Empty, Input, Space, Tree } from "antd";
 
 import { ApiError, apiDelete, apiSend, projectPath } from "../api/client";
 import type { Folder } from "../api/types";
@@ -89,9 +90,9 @@ export function CaseBrowser({
     <aside className="browser" aria-label="用例目录">
       <div className="browser-head">
         <h2>用例</h2>
-        <button type="button" onClick={() => onCreate(folderId)} disabled={!canEdit}>
+        <Button htmlType="button" type="primary" onClick={() => onCreate(folderId)} disabled={!canEdit}>
           ＋新建用例
-        </button>
+        </Button>
       </div>
       {error ? <ErrorText message={error} /> : null}
 
@@ -99,46 +100,32 @@ export function CaseBrowser({
         <h3>目录</h3>
         {foldersLoading ? <Loading label="正在加载目录…" /> : null}
         {foldersError ? <ErrorText message={foldersError} /> : null}
-        <ul className="folder-list">
-          <li>
-            <button
-              type="button"
-              className={folderId === null ? "active" : undefined}
-              onClick={() => setFolderId(null)}
-            >
-              全部用例
-            </button>
-          </li>
-          {folders.map((folder) => (
-            <li key={folder.id}>
-              <span className="folder-item">
-                <button
-                  type="button"
-                  className={folderId === folder.id ? "active" : undefined}
-                  onClick={() => setFolderId(folder.id)}
-                >
-                  {folder.name}
-                </button>
-                {canEdit ? (
-                  <button type="button" className="link" onClick={() => void archiveFolder(folder.id)}>
-                    归档
-                  </button>
-                ) : null}
-              </span>
-            </li>
-          ))}
-        </ul>
+        <Tree
+          aria-label="用例目录树"
+          selectedKeys={[folderId ?? "__all__"]}
+          onSelect={(keys) => {
+            const key = keys[0];
+            if (key === undefined) return;
+            setFolderId(key === "__all__" ? null : String(key));
+          }}
+          treeData={[
+            { key: "__all__", title: "全部用例" },
+            ...folders.map((folder) => ({
+              key: folder.id,
+              title: <Space className="folder-item" size={4}><span>{folder.name}</span>{canEdit ? <Button htmlType="button" type="link" size="small" aria-label={`归档目录 ${folder.name}`} onClick={(event) => { event.stopPropagation(); void archiveFolder(folder.id); }}>归档</Button> : null}</Space>,
+            })),
+          ]}
+        />
         {canEdit ? (
           // 新建目录是低频操作，收进展开区：常驻的输入框与按钮会把下面的用例列表
           // 挤下去，而列表才是每次都要用的那一个。
-          <details className="folder-create">
-            <summary>＋新建目录</summary>
+          <Collapse className="folder-create" items={[{ key: "new-folder", label: "＋新建目录", children: <>
             <label htmlFor="new-folder">新目录名称</label>
-            <input id="new-folder" value={newFolder} onChange={(event) => setNewFolder(event.target.value)} />
-            <button type="button" onClick={() => void createFolder()}>
+            <Input id="new-folder" value={newFolder} onChange={(event) => setNewFolder(event.target.value)} />
+            <Button htmlType="button" type="primary" onClick={() => void createFolder()}>
               添加目录
-            </button>
-          </details>
+            </Button>
+          </> }]} />
         ) : (
           <Hint>当前角色为只读，不能编辑目录与用例。</Hint>
         )}
@@ -148,12 +135,13 @@ export function CaseBrowser({
         <h3>用例列表</h3>
         {list.loading ? <Loading label="正在加载用例…" /> : null}
         {list.error ? <ErrorText message={list.error.message} /> : null}
-        {list.data && list.data.length === 0 ? <Hint>当前范围内没有用例。</Hint> : null}
+        {list.data && list.data.length === 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前范围内没有用例" /> : null}
         <ul className="case-list">
           {(list.data ?? []).map((item) => (
             <li key={item.id}>
-              <button
-                type="button"
+              <Button
+                htmlType="button"
+                type="text"
                 className={selectedCaseId === item.id ? "active" : undefined}
                 onClick={() => onSelect(item.id)}
               >
@@ -162,7 +150,7 @@ export function CaseBrowser({
                 <span className="caption">
                   {item.latest_version === null ? "未发布" : `已发布 v${item.latest_version}`}
                 </span>
-              </button>
+              </Button>
             </li>
           ))}
         </ul>

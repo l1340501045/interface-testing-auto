@@ -54,6 +54,7 @@ vi.mock("../api/client", async (importOriginal) => {
 });
 
 import { apiGet, apiSend, apiSendWithMeta, projectPath } from "../api/client";
+import { antSelectedValue, selectAntOption } from "../test/antd";
 import { rawToSpec, requestToRaw } from "./requestDraft";
 import { CaseEditor } from "./CaseEditor";
 
@@ -249,11 +250,41 @@ async function renderLoaded() {
   await waitFor(() =>
     expect((screen.getByLabelText("用例名称") as HTMLInputElement).value).toBe("查询订单"),
   );
-  await screen.findByText(/^v1 · 副作用/);
+  // 版本历史迁入默认收起但 forceRender 保活的 Collapse；装配前提是版本请求已真正完成，
+  // 后续操作仍需按真实用户路径显式展开，再在该区域内点击执行按钮。
+  await waitFor(() =>
+    expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, `/cases/${CASE_ID}/versions`), "GET")).toHaveLength(1),
+  );
 }
 
 function callsTo(path: string, method: string): Call[] {
   return calls.filter((call) => call.method === method && call.path === path);
+}
+
+async function versionPanel(): Promise<HTMLElement> {
+  const trigger = Array.from(document.querySelectorAll<HTMLElement>('.ant-collapse-header[role="button"]'))
+    .find((candidate) => candidate.textContent?.trim() === "版本执行与发布记录");
+  if (trigger === undefined) throw new Error("版本执行与发布记录入口未挂载");
+  if (trigger.getAttribute("aria-expanded") !== "true") {
+    fireEvent.click(trigger);
+    await waitFor(() => expect(trigger.getAttribute("aria-expanded")).toBe("true"));
+  }
+  const panel = trigger.closest<HTMLElement>(".ant-collapse-item");
+  if (panel === null) throw new Error("版本执行与发布记录区域未挂载");
+  return panel;
+}
+
+function actionButton(container: ParentNode, label: "保存并执行" | "保存草稿"): HTMLButtonElement {
+  const button = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+    .find((candidate) => candidate.textContent?.trim() === label);
+  if (button === undefined) throw new Error(`“${label}”按钮未挂载`);
+  return button;
+}
+
+function caseHeader(): HTMLElement {
+  const header = document.querySelector(".case-head");
+  if (!(header instanceof HTMLElement)) throw new Error("用例标题操作区未挂载");
+  return header;
 }
 
 /**
@@ -297,7 +328,7 @@ describe("执行固定在内容一致的已发布版本上", () => {
     // 每次执行都会造出一个新版本，管理员按“固定用例版本”签发的用途授权永远对不上
     // 实际执行的那一版，而界面不会有任何异常提示。
     await renderLoaded();
-    fireEvent.click(screen.getByRole("button", { name: "保存并执行" }));
+    fireEvent.click(actionButton(await versionPanel(), "保存并执行"));
 
     await waitFor(() =>
       expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")).toHaveLength(1),
@@ -313,7 +344,7 @@ describe("执行固定在内容一致的已发布版本上", () => {
     // 内容变了就必须固化出新版本再执行，否则会把改过的用例跑在旧版本上。
     draftHash = CHANGED_HASH;
     await renderLoaded();
-    fireEvent.click(screen.getByRole("button", { name: "保存并执行" }));
+    fireEvent.click(actionButton(await versionPanel(), "保存并执行"));
 
     await waitFor(() =>
       expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")).toHaveLength(1),
@@ -330,8 +361,8 @@ describe("执行固定在内容一致的已发布版本上", () => {
     // 内容相同、id 不同的版本，把管理员按“固定用例版本”签发的授权换掉——执行固定到
     // 新版本上，授权却绑在旧版本上，直到执行前才暴露。
     await renderLoaded();
-    fireEvent.change(screen.getByLabelText("所属目录"), { target: { value: FOLDER_A } });
-    fireEvent.click(screen.getByRole("button", { name: "保存并执行" }));
+    await selectAntOption("所属目录", "A 模块");
+    fireEvent.click(actionButton(await versionPanel(), "保存并执行"));
 
     await waitFor(() =>
       expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")).toHaveLength(1),
@@ -352,7 +383,7 @@ describe("执行固定在内容一致的已发布版本上", () => {
     // 与只改目录相对的另一半：请求定义变了，摘要与任何已发布版本都不同，必须发布。
     await renderLoaded();
     fireEvent.change(screen.getByLabelText("路径"), { target: { value: "/orders/42" } });
-    fireEvent.click(screen.getByRole("button", { name: "保存并执行" }));
+    fireEvent.click(actionButton(await versionPanel(), "保存并执行"));
 
     await waitFor(() =>
       expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")).toHaveLength(1),
@@ -368,15 +399,14 @@ describe("执行固定在内容一致的已发布版本上", () => {
     // 保存请求在飞的时候目录选择仍然可用。响应回来时若按服务端回显无条件回填，用户
     // 刚做的那次选择会被跳回去、且不留痕迹；只推进已提交的那一份基线才对。
     await renderLoaded();
-    const folderSelect = () => screen.getByLabelText("所属目录") as HTMLSelectElement;
 
     holdPatch = true;
-    fireEvent.change(folderSelect(), { target: { value: FOLDER_A } });
-    fireEvent.click(screen.getByRole("button", { name: "保存草稿" }));
+    await selectAntOption("所属目录", "A 模块");
+    fireEvent.click(actionButton(caseHeader(), "保存草稿"));
     await waitFor(() => expect(releasePatch).not.toBeNull());
 
     // 请求还没回来，用户改成了另一个目录。
-    fireEvent.change(folderSelect(), { target: { value: FOLDER_B } });
+    await selectAntOption("所属目录", "B 模块");
     await act(async () => {
       releasePatch?.();
     });
@@ -387,7 +417,7 @@ describe("执行固定在内容一致的已发布版本上", () => {
     // 提交并入库的是 A；界面上留着用户后来选的 B，而且这一处仍未保存。
     const patched = callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, `/cases/${CASE_ID}`), "PATCH");
     expect(folderIdOf(patched[0])).toBe(FOLDER_A);
-    expect(folderSelect().value).toBe(FOLDER_B);
+    expect(antSelectedValue("所属目录")).toBe(FOLDER_B);
     expect(screen.getByText("有未保存修改")).toBeTruthy();
   });
 });

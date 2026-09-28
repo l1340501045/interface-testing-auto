@@ -22,7 +22,24 @@ import { ApiError, apiSend } from "../api/client";
 import { toCredentialSet } from "../api/guards";
 import type { Environment } from "../api/types";
 import { LeaveGuardProvider } from "../hooks/leaveGuard";
+import { AppProviders } from "../theme/AppProviders";
 import { CredentialsPanel } from "./CredentialsPanel";
+
+function selectedValue(control: HTMLElement): string {
+  return control.closest<HTMLElement>("[data-selected-value]")?.dataset.selectedValue ?? "";
+}
+
+function selectedLabel(control: HTMLElement): string {
+  return control.closest<HTMLElement>("[data-selected-value]")?.textContent?.trim() ?? "";
+}
+
+async function selectOption(control: HTMLElement, label: string): Promise<void> {
+  fireEvent.mouseDown(control);
+  const matches = await screen.findAllByText(label);
+  const option = matches.at(-1);
+  if (option === undefined) throw new Error(`找不到选项：${label}`);
+  fireEvent.click(option);
+}
 const WS = "11111111-1111-4111-8111-111111111111";
 const PROJECT = "22222222-2222-4222-8222-222222222222";
 const ENV_ID = "33333333-3333-4333-8333-333333333333";
@@ -246,7 +263,7 @@ function panelTree(currentCase: CurrentCase = null) {
 }
 
 function renderPanel(currentCase: CurrentCase = null) {
-  return render(panelTree(currentCase));
+  return render(panelTree(currentCase), { wrapper: AppProviders });
 }
 
 describe("凭证绑定的整份提交", () => {
@@ -270,16 +287,13 @@ describe("凭证绑定的整份提交", () => {
     // 集合读回来后两行都在：没有“只显示本次要改的那一个槽位”的入口。
     await waitFor(() => expect(screen.getAllByLabelText("秘密版本")).toHaveLength(2));
     // 版本列表没到之前选择框是禁用的；等它真的能选，避免在“选项还不存在”时白点一下。
-    await waitFor(() => {
-      const rows = screen.getAllByLabelText("秘密版本") as HTMLSelectElement[];
-      expect(Array.from(rows[0].options).map((option) => option.value)).toContain(TOKEN_V2);
-    });
-    const rows = screen.getAllByLabelText("秘密版本") as HTMLSelectElement[];
+    await waitFor(() => expect(screen.getAllByLabelText("秘密版本")[0].hasAttribute("disabled")).toBe(false));
+    const rows = screen.getAllByLabelText("秘密版本");
     // 第一行显示的就是服务端当前绑定的那一版（第 2 版的 id），不是列表里的第一项。
-    expect(rows[0].value).toBe(TOKEN_V1);
+    expect(selectedValue(rows[0])).toBe(TOKEN_V1);
 
     // 只把第一个槽位轮换到同一秘密的另一个版本；第二行完全没被碰过。
-    fireEvent.change(rows[0], { target: { value: TOKEN_V2 } });
+    await selectOption(rows[0], "第 1 版");
     const save = screen.getByRole("button", { name: "保存整份绑定集合" });
     await waitFor(() => expect(save.hasAttribute("disabled")).toBe(false));
     fireEvent.click(save);
@@ -311,14 +325,15 @@ describe("凭证绑定的整份提交", () => {
     // 声明里还有一个没被绑定的槽位；“添加槽位”只从声明里挑，不允许手写槽位字符串。
     fireEvent.click(screen.getByRole("button", { name: "＋添加槽位" }));
     await waitFor(() => expect(screen.getAllByLabelText("秘密")).toHaveLength(3));
-    const slotSelects = screen.getAllByLabelText("槽位") as HTMLSelectElement[];
-    expect(slotSelects[2].value).toBe("query.access_token");
+    const slotSelects = screen.getAllByLabelText("槽位");
+    expect(selectedValue(slotSelects[2])).toBe("query.access_token");
 
     const secretSelects = screen.getAllByLabelText("秘密");
-    fireEvent.change(secretSelects[2], { target: { value: APP_SECRET } });
+    await selectOption(secretSelects[2], "闭环验收应用凭据（最新第 1 版）");
     await waitFor(() => expect(screen.getAllByLabelText("秘密版本")).toHaveLength(3));
     const versionSelects = screen.getAllByLabelText("秘密版本");
-    fireEvent.change(versionSelects[2], { target: { value: APP_V1 } });
+    await waitFor(() => expect(versionSelects[2].hasAttribute("disabled")).toBe(false));
+    await selectOption(versionSelects[2], "第 1 版");
 
     const save = screen.getByRole("button", { name: "保存整份绑定集合" });
     await waitFor(() => expect(save.hasAttribute("disabled")).toBe(false));
@@ -357,6 +372,28 @@ describe("凭证绑定的整份提交", () => {
     expect(Object.keys(parsed.slots[0]).sort()).toEqual(
       ["auth_slot", "secret_id", "secret_name", "secret_version", "secret_version_id"].sort(),
     );
+  });
+
+  it("可见版本标签关联各自行的真实选择器，点击后焦点进入对应控件", async () => {
+    apiSendMock.mockImplementation(
+      router(
+        baseHandlers({
+          [`GET ${url(`/credentials/profiles/${PROFILE_ID}/set`)}`]: credentialSet(4),
+        }),
+      ),
+    );
+    renderPanel();
+
+    await waitFor(() => expect(screen.getAllByLabelText("秘密版本")).toHaveLength(2));
+    const selects = screen.getAllByLabelText("秘密版本");
+    await waitFor(() => expect(selects[0].hasAttribute("disabled")).toBe(false));
+    const labels = [...document.querySelectorAll<HTMLLabelElement>('label[for^="binding-version-"]')];
+    expect(labels).toHaveLength(2);
+    expect(labels[0].htmlFor).toBe(selects[0].id);
+
+    act(() => labels[0].click());
+    expect(document.activeElement).toBe(selects[0]);
+    expect(document.activeElement).not.toBe(selects[1]);
   });
 
   it("epoch 已被别人推进时按冲突拒绝，不覆盖别人的集合", async () => {
@@ -463,15 +500,16 @@ describe("授权只通过选择器与表单完成", () => {
     );
     renderPanel({ caseId: CASE_ID, versionId: VERSION_3 });
 
-    const subject = (await screen.findByLabelText("被授权主体（当前工作空间成员）")) as HTMLSelectElement;
-    await waitFor(() => expect(subject.value).toBe(USER_ID));
+    const subject = await screen.findByLabelText("被授权主体（当前工作空间成员）");
+    await waitFor(() => expect(selectedValue(subject)).toBe(USER_ID));
     // 选项是中文姓名，不是 id：用户不需要（也不能）手抄 UUID。
-    const labels = Array.from(subject.options).map((option) => option.textContent ?? "");
-    expect(labels.some((label) => label.includes("演示账号"))).toBe(true);
-    expect(labels.some((label) => label.includes("另一位同事"))).toBe(true);
-    expect(labels.some((label) => label.includes(OTHER_USER_ID))).toBe(false);
+    fireEvent.mouseDown(subject);
+    expect((await screen.findAllByText(/演示账号/)).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText(/另一位同事/)).length).toBeGreaterThan(0);
+    expect(screen.queryByRole("option", { name: new RegExp(OTHER_USER_ID) })).toBeNull();
+    fireEvent.keyDown(subject, { key: "Escape" });
 
-    fireEvent.change(screen.getByLabelText("身份配置"), { target: { value: PROFILE_ID } });
+    await selectOption(screen.getByLabelText("身份配置"), "闭环验收身份（本地测试环境）");
     fireEvent.click(await screen.findByLabelText("header.Authorization"));
     fireEvent.click(screen.getByRole("button", { name: "签发用途授权" }));
 
@@ -489,18 +527,16 @@ describe("授权只通过选择器与表单完成", () => {
     apiSendMock.mockImplementation(router(grantHandlers()));
     renderPanel({ caseId: CASE_ID, versionId: VERSION_3 });
 
-    const caseSelect = (await screen.findByLabelText("用例")) as HTMLSelectElement;
-    await waitFor(() => expect(caseSelect.value).toBe(CASE_ID));
-    expect(Array.from(caseSelect.options).some((option) => option.textContent === "闭环验收-认证GET（当前打开的用例）")).toBe(
-      true,
-    );
+    const caseSelect = await screen.findByLabelText("用例");
+    await waitFor(() => expect(selectedValue(caseSelect)).toBe(CASE_ID));
+    expect(selectedLabel(caseSelect)).toBe("闭环验收-认证GET（当前打开的用例）");
 
-    const versionSelect = (await screen.findByLabelText("已发布版本")) as HTMLSelectElement;
+    const versionSelect = await screen.findByLabelText("已发布版本");
     // 预选的是编辑器当前打开的那一版，不是列表里的第一项。
-    await waitFor(() => expect(versionSelect.value).toBe(VERSION_3));
-    const versionLabels = Array.from(versionSelect.options).map((option) => option.textContent ?? "");
-    expect(versionLabels.some((label) => label === "闭环验收-认证GET · 第 3 版 · 2026-09-14T08:30:00+00:00")).toBe(true);
-    expect(versionLabels.some((label) => label === "闭环验收-认证GET · 第 2 版 · 2026-09-13T08:30:00+00:00")).toBe(true);
+    await waitFor(() => expect(selectedValue(versionSelect)).toBe(VERSION_3));
+    expect(selectedLabel(versionSelect)).toBe("闭环验收-认证GET · 第 3 版 · 2026-09-14T08:30:00+00:00");
+    fireEvent.mouseDown(versionSelect);
+    expect((await screen.findAllByText("闭环验收-认证GET · 第 2 版 · 2026-09-13T08:30:00+00:00")).length).toBeGreaterThan(0);
   });
 
   /**
@@ -533,13 +569,13 @@ describe("授权只通过选择器与表单完成", () => {
 
     // 补读一次后，选择器里就有这条用例了。
     await waitFor(() => expect(caseListReads).toBe(2));
-    const caseSelect = (await screen.findByLabelText("用例")) as HTMLSelectElement;
-    await waitFor(() => expect(caseSelect.value).toBe(CASE_ID));
-    expect(caseSelect.options[caseSelect.selectedIndex].textContent).toBe("闭环验收-认证GET（当前打开的用例）");
+    const caseSelect = await screen.findByLabelText("用例");
+    await waitFor(() => expect(selectedValue(caseSelect)).toBe(CASE_ID));
+    expect(selectedLabel(caseSelect)).toBe("闭环验收-认证GET（当前打开的用例）");
 
-    const versionSelect = (await screen.findByLabelText("已发布版本")) as HTMLSelectElement;
-    await waitFor(() => expect(versionSelect.value).toBe(VERSION_3));
-    expect(versionSelect.options[versionSelect.selectedIndex].textContent).toBe(
+    const versionSelect = await screen.findByLabelText("已发布版本");
+    await waitFor(() => expect(selectedValue(versionSelect)).toBe(VERSION_3));
+    expect(selectedLabel(versionSelect)).toBe(
       "闭环验收-认证GET · 第 3 版 · 2026-09-14T08:30:00+00:00",
     );
   });
@@ -565,14 +601,14 @@ describe("授权只通过选择器与表单完成", () => {
 
     renderPanel({ caseId: CASE_ID, versionId: VERSION_3 });
 
-    const caseSelect = (await screen.findByLabelText("用例")) as HTMLSelectElement;
-    await waitFor(() => expect(caseSelect.value).toBe(CASE_ID));
+    const caseSelect = await screen.findByLabelText("用例");
+    await waitFor(() => expect(selectedValue(caseSelect)).toBe(CASE_ID));
     // 屏幕上显示的就是实际会签发的那条用例：不能显示“请选择用例”却把 id 提交出去。
-    expect(caseSelect.options[caseSelect.selectedIndex].textContent).toBe("当前打开的用例 13131313…（尚未读入列表）");
+    expect(selectedLabel(caseSelect)).toBe("当前打开的用例 13131313…（尚未读入列表）");
 
-    const versionSelect = (await screen.findByLabelText("已发布版本")) as HTMLSelectElement;
-    await waitFor(() => expect(versionSelect.value).toBe(VERSION_3));
-    const label = versionSelect.options[versionSelect.selectedIndex].textContent ?? "";
+    const versionSelect = await screen.findByLabelText("已发布版本");
+    await waitFor(() => expect(selectedValue(versionSelect)).toBe(VERSION_3));
+    const label = selectedLabel(versionSelect);
     expect(label).toBe("当前打开的用例 13131313… · 第 3 版 · 2026-09-14T08:30:00+00:00");
     expect(label).not.toMatch(/^用例 · /);
 
@@ -647,24 +683,27 @@ describe("发布与绑定保存后的刷新联动", () => {
     );
 
     const view = renderPanel({ caseId: CASE_ID, versionId: VERSION_3 });
-    const versionSelect = (await screen.findByLabelText("已发布版本")) as HTMLSelectElement;
-    await waitFor(() => expect(versionSelect.value).toBe(VERSION_3));
+    const versionSelect = await screen.findByLabelText("已发布版本");
+    await waitFor(() => expect(selectedValue(versionSelect)).toBe(VERSION_3));
     // 此刻下拉里确实还没有第 4 版——补读不是“本来就有”。
-    expect(Array.from(versionSelect.options).some((option) => option.value === VERSION_4)).toBe(false);
+    fireEvent.mouseDown(versionSelect);
+    await screen.findByRole("option", { name: /第 3 版/ });
+    expect(screen.queryByRole("option", { name: /第 4 版/ })).toBeNull();
+    fireEvent.keyDown(versionSelect, { key: "Escape" });
 
     // 编辑器发布成功，把“当前这一版”换成了刚发布的第 4 版。
     view.rerender(panelTree({ caseId: CASE_ID, versionId: VERSION_4 }));
 
     await waitFor(() => expect(versionReads).toBe(2));
     // 预选到刚发布的这一版，并且选项是按“用例名 / 第几版 / 时间”显示的。
-    await waitFor(() => expect(versionSelect.value).toBe(VERSION_4));
-    expect(versionSelect.options[versionSelect.selectedIndex].textContent).toBe(
+    await waitFor(() => expect(selectedValue(versionSelect)).toBe(VERSION_4));
+    expect(selectedLabel(versionSelect)).toBe(
       "闭环验收-认证GET（改名） · 第 4 版 · 2026-09-14T09:30:00+00:00",
     );
     // 用例下拉里也是同一个新名字：左侧列表改了名，这里不能继续显示旧名字。
-    const caseSelect = (await screen.findByLabelText("用例")) as HTMLSelectElement;
-    await waitFor(() => expect(caseSelect.value).toBe(CASE_ID));
-    expect(caseSelect.options[caseSelect.selectedIndex].textContent).toBe("闭环验收-认证GET（改名）（当前打开的用例）");
+    const caseSelect = await screen.findByLabelText("用例");
+    await waitFor(() => expect(selectedValue(caseSelect)).toBe(CASE_ID));
+    expect(selectedLabel(caseSelect)).toBe("闭环验收-认证GET（改名）（当前打开的用例）");
     // 补读只发生一次：这一版已经在列表里，不会反复重读。
     await act(async () => {});
     expect(versionReads).toBe(2);
@@ -712,12 +751,9 @@ describe("发布与绑定保存后的刷新联动", () => {
     // 保存前：身份摘要与集合都停在 epoch 4。
     await waitFor(() => expect(screen.getByText(/· epoch 4/)).toBeTruthy());
     await waitFor(() => expect(screen.getAllByLabelText("秘密版本")).toHaveLength(2));
-    await waitFor(() => {
-      const rows = screen.getAllByLabelText("秘密版本") as HTMLSelectElement[];
-      expect(Array.from(rows[0].options).map((option) => option.value)).toContain(TOKEN_V2);
-    });
-    const rows = screen.getAllByLabelText("秘密版本") as HTMLSelectElement[];
-    fireEvent.change(rows[0], { target: { value: TOKEN_V2 } });
+    await waitFor(() => expect(screen.getAllByLabelText("秘密版本")[0].hasAttribute("disabled")).toBe(false));
+    const rows = screen.getAllByLabelText("秘密版本");
+    await selectOption(rows[0], "第 1 版");
     const save = screen.getByRole("button", { name: "保存整份绑定集合" });
     await waitFor(() => expect(save.hasAttribute("disabled")).toBe(false));
     fireEvent.click(save);
@@ -788,13 +824,13 @@ describe("重复槽位不能静默覆盖", () => {
     renderPanel();
     await waitFor(() => expect(screen.getAllByLabelText("秘密版本")).toHaveLength(2));
 
-    const slotSelects = screen.getAllByLabelText("槽位") as HTMLSelectElement[];
-    const second = Array.from(slotSelects[1].options);
-    const taken = second.find((option) => option.value === "header.Authorization");
-    expect(taken?.disabled).toBe(true);
-    expect(taken?.textContent).toBe("header.Authorization（已被另一行使用）");
+    const slotSelects = screen.getAllByLabelText("槽位");
+    fireEvent.mouseDown(slotSelects[1]);
+    const taken = (await screen.findAllByRole("option", { name: "header.Authorization（已被另一行使用）" })).at(-1);
+    expect(taken?.getAttribute("aria-disabled")).toBe("true");
     // 没被占用的槽位不受影响：正常加槽位照旧。
-    expect(second.find((option) => option.value === "query.access_token")?.disabled).toBe(false);
+    const available = (await screen.findAllByRole("option", { name: "query.access_token" })).at(-1);
+    expect(available?.getAttribute("aria-disabled")).not.toBe("true");
   });
 
   it("带重复槽位提交时本地拒绝，不发写请求，也不报告保存了几行", async () => {
@@ -811,19 +847,17 @@ describe("重复槽位不能静默覆盖", () => {
     // 这时候改值会落成空串（行上是“每一行都要选好槽位与秘密版本”而不是重复槽位），
     // 那样测的就不是本轮要盯的拒绝了。
     await waitFor(() => {
-      const selects = screen.getAllByLabelText("秘密版本") as HTMLSelectElement[];
+      const selects = screen.getAllByLabelText("秘密版本");
       expect(selects).toHaveLength(2);
-      expect(Array.from(selects[1].options).map((option) => option.value)).toContain(TOKEN_V1);
+      expect(selects[1].hasAttribute("disabled")).toBe(false);
     });
 
     // 重复状态在点保存之前就能看见。
     expect(screen.getByText(/槽位重复：header\.Authorization/)).toBeTruthy();
 
     // 把第二行的版本改成与第一行相同：这是一次真实的“用户动过表单”的提交。
-    fireEvent.change(screen.getAllByLabelText("秘密版本")[1], { target: { value: TOKEN_V1 } });
-    await waitFor(() =>
-      expect((screen.getAllByLabelText("秘密版本") as HTMLSelectElement[])[1].value).toBe(TOKEN_V1),
-    );
+    await selectOption(screen.getAllByLabelText("秘密版本")[1], "第 2 版");
+    await waitFor(() => expect(selectedValue(screen.getAllByLabelText("秘密版本")[1])).toBe(TOKEN_V1));
 
     const save = screen.getByRole("button", { name: "保存整份绑定集合" });
     await waitFor(() => expect(save.hasAttribute("disabled")).toBe(false));

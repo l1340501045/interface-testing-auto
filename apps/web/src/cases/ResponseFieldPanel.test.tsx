@@ -174,12 +174,18 @@ describe("不在样例树里的字段：已保存字面量是类型证据", () =
       ...makeAssertion("a-equals", "equals", 0),
       parameters: { expected: { type: "boolean", value: true } },
     };
-    render(<Harness initial={[assertion]} />);
+    render(<RecordingHarness initial={[assertion]} />);
 
     const heading = screen.getByText("响应正文 data.id");
     const block = heading.closest(".response-field") as HTMLElement;
-    const select = within(block).getByLabelText("字段类型") as HTMLSelectElement;
-    expect(select.value).toBe("boolean");
+    const select = within(block).getByRole("combobox", { name: "字段类型" });
+    const selectRoot = select.closest<HTMLElement>(".ant-select");
+    expect(selectRoot?.textContent?.trim()).toBe("boolean");
+
+    const row = within(block).getAllByRole("listitem")[0];
+    fireEvent.click(within(row).getByRole("button", { name: "修改" }));
+    fireEvent.click(screen.getByRole("button", { name: "保存这条断言" }));
+    expect(latest[0].parameters).toEqual({ expected: { type: "boolean", value: true } });
   });
 
   it("修改既有断言后原样提交：数字字面量不会变成文本字面量", () => {

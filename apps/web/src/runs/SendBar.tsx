@@ -15,6 +15,7 @@
  * 明确标注，不冒充最终目标。
  */
 import type { ReactNode } from "react";
+import { Alert, Button, Checkbox, Collapse, Descriptions, Input, Select, Space } from "antd";
 
 import type { DebugPreflight, Environment, PreflightIssue } from "../api/types";
 import type { AuthorizationView } from "./useDebugRun";
@@ -193,22 +194,19 @@ export function SendBar({
       <div className="send-line">
         <span className="param method-cell">
           <label htmlFor={methodId}>方法</label>
-          <select
+          <Select
             id={methodId}
             value={request.method}
             disabled={readOnly}
-            onChange={(event) => onPatch({ method: event.target.value })}
-          >
-            {methods.map((method) => (
-              <option key={method} value={method}>
-                {method}
-              </option>
-            ))}
-          </select>
+            aria-label="方法"
+            data-selected-value={request.method}
+            onChange={(value: string) => onPatch({ method: value })}
+            options={methods.map((method) => ({ value: method, label: method }))}
+          />
         </span>
         <span className="param grow">
           <label htmlFor={pathId}>路径</label>
-          <input
+          <Input
             id={pathId}
             value={request.path}
             readOnly={readOnly}
@@ -218,19 +216,15 @@ export function SendBar({
         </span>
         <span className="param">
           <label htmlFor={environmentId}>执行环境</label>
-          <select
+          <Select
             id={environmentId}
             value={selectedEnvironmentId ?? ""}
             disabled={readOnly}
-            onChange={(event) => onSelectEnvironment(event.target.value)}
-          >
-            <option value="">请选择环境</option>
-            {environments.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.name}（{item.kind === "production" ? "生产" : "测试"}）
-              </option>
-            ))}
-          </select>
+            aria-label="执行环境"
+            data-selected-value={selectedEnvironmentId ?? ""}
+            onChange={(value: string) => onSelectEnvironment(value)}
+            options={[{ value: "", label: "请选择环境" }, ...environments.map((item) => ({ value: item.id, label: `${item.name}（${item.kind === "production" ? "生产" : "测试"}）` }))]}
+          />
         </span>
         <SendAction
           stage={stage}
@@ -265,7 +259,7 @@ export function SendBar({
       ) : null}
 
       {contentIssues.length > 0 && !awaitingAuthorization ? (
-        <ul className="issue-list">
+        <Alert type="error" showIcon title="当前请求暂时不能发送" description={<ul className="issue-list">
           {contentIssues.map((issue) => (
             <li key={issue.code}>
               <span>{issue.message}</span>
@@ -274,15 +268,15 @@ export function SendBar({
                   环境类问题给**真能点的下一步**：只写一句“建议：前往环境设置”，用户还得自己
                   去侧栏里找那一段。按钮复用外壳已有的展开入口，不新建第二套管理界面。
                 */
-                <button type="button" className="link" onClick={openEnvironment}>
+                <Button htmlType="button" type="link" onClick={openEnvironment}>
                   {actionLabel(issue.action)}
-                </button>
+                </Button>
               ) : (
                 <span className="caption">建议：{actionLabel(issue.action)}</span>
               )}
             </li>
           ))}
-        </ul>
+        </ul>} />
       ) : null}
 
       {authorizationIssues.length > 0 && !awaitingAuthorization ? (
@@ -307,9 +301,9 @@ export function SendBar({
       {/* 工具与管理入口同排：管理入口留在地址行里可及，但不为它单独占一整行。 */}
       <div className="toolbar-row">
         {tools}
-        <button type="button" className="link" onClick={onOpenAdmin}>
+        <Button htmlType="button" type="link" onClick={onOpenAdmin}>
           环境与凭证管理
-        </button>
+        </Button>
       </div>
     </div>
   );
@@ -348,34 +342,35 @@ function SendAction({
   const busy = stage !== "idle";
   return (
     <>
-      <button
-        type="button"
-        className="primary"
+      <Button
+        htmlType="button"
+        type="primary"
+        aria-label={stage === "running" ? "运行中" : "发送"}
         onClick={onSend}
         disabled={readOnly || !hasEnvironment || busy}
         title={busy ? "上一次发送尚未结束；同一份内容不会重复提交。" : undefined}
       >
         {stage === "running" ? "运行中" : "发送"}
-      </button>
+      </Button>
       {stage === "pending" ? (
-        <button type="button" className="danger" onClick={onStopWaiting}>
+        <Button htmlType="button" danger onClick={onStopWaiting}>
           停止等待
-        </button>
+        </Button>
       ) : null}
       {stage === "running" && !paused ? (
-        <button type="button" className="danger" onClick={onStopWaiting}>
+        <Button htmlType="button" danger onClick={onStopWaiting}>
           停止等待
-        </button>
+        </Button>
       ) : null}
       {stage === "running" && paused ? (
-        <button type="button" onClick={onResumeWaiting}>
+        <Button htmlType="button" onClick={onResumeWaiting}>
           恢复等待
-        </button>
+        </Button>
       ) : null}
       {stage === "acceptance_unknown" ? (
-        <button type="button" className="primary" onClick={onRetryAcceptance}>
+        <Button htmlType="button" type="primary" onClick={onRetryAcceptance}>
           确认受理结果
-        </button>
+        </Button>
       ) : null}
     </>
   );
@@ -404,39 +399,36 @@ function AuthorizationPrompt({
   return (
     <section className="auth-prompt" role="region" aria-label="本次授权确认">
       <h3>本次授权确认</h3>
-      <ul className="caption">
-        <li>
-          请求：<code>{authorization.method} {authorization.path}</code>
-        </li>
-        <li>环境：{authorization.environmentLabel}</li>
-        <li>身份：当前环境登录态（按该环境配置的身份注入，不在此另选）</li>
-        <li>被授权人：当前登录账号本人</li>
-        <li>有效期：{authorization.ttlMinutes} 分钟；授权不等于保存或发布用例</li>
-      </ul>
+      <Descriptions size="small" column={1} items={[
+        { key: "request", label: "请求", children: <code>{authorization.method} {authorization.path}</code> },
+        { key: "environment", label: "环境", children: authorization.environmentLabel },
+        { key: "identity", label: "身份", children: "当前环境登录态（按该环境配置的身份注入，不在此另选）" },
+        { key: "principal", label: "被授权人", children: "当前登录账号本人" },
+        { key: "ttl", label: "有效期", children: `${authorization.ttlMinutes} 分钟；授权不等于保存或发布用例` },
+      ]} />
       {/*
         内部坐标收在详细信息里：用户需要判断的是“这次授的是什么”，不是一串 UUID。
         但坐标也不能省——需要核对身份的管理员得能看到授权到底绑定在哪一份身份上。
       */}
-      <details>
-        <summary>详细信息</summary>
+      <Collapse items={[{ key: "details", label: "详细信息", forceRender: true, children:
         <ul className="caption">
           <li>环境 ID：{authorization.environmentId}</li>
           <li>身份 ID：{authorization.profileId ?? "（服务端未返回可授权的身份）"}</li>
           <li>被授权人 ID：{authorization.principalId}</li>
         </ul>
-      </details>
+      }]} />
       <p className="caption">
         确认后由服务端按<strong>这份冻结内容</strong>计算摘要并签发一次性授权，随后用同一份
         内容发送；期间继续编辑不会改变已提交的内容。
       </p>
-      <div className="actions">
-        <button type="button" className="primary" onClick={onSubmit}>
+      <Space className="actions">
+        <Button htmlType="button" type="primary" onClick={onSubmit}>
           授权并发送
-        </button>
-        <button type="button" onClick={onCancel}>
+        </Button>
+        <Button htmlType="button" aria-label="取消" onClick={onCancel}>
           取消
-        </button>
-      </div>
+        </Button>
+      </Space>
     </section>
   );
 }
@@ -466,15 +458,14 @@ export function AuthTab({
         身份按环境继承：一次请求使用当前环境的登录态，不能在这里为单次请求另选身份。
       </p>
 
-      <label className="checkbox-row">
-        <input
-          type="checkbox"
+      <Checkbox
+          className="checkbox-row"
           checked={authRequired}
           disabled={readOnly}
           onChange={(event) => onToggleRequired(event.target.checked)}
-        />
+      >
         必须使用环境登录态（关闭时“跟随环境”：环境配了可用身份就注入，没有就按公开请求发送）
-      </label>
+      </Checkbox>
       {authRequired ? (
         <Hint>
           这份请求已标记为必须认证。没有可用身份时发送会被拒绝，不会退回匿名发送；
@@ -509,9 +500,9 @@ export function AuthTab({
       )}
 
       <div className="actions">
-        <button type="button" onClick={onOpenAdmin}>
+        <Button htmlType="button" onClick={onOpenAdmin}>
           打开凭证管理
-        </button>
+        </Button>
       </div>
     </div>
   );

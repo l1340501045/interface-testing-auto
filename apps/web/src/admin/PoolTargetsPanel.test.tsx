@@ -21,6 +21,7 @@ vi.mock("../api/client", async (importOriginal) => {
 import { apiSend } from "../api/client";
 import type { RunnerPool } from "../api/types";
 import { LeaveGuardProvider, useLeaveAggregate } from "../hooks/leaveGuard";
+import { AppProviders } from "../theme/AppProviders";
 import { PoolTargetsPanel } from "./PoolTargetsPanel";
 
 const WS = "11111111-1111-4111-8111-111111111111";
@@ -85,6 +86,7 @@ function renderPanel(stored: RunnerPool, saved: RunnerPool) {
       <LeaveProbe />
       <PoolTargetsPanel workspaceId={WS} projectId={PROJECT} canAdmin />
     </LeaveGuardProvider>,
+    { wrapper: AppProviders },
   );
 }
 

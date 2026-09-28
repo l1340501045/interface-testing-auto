@@ -204,16 +204,56 @@ async function renderLoaded(
   extra: { configEpoch?: number; getConfigEpoch?: () => number | null } = {},
 ) {
   const view = renderEditor(projectRole, extra);
-  await screen.findByLabelText("用例名称");
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 450));
-  });
-  await act(async () => {});
+  await waitFor(() => expect(
+    (screen.getByLabelText("用例名称") as HTMLInputElement).value,
+  ).toBe("查询订单"));
+  if (projectRole !== "viewer") {
+    await waitFor(() => expect(
+      document.querySelector('button[aria-label="发送"]') instanceof HTMLButtonElement,
+    ).toBe(true));
+  }
   return view;
 }
 
 function responseRegion(): HTMLElement {
   return screen.getByRole("region", { name: "响应" });
+}
+
+async function versionHistory(): Promise<HTMLElement> {
+  const trigger = Array.from(document.querySelectorAll<HTMLElement>('.ant-collapse-header[role="button"]'))
+    .find((candidate) => candidate.textContent?.trim() === "版本执行与发布记录");
+  if (trigger === undefined) throw new Error("版本执行与发布记录入口未挂载");
+  if (trigger.getAttribute("aria-expanded") !== "true") {
+    fireEvent.click(trigger);
+    await waitFor(() => expect(trigger.getAttribute("aria-expanded")).toBe("true"));
+  }
+  const item = trigger.closest<HTMLElement>(".ant-collapse-item");
+  if (item === null) throw new Error("版本执行与发布记录内容未挂载");
+  return item;
+}
+
+async function currentSessionRecords(): Promise<HTMLElement> {
+  const trigger = Array.from(document.querySelectorAll<HTMLElement>('.ant-collapse-header[role="button"]'))
+    .find((candidate) => candidate.textContent?.trim().startsWith("本次记录"));
+  if (trigger === undefined) throw new Error("本次记录入口未挂载");
+  if (trigger.getAttribute("aria-expanded") !== "true") {
+    fireEvent.click(trigger);
+    await waitFor(() => expect(trigger.getAttribute("aria-expanded")).toBe("true"));
+  }
+  const item = trigger.closest<HTMLElement>(".ant-collapse-item");
+  if (item === null) throw new Error("本次记录内容未挂载");
+  return item;
+}
+
+function buttonByText(container: ParentNode, label: string): HTMLButtonElement {
+  if (label === "发送") {
+    const send = container.querySelector('button[aria-label="发送"]');
+    if (send instanceof HTMLButtonElement) return send;
+  }
+  const button = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+    .find((candidate) => candidate.textContent?.trim() === label);
+  if (button === undefined) throw new Error(`“${label}”按钮未挂载`);
+  return button;
 }
 
 beforeEach(() => {
@@ -241,17 +281,16 @@ describe("R3-12 真实 RunPanel 的显式选择", () => {
     await renderLoaded();
 
     // 本次调试：受理后正文显示 200。
-    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    fireEvent.click(buttonByText(document, "发送"));
     await waitFor(() => expect(responseRegion().textContent).toContain("200"));
     expect(responseRegion().textContent).toContain(DEBUG_RUN.slice(0, 8));
 
     // 项目／环境历史里的那条版本运行（真实 RunPanel 渲染的列表）。
-    const history = screen.getByRole("heading", { name: "已发布版本执行与项目历史" }).closest(".block");
-    expect(history).not.toBeNull();
+    const history = await versionHistory();
     await waitFor(() =>
       expect(within(history as HTMLElement).getByText(VERSION_RUN.slice(0, 8))).toBeTruthy(),
     );
-    fireEvent.click(within(history as HTMLElement).getByRole("button", { name: "查看报告" }));
+    fireEvent.click(buttonByText(history, "查看报告"));
     await waitFor(() =>
       expect(responseRegion().textContent).toContain(VERSION_RUN.slice(0, 8)),
     );
@@ -261,7 +300,7 @@ describe("R3-12 真实 RunPanel 的显式选择", () => {
     expect(responseRegion().textContent).not.toContain("已结束");
 
     // 回到本次调试记录：来源与正文一起切回来。
-    fireEvent.click(screen.getByRole("button", { name: DEBUG_RUN.slice(0, 8) }));
+    fireEvent.click(buttonByText(await currentSessionRecords(), DEBUG_RUN.slice(0, 8)));
     await waitFor(() => expect(responseRegion().textContent).toContain("200"));
     expect(responseRegion().textContent).toContain(DEBUG_RUN.slice(0, 8));
     expect(responseRegion().textContent).not.toContain("排队中");
@@ -269,12 +308,12 @@ describe("R3-12 真实 RunPanel 的显式选择", () => {
 
   it("后台到达的版本报告不抢走当前选择", async () => {
     await renderLoaded();
-    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    fireEvent.click(buttonByText(document, "发送"));
     await waitFor(() => expect(responseRegion().textContent).toContain("200"));
 
     // 历史列表刷新（后台读取）不改变来源：报告到达只更新缓存。
-    const history = screen.getByRole("heading", { name: "已发布版本执行与项目历史" }).closest(".block");
-    fireEvent.click(within(history as HTMLElement).getByRole("button", { name: "刷新运行列表" }));
+    const history = await versionHistory();
+    fireEvent.click(buttonByText(history, "刷新运行列表"));
     await act(async () => {});
 
     expect(responseRegion().textContent).toContain(DEBUG_RUN.slice(0, 8));
@@ -289,8 +328,8 @@ describe("R5 作用域失效时不发起版本运行", () => {
     // 匹配上当前。两种“没有值”必须分开——getter 不存在才回退。
     await renderLoaded("admin", { configEpoch: 5, getConfigEpoch: () => null });
 
-    const history = screen.getByRole("heading", { name: "已发布版本执行与项目历史" }).closest(".block");
-    fireEvent.click(within(history as HTMLElement).getByRole("button", { name: "保存并执行" }));
+    const history = await versionHistory();
+    fireEvent.click(buttonByText(history, "保存并执行"));
     await act(async () => {});
 
     expect(
@@ -302,8 +341,8 @@ describe("R5 作用域失效时不发起版本运行", () => {
   it("getter 不存在时仍按 props 的世代提交：回退分支没有被误删", async () => {
     await renderLoaded("admin", { configEpoch: 5 });
 
-    const history = screen.getByRole("heading", { name: "已发布版本执行与项目历史" }).closest(".block");
-    fireEvent.click(within(history as HTMLElement).getByRole("button", { name: "保存并执行" }));
+    const history = await versionHistory();
+    fireEvent.click(buttonByText(history, "保存并执行"));
     await waitFor(() =>
       expect(
         calls.filter(
@@ -319,13 +358,13 @@ describe("R4 F10 查看者得不到取消入口", () => {
     // 权限守卫要在界面这一层就把动作去掉，而不是让用户点下去收一个 403——那是把一个
     // 权限事实伪装成一次失败操作。
     await renderLoaded("viewer");
-    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    fireEvent.click(buttonByText(document, "发送"));
     // 查看者的发送入口本就不可用（只读），这里直接选历史里那条未结束的运行。
-    const history = screen.getByRole("heading", { name: "已发布版本执行与项目历史" }).closest(".block");
+    const history = await versionHistory();
     await waitFor(() =>
       expect(within(history as HTMLElement).getByText(VERSION_RUN.slice(0, 8))).toBeTruthy(),
     );
-    fireEvent.click(within(history as HTMLElement).getByRole("button", { name: "查看报告" }));
+    fireEvent.click(buttonByText(history, "查看报告"));
     await waitFor(() =>
       expect(responseRegion().textContent).toContain(VERSION_RUN.slice(0, 8)),
     );
@@ -340,11 +379,11 @@ describe("R4 F10 查看者得不到取消入口", () => {
 
   it("编辑者仍能取消：不因权限守卫回退", async () => {
     await renderLoaded("editor");
-    const history = screen.getByRole("heading", { name: "已发布版本执行与项目历史" }).closest(".block");
+    const history = await versionHistory();
     await waitFor(() =>
       expect(within(history as HTMLElement).getByText(VERSION_RUN.slice(0, 8))).toBeTruthy(),
     );
-    fireEvent.click(within(history as HTMLElement).getByRole("button", { name: "查看报告" }));
+    fireEvent.click(buttonByText(history, "查看报告"));
     await waitFor(() => expect(responseRegion().textContent).toContain(VERSION_RUN.slice(0, 8)));
 
     fireEvent.click(within(responseRegion()).getByRole("button", { name: /取消/ }));
@@ -365,17 +404,17 @@ describe("R3-13 取消目标来自明确的 run_id", () => {
     // r1 已经缓存了一份通过的 201。随后选中历史里的 r2，而 r2 的报告读取失败：
     // 取消入口必须按**已知 run_id** 提供，不能因为报告没读回来就消失，也不能变成取消 r1。
     await renderLoaded();
-    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    fireEvent.click(buttonByText(document, "发送"));
     await waitFor(() => expect(responseRegion().textContent).toContain("200"));
     expect(responseRegion().textContent).toContain(DEBUG_RUN.slice(0, 8));
 
     // 历史里的 r2 尚未结束，且它的报告读取失败。
     failReportFor = VERSION_RUN;
-    const history = screen.getByRole("heading", { name: "已发布版本执行与项目历史" }).closest(".block");
+    const history = await versionHistory();
     await waitFor(() =>
       expect(within(history as HTMLElement).getByText(VERSION_RUN.slice(0, 8))).toBeTruthy(),
     );
-    fireEvent.click(within(history as HTMLElement).getByRole("button", { name: "查看报告" }));
+    fireEvent.click(buttonByText(history, "查看报告"));
     await act(async () => {});
 
     // 旧报告（r1 的 200）不得冒充当前选择的正文。

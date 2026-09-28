@@ -11,6 +11,7 @@
  * 都由独立组件／Hook 承担，这里只负责把它们接起来（design 第 5 节的组件边界）。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Button, Collapse, Modal } from "antd";
 
 import { ApiError, apiSend, apiSendWithMeta, projectPath } from "../api/client";
 import { toAssertionTypes, toCaseDetail, toCaseVersion, toCurlPreview } from "../api/guards";
@@ -25,6 +26,7 @@ import type {
   RunReport,
 } from "../api/types";
 import { ErrorText, Hint, Loading, Notice } from "../components/Feedback";
+import { trapModalTabEndpoints } from "../components/modalFocus";
 import { useLeaveReport } from "../hooks/leaveGuard";
 import type { LeaveState } from "../hooks/leaveGuard";
 import { useResource } from "../hooks/useResource";
@@ -302,6 +304,33 @@ export function CaseEditor({
   /** 请求标签；默认停在参数上，首屏即可看到地址、环境与发送。 */
   const [activeTab, setActiveTab] = useState("params");
   const [sendError, setSendError] = useState<string | null>(null);
+  const confirmOwner = `${workspaceId}/${projectId}/${currentUserId ?? ""}/${domIdPrefix ?? caseSummaryId ?? "new"}`;
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  const confirmOwnerRef = useRef(confirmOwner);
+  confirmOwnerRef.current = confirmOwner;
+  const [editorConfirm, setEditorConfirm] = useState<{ attemptId: number; owner: string; message: string } | null>(null);
+  const editorConfirmAttemptRef = useRef(0);
+  const editorConfirmResolverRef = useRef<((accepted: boolean) => void) | null>(null);
+
+  const requestEditorConfirm = useCallback((message: string): Promise<boolean> => {
+    if (!activeRef.current) return Promise.resolve(false);
+    editorConfirmResolverRef.current?.(false);
+    editorConfirmAttemptRef.current += 1;
+    const attemptId = editorConfirmAttemptRef.current;
+    setEditorConfirm({ attemptId, owner: confirmOwnerRef.current, message });
+    return new Promise((resolve) => {
+      editorConfirmResolverRef.current = resolve;
+    });
+  }, []);
+
+  const finishEditorConfirm = useCallback((accepted: boolean) => {
+    if (editorConfirm === null || editorConfirm.attemptId !== editorConfirmAttemptRef.current) return;
+    const resolve = editorConfirmResolverRef.current;
+    editorConfirmResolverRef.current = null;
+    setEditorConfirm(null);
+    resolve?.(accepted && activeRef.current && editorConfirm.owner === confirmOwnerRef.current);
+  }, [editorConfirm]);
 
   /**
    * 只读由**明确的角色**决定，不由“没传角色”推断。
@@ -314,6 +343,16 @@ export function CaseEditor({
   const readOnlyReason = readOnly
     ? "当前项目角色是查看者：可以查看请求、断言与历史报告，但不能新建、保存、授权或发送。"
     : null;
+
+  useEffect(() => {
+    if (editorConfirm === null) return;
+    if (active && !readOnly && editorConfirm.owner === confirmOwner) return;
+    editorConfirmAttemptRef.current += 1;
+    const resolve = editorConfirmResolverRef.current;
+    editorConfirmResolverRef.current = null;
+    setEditorConfirm(null);
+    resolve?.(false);
+  }, [active, confirmOwner, editorConfirm, readOnly]);
 
   /**
    * 编辑实例标识：**挂载时生成一次**，切换用例由外壳按 nonce 重挂载来换值。
@@ -337,7 +376,11 @@ export function CaseEditor({
   const aliveRef = useRef(true);
   useEffect(() => {
     aliveRef.current = true;
-    return () => { aliveRef.current = false; };
+    return () => {
+      aliveRef.current = false;
+      editorConfirmResolverRef.current?.(false);
+      editorConfirmResolverRef.current = null;
+    };
   }, []);
   const debugReadOnly = readOnly;
 
@@ -508,9 +551,7 @@ export function CaseEditor({
     );
   }, [effectiveBaseline, name, request, assertions, folderId]);
 
-  /** v1 只为呈现生成稳定行视图；不写回 state，因此纯读取不 dirty、不改 hash。 */
-  const presentedUpgrade = useMemo(() => {
-    if (request.schema_version === 2) return upgradeRequestV2(request, assertions);
+  const stableUpgradeV1 = useCallback((sourceRequest: RawRequest, sourceAssertions: CaseAssertion[]) => {
     const stableId = (row: RawKeyValue): string => {
       const existing = legacyRowIdsRef.current.get(row);
       if (existing !== undefined) return existing;
@@ -518,11 +559,17 @@ export function CaseEditor({
       legacyRowIdsRef.current.set(row, created);
       return created;
     };
-    return upgradeRequestV2(request, assertions, {
-      query_params: request.query_params.map(stableId),
-      headers: request.headers.map(stableId),
+    return upgradeRequestV2(sourceRequest, sourceAssertions, {
+      query_params: sourceRequest.query_params.map(stableId),
+      headers: sourceRequest.headers.map(stableId),
     });
-  }, [request, assertions]);
+  }, []);
+
+  /** v1 只为呈现生成稳定行视图；不写回 state，因此纯读取不 dirty、不改 hash。 */
+  const presentedUpgrade = useMemo(() => {
+    if (request.schema_version === 2) return upgradeRequestV2(request, assertions);
+    return stableUpgradeV1(request, assertions);
+  }, [request, assertions, stableUpgradeV1]);
   const presentedRequest = request.schema_version === 2 ? request : presentedUpgrade.request;
   const presentedAssertions = request.schema_version === 2 ? assertions : presentedUpgrade.assertions;
 
@@ -1207,6 +1254,7 @@ export function CaseEditor({
       return { error: "请先粘贴 cURL 命令文本。", warnings: [] };
     }
     const startedRevision = editRevisionRef.current;
+    const startedOwner = confirmOwnerRef.current;
     setBusy(true);
     try {
       const preview = await apiSend(
@@ -1223,14 +1271,24 @@ export function CaseEditor({
         };
       }
       if (!aliveRef.current) return { error: "编辑器已关闭，解析结果没有应用。", warnings: preview.warnings };
+      if (!activeRef.current || confirmOwnerRef.current !== startedOwner) {
+        return { error: "解析预览已保留；原编辑器当前不可操作，请返回对应标签后重新应用。", warnings: preview.warnings };
+      }
       const changedWhileParsing = editRevisionRef.current !== startedRevision;
-      const currentRequest = requestRef.current;
-      const currentAssertions = assertionsRef.current;
+      let currentRequest = requestRef.current;
+      let currentAssertions = assertionsRef.current;
       const hasAssertions = currentAssertions.length > 0;
-      if ((changedWhileParsing || currentRequest.schema_version === 2 || hasAssertions) && !window.confirm(
-        `${changedWhileParsing ? "解析期间请求已被修改。" : ""}应用会整份替换请求；原行断言会保留为“字段已删除”，历史位置条件不会自动绑定新行。仍要应用吗？`,
-      )) {
-        return { error: "已保留解析预览，当前请求没有被覆盖。", warnings: preview.warnings };
+      if (changedWhileParsing || currentRequest.schema_version === 2 || hasAssertions) {
+        const confirmationRevision = editRevisionRef.current;
+        const accepted = await requestEditorConfirm(
+          `${changedWhileParsing ? "解析期间请求已被修改。" : ""}应用会整份替换请求；原行断言会保留为“字段已删除”，历史位置条件不会自动绑定新行。仍要应用吗？`,
+        );
+        if (!accepted) return { error: "已保留解析预览，当前请求没有被覆盖。", warnings: preview.warnings };
+        if (!aliveRef.current || !activeRef.current || confirmOwnerRef.current !== startedOwner || editRevisionRef.current !== confirmationRevision) {
+          return { error: "确认期间请求又被修改，请重新解析后再应用。", warnings: preview.warnings };
+        }
+        currentRequest = requestRef.current;
+        currentAssertions = assertionsRef.current;
       }
       let next = requestToRaw(preview.draft);
       let nextAssertions = currentAssertions;
@@ -1268,17 +1326,28 @@ export function CaseEditor({
     setAssertions(next);
   }
 
-  function changeRows(field: "query_params" | "headers", rows: RawKeyValue[]) {
-    const upgraded = request.schema_version === 2
-      ? { request, assertions, migrated: 0, historical: 0 }
-      : presentedUpgrade;
-    if (request.schema_version !== 2 && (upgraded.migrated > 0 || upgraded.historical > 0)) {
-      const accepted = window.confirm(
+  async function changeRows(field: "query_params" | "headers", rows: RawKeyValue[]): Promise<boolean> {
+    const startedOwner = confirmOwnerRef.current;
+    if (!activeRef.current) return false;
+    let currentRequest = requestRef.current;
+    let currentAssertions = assertionsRef.current;
+    let upgraded = currentRequest.schema_version === 2
+      ? { request: currentRequest, assertions: currentAssertions, migrated: 0, historical: 0 }
+      : stableUpgradeV1(currentRequest, currentAssertions);
+    if (currentRequest.schema_version !== 2 && (upgraded.migrated > 0 || upgraded.historical > 0)) {
+      const confirmationRevision = editRevisionRef.current;
+      const accepted = await requestEditorConfirm(
         `首次编辑参数会启用稳定行定位：可迁移 ${upgraded.migrated} 条断言，${upgraded.historical} 条历史位置条件保持原语义。继续吗？`,
       );
-      if (!accepted) return;
+      if (!accepted) return false;
+      if (!aliveRef.current || !activeRef.current || confirmOwnerRef.current !== startedOwner || editRevisionRef.current !== confirmationRevision) {
+        setError("确认期间请求又被修改，请重新执行本次行操作。");
+        return false;
+      }
+      currentRequest = requestRef.current;
+      currentAssertions = assertionsRef.current;
     }
-    const originalRows = request[field];
+    const originalRows = currentRequest[field];
     const upgradedRows = upgraded.request[field];
     const used = new Set<string>();
     const stableRows = rows.map((row, submittedIndex) => {
@@ -1297,11 +1366,12 @@ export function CaseEditor({
     const otherField = field === "query_params" ? "headers" : "query_params";
     if (stableRows.length + upgraded.request[otherField].length > 500) {
       setError("启用新版参数功能后 Query 和 Header 合计最多 500 行；请先删除多余行。");
-      return;
+      return false;
     }
     editRevisionRef.current += 1;
     setAssertions(upgraded.assertions);
     setRequest({ ...upgraded.request, [field]: stableRows });
+    return true;
   }
 
   function changeRowAssertions(next: CaseAssertion[] | ((current: CaseAssertion[]) => CaseAssertion[])) {
@@ -1354,6 +1424,7 @@ export function CaseEditor({
   }
 
   return (
+    <>
     <section className="pane workbench">
       <CaseHeading
         idPrefix={domIdPrefix ? `${domIdPrefix}-case` : "case"}
@@ -1624,7 +1695,7 @@ export function CaseEditor({
         selectedRunId={selection?.runId ?? null}
         onCancel={(runId) => void debug.cancel(runId)}
         canCancel={!readOnly}
-        fieldsTab={
+        fieldsTab={(fieldsActive) => (
           <ResponseFieldPanel
             workspaceId={workspaceId}
             projectId={projectId}
@@ -1637,14 +1708,12 @@ export function CaseEditor({
             onChange={changeAssertions}
             pendingPrefix={leaveKey}
             idPrefix={domIdPrefix ? `${domIdPrefix}-response` : "response"}
+            active={active && fieldsActive}
           />
-        }
+        )}
       />
 
-      <details className="block">
-        <summary>
-          本次记录{debug.records.length > 0 ? `（${debug.records.length}）` : ""}
-        </summary>
+      <Collapse className="block" items={[{ key: "records", forceRender: true, label: `本次记录${debug.records.length > 0 ? `（${debug.records.length}）` : ""}`, children: <>
         <p className="caption">
           只列<strong>本次打开这个编辑器</strong>期间受理的运行。关闭或刷新后，
           {separateHistory
@@ -1657,13 +1726,15 @@ export function CaseEditor({
           <ul className="record-list">
             {debug.records.map((item) => (
               <li key={item.runId}>
-                <button
-                  type="button"
+                <Button
+                  htmlType="button"
+                  type="text"
+                  size="small"
                   className={item.runId === debug.selectedRunId ? "row-active" : undefined}
                   onClick={() => setSelection({ source: "debug", runId: item.runId })}
                 >
                   {item.runId.slice(0, 8)}
-                </button>
+                </Button>
                 <span className="caption">
                   {new Date(item.submittedAt).toLocaleTimeString()} · 环境{" "}
                   {environments.find((env) => env.id === item.environmentId)?.name ??
@@ -1673,7 +1744,7 @@ export function CaseEditor({
             ))}
           </ul>
         )}
-      </details>
+      </> }]} />
 
           </>
         )}
@@ -1685,8 +1756,7 @@ export function CaseEditor({
         ETag 保存、再固定一个已发布版本，与上面的调试发送不是同一条路。保留原有用例
         执行的既有约束（必须有版本、必须先保存）不变。
       */}
-      <details className="block">
-        <summary>版本执行与发布记录</summary>
+      <Collapse className="block" items={[{ key: "versions", forceRender: true, label: "版本执行与发布记录", children: <>
         <RunPanel
           workspaceId={workspaceId}
           projectId={projectId}
@@ -1727,7 +1797,24 @@ export function CaseEditor({
           <Hint>尚未发布任何版本。</Hint>
         )}
         {creating ? <Hint>用例已创建；列表稍后会刷新，可继续编辑或发布。</Hint> : null}
-      </details>
+      </> }]} />
     </section>
+    {editorConfirm !== null && active && editorConfirm.owner === confirmOwner ? (
+    <Modal
+      open
+      title="确认应用更改"
+      destroyOnHidden={false}
+      mask={{ closable: true }}
+      wrapProps={{ onKeyDown: trapModalTabEndpoints }}
+      onCancel={() => finishEditorConfirm(false)}
+      footer={[
+        <Button key="apply" type="primary" htmlType="button" aria-label="继续应用" onClick={() => finishEditorConfirm(true)}>继续应用</Button>,
+        <Button key="cancel" htmlType="button" aria-label="取消" autoFocus onClick={() => finishEditorConfirm(false)}>取消</Button>,
+      ]}
+    >
+      <p>{editorConfirm?.message}</p>
+    </Modal>
+    ) : null}
+    </>
   );
 }

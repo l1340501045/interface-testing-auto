@@ -10,7 +10,8 @@
  *    当前内容／环境对不上时，字段行旁不贴旧的通过，只在“上次响应”里保留原文供继续
  *    配置断言。
  */
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Button, Tabs, Tag } from "antd";
 
 import type { RunReport } from "../api/types";
 import { Hint } from "../components/Feedback";
@@ -112,11 +113,15 @@ export function ResponsePanel({
    * 提供，两边的职责不混在一起。放进标签而不是常驻在面板底下：那块表单很长，会把它上面
    * 的正文、以及它下面的“本次记录”一起推出视野，而多数时候用户只是先看响应。
    */
-  fieldsTab?: ReactNode;
+  fieldsTab?: ReactNode | ((active: boolean) => ReactNode);
 }) {
   const evidence = useMemo(() => responseEvidence(report), [report]);
   /** 响应区自己的标签；空状态下也显示，用户才能看出这里会有哪些内容。 */
   const [tab, setTab] = useState<"body" | "fields" | "headers">("body");
+  const tabsRootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    tabsRootRef.current?.querySelector<HTMLElement>('[role="tablist"]')?.setAttribute("aria-label", "响应");
+  }, []);
 
   return (
     <section className="response-pane" aria-label="响应">
@@ -127,17 +132,17 @@ export function ResponsePanel({
         )}
         {report !== null ? (
           <>
-            <span className="tag">{runStateLabel(report.run)}</span>
-            <span className="tag">{runOutcomeLabel(report.run)}</span>
+            <Tag>{runStateLabel(report.run)}</Tag>
+            <Tag>{runOutcomeLabel(report.run)}</Tag>
             {runReasonLabel(report.run) ? (
-              <span className="tag tag-warn">{runReasonLabel(report.run)}</span>
+              <Tag color="warning">{runReasonLabel(report.run)}</Tag>
             ) : null}
           </>
         ) : null}
         {canCancel && selectedRunId !== null && !(report !== null && isTerminal(report.run)) ? (
-          <button type="button" onClick={() => onCancel(selectedRunId)}>
+          <Button htmlType="button" danger onClick={() => onCancel(selectedRunId)}>
             取消本次执行
-          </button>
+          </Button>
         ) : null}
         {!canCancel && selectedRunId !== null && !(report !== null && isTerminal(report.run)) ? (
           <span className="caption">当前角色只能查看，不能取消运行</span>
@@ -148,25 +153,6 @@ export function ResponsePanel({
         标签常驻：还没有响应时也让用户看到这里会有正文、字段与断言、响应头。
         没有响应时只有一个空态说明，因此不需要像请求区那样限制面板高度。
       */}
-      <div className="tab-bar" role="tablist" aria-label="响应">
-        {RESPONSE_TABS.map((item) => (
-          <button
-            key={item.id}
-            type="button"
-            role="tab"
-            aria-selected={tab === item.id}
-            tabIndex={tab === item.id ? 0 : -1}
-            className={tab === item.id ? "tab tab-active" : "tab"}
-            onClick={() => setTab(item.id)}
-          >
-            {item.label}
-            {item.id === "fields" && report !== null && report.assertions.length > 0 ? (
-              <span className="tab-badge">{report.assertions.length}</span>
-            ) : null}
-          </button>
-        ))}
-      </div>
-
       {selectedRunId === null ? (
         <Hint>还没有本次调试记录。点击地址栏右侧的「发送」即可调试当前编辑内容，无需先保存用例。</Hint>
       ) : null}
@@ -221,9 +207,18 @@ export function ResponsePanel({
         </>
       ) : null}
 
-      <div className="response-tab-body">
-        {tab === "body" ? (
-          <>
+      <div ref={tabsRootRef}>
+      <Tabs
+        aria-label="响应"
+        activeKey={tab}
+        onChange={(value) => setTab(value as "body" | "fields" | "headers")}
+        destroyOnHidden={false}
+        items={[
+          {
+            key: "body",
+            label: "正文",
+            forceRender: true,
+            children: <div className="response-tab-body">
             {report === null ? (
               <Hint>发送后，这里显示服务端返回的真实状态码、耗时与正文。</Hint>
             ) : evidence === null ? (
@@ -241,19 +236,29 @@ export function ResponsePanel({
                 <pre className="evidence">{evidence.body}</pre>
               </>
             )}
-          </>
-        ) : null}
-
-        {tab === "fields" ? (
-          <>
+            </div>,
+          },
+          {
+            key: "fields",
+            label: (
+              <span>
+                字段与断言
+                {report !== null && report.assertions.length > 0 ? <span className="tab-badge">{report.assertions.length}</span> : null}
+              </span>
+            ),
+            forceRender: true,
+            children: <div className="response-tab-body">
             {report === null ? (
               <Hint>发送后，字段树对着**本次真实响应**展开，条件也就近配置在字段旁。</Hint>
             ) : null}
-            {fieldsTab}
-          </>
-        ) : null}
-
-        {tab === "headers" ? (
+            {typeof fieldsTab === "function" ? fieldsTab(tab === "fields") : fieldsTab}
+            </div>,
+          },
+          {
+            key: "headers",
+            label: "响应头",
+            forceRender: true,
+            children: <div className="response-tab-body">{
           evidence === null ? (
             <Hint>本次没有响应头可显示。</Hint>
           ) : evidence.headers.length === 0 ? (
@@ -267,15 +272,11 @@ export function ResponsePanel({
               ))}
             </ul>
           )
-        ) : null}
+            }</div>,
+          },
+        ]}
+      />
       </div>
     </section>
   );
 }
-
-/** 响应区的标签定义；顺序即阅读顺序。 */
-const RESPONSE_TABS = [
-  { id: "body" as const, label: "正文" },
-  { id: "fields" as const, label: "字段与断言" },
-  { id: "headers" as const, label: "响应头" },
-];

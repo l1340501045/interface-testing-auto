@@ -10,6 +10,8 @@ import { useState } from "react";
 import { describe, expect, it } from "vitest";
 
 import type { AssertionResult, AssertionType, CaseAssertion } from "../api/types";
+import { AppProviders } from "../theme/AppProviders";
+import { antSelectedValue } from "../test/antd";
 import { AssertionColumn } from "./AssertionColumn";
 
 const EXPECTED_NUMBER = { control: "value" as const, type: "number", label: "边界" };
@@ -86,16 +88,15 @@ describe("AssertionColumn 切换编辑目标", () => {
       <Harness
         initial={[makeAssertion("a-gt", "greater_than", "0", 0), makeAssertion("b-lt", "less_than", "100", 1)]}
       />,
+      { wrapper: AppProviders },
     );
 
     openEditor(0);
-    const typeSelect = screen.getByLabelText("断言类型") as HTMLSelectElement;
-    expect(typeSelect.value).toBe("greater_than");
+    expect(antSelectedValue("断言类型")).toBe("greater_than");
     expect((screen.getByLabelText("边界") as HTMLInputElement).value).toBe("0");
 
     openEditor(1);
-    const switchedType = screen.getByLabelText("断言类型") as HTMLSelectElement;
-    expect(switchedType.value).toBe("less_than");
+    expect(antSelectedValue("断言类型")).toBe("less_than");
     // 上限必须还是目标自己配置的 100，而不是上一条的 0。
     expect((screen.getByLabelText("边界") as HTMLInputElement).value).toBe("100");
   });
@@ -109,6 +110,7 @@ describe("AssertionColumn 切换编辑目标", () => {
           captured = next;
         }}
       />,
+      { wrapper: AppProviders },
     );
 
     openEditor(1);
@@ -133,6 +135,7 @@ describe("AssertionColumn 切换编辑目标", () => {
           captured = next;
         }}
       />,
+      { wrapper: AppProviders },
     );
 
     // 第一条：把 0 改成 5。
@@ -161,6 +164,7 @@ describe("AssertionColumn 列表", () => {
       <Harness
         initial={[makeAssertion("a-gt", "greater_than", "0", 0), makeAssertion("b-lt", "less_than", "100", 1)]}
       />,
+      { wrapper: AppProviders },
     );
     const items = screen.getAllByRole("listitem");
     expect(items).toHaveLength(2);

@@ -6,6 +6,7 @@
  * 列表同时给出绑定了该池的环境数量：改之前能看出会影响谁。
  */
 import { useEffect, useState } from "react";
+import { Button, Card, Collapse, Flex, Form, Input, Space, Typography } from "antd";
 
 import { ApiError, apiSend, projectPath } from "../api/client";
 import { toRunnerPool, toRunnerPoolList } from "../api/guards";
@@ -101,49 +102,63 @@ export function PoolTargetsPanel({
     }
   }
 
-  return (
-    <details className="block">
-      <summary>执行池与目标白名单（{pools.data?.length ?? 0}）</summary>
-      <p className="caption">
+  const content = (
+    <Flex vertical gap="small">
+      <Typography.Paragraph type="secondary">
         只有列在这里的目标才允许被访问，审批顺序为：先加白名单，再执行用例。保存只改配置，不访问目标。
-      </p>
+      </Typography.Paragraph>
       {pools.loading ? <Loading label="正在加载执行池…" /> : null}
       {pools.error ? <ErrorText message={pools.error.message} /> : null}
       {pools.data && pools.data.length === 0 ? (
         <Empty label="当前项目没有已授权的执行池，请联系执行池管理者授权。" />
       ) : null}
       {pools.data?.map((pool) => (
-        <div className="pool-row" key={pool.id}>
-          <div className="pool-head">
-            <strong>{pool.name}</strong>
-            <span className="caption">
+        <Card className="pool-row" key={pool.id} size="small" title={pool.name}>
+          <Flex className="pool-head" vertical gap="small">
+            <Typography.Text type="secondary">
               网络区域 {pool.network_zone} · 状态 {pool.status} · 授权 {pool.grant_status} ·
               绑定环境 {pool.environment_ids.length} 个
-            </span>
-          </div>
-          <label htmlFor={`pool-targets-${pool.id}`}>允许的目标（每行一个，格式 scheme://host:port）</label>
-          <textarea
-            id={`pool-targets-${pool.id}`}
-            rows={4}
-            value={textOf(pool)}
-            disabled={!canAdmin || busyId === pool.id}
-            onChange={(event) =>
-              setDrafts((current) => ({ ...current, [pool.id]: event.target.value }))
-            }
-          />
+            </Typography.Text>
+          </Flex>
+          <Form layout="vertical">
+            <Form.Item label="允许的目标（每行一个，格式 scheme://host:port）" htmlFor={`pool-targets-${pool.id}`}>
+              <Input.TextArea
+                id={`pool-targets-${pool.id}`}
+                rows={4}
+                value={textOf(pool)}
+                disabled={!canAdmin || busyId === pool.id}
+                onChange={(event) =>
+                  setDrafts((current) => ({ ...current, [pool.id]: event.target.value }))
+                }
+              />
+            </Form.Item>
+          </Form>
           {canAdmin ? (
-            <div className="actions">
-              <button type="button" onClick={() => void save(pool)} disabled={busyId === pool.id}>
+            <Space className="actions">
+              <Button type="primary" htmlType="button" onClick={() => void save(pool)} disabled={busyId === pool.id}>
                 {busyId === pool.id ? "保存中…" : "保存白名单"}
-              </button>
-            </div>
+              </Button>
+            </Space>
           ) : (
             <Hint>查看者不能扩大出网范围；白名单维护需要管理员权限。</Hint>
           )}
-        </div>
+        </Card>
       ))}
       {message ? <Notice tone="info" title={message} /> : null}
       {failure ? <ErrorText message={failure} /> : null}
-    </details>
+    </Flex>
+  );
+
+  return (
+    <div className="block">
+      <Collapse
+        defaultActiveKey={["pools"]}
+        items={[{
+          key: "pools",
+          label: `执行池与目标白名单（${pools.data?.length ?? 0}）`,
+          children: content,
+        }]}
+      />
+    </div>
   );
 }

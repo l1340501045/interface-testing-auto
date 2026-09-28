@@ -16,6 +16,8 @@ vi.mock("../api/client", async (importOriginal) => {
 import { ApiError, apiSend } from "../api/client";
 import type { Environment } from "../api/types";
 import { LeaveGuardProvider, useLeaveAggregate } from "../hooks/leaveGuard";
+import { AppProviders } from "../theme/AppProviders";
+import { antSelectedValue, selectAntOption } from "../test/antd";
 import {
   ENVIRONMENT_URL_EXAMPLE,
   ENVIRONMENT_URL_IP_EXAMPLE,
@@ -76,6 +78,7 @@ function renderPanel(list: Environment[], options: { canEdit?: boolean } = {}) {
         onOpenChange={onOpenChange}
       />
     </LeaveGuardProvider>,
+    { wrapper: AppProviders },
   );
   return { onChanged, onOpenChange };
 }
@@ -110,11 +113,11 @@ describe("环境编辑", () => {
     fireEvent.click(screen.getByRole("button", { name: "编辑" }));
     fireEvent.change(screen.getByLabelText("环境名称"), { target: { value: "灰度环境" } });
     fireEvent.change(screen.getByLabelText("服务地址"), { target: { value: "http://gray:9000" } });
-    fireEvent.change(screen.getByLabelText("状态"), { target: { value: "archived" } });
+    await selectAntOption("状态", "停用");
 
     fireEvent.click(screen.getByRole("button", { name: "＋添加变量" }));
     fireEvent.change(screen.getByLabelText("名称"), { target: { value: "order_id" } });
-    fireEvent.change(screen.getByLabelText("类型"), { target: { value: "number" } });
+    await selectAntOption("类型", "数字");
     fireEvent.change(screen.getByLabelText("值"), { target: { value: "9007199254740993" } });
     fireEvent.click(screen.getByRole("button", { name: "保存环境" }));
 
@@ -195,10 +198,7 @@ describe("环境编辑", () => {
     const names = screen.getAllByLabelText("名称") as HTMLInputElement[];
     expect(names.map((input) => input.value).sort()).toEqual(["base", "flag"]);
     // 布尔变量的取值控件应当直接选中 true，而不是让人从 "true"/"false" 文本里猜。
-    const values = screen.getAllByLabelText("值");
-    expect(
-      values.some((element) => element.tagName === "SELECT" && (element as HTMLSelectElement).value === "true"),
-    ).toBe(true);
+    expect(antSelectedValue("值")).toBe("true");
   });
 });
 
@@ -233,7 +233,7 @@ describe("环境草稿的未保存保护", () => {
     renderPanel([saved]);
 
     fireEvent.click(screen.getByRole("button", { name: "编辑" }));
-    fireEvent.change(screen.getByLabelText("类型"), { target: { value: "string" } });
+    await selectAntOption("类型", "文本");
 
     // 显示文本同样是 "1"：只有比较字面量本身才看得出类型变了。
     expect((screen.getByLabelText("值") as HTMLInputElement).value).toBe("1");
@@ -377,25 +377,16 @@ describe("环境面板的折叠回报", () => {
     apiSendMock.mockReset();
   });
 
-  it("用户折叠（属性变得与 prop 不同）时回报 false", () => {
+  it("用户点击折叠标题时回报 false", () => {
     const { onOpenChange } = renderPanel([environment()]);
-    const panel = document.getElementById("environment-panel") as HTMLDetailsElement;
-    expect(panel.open).toBe(true);
-
-    panel.open = false;
-    fireEvent(panel, new Event("toggle"));
+    fireEvent.click(screen.getByRole("button", { name: "环境（1）" }));
 
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
-  it("React 同步属性（值与 prop 相同）时不回报，面板不会被锁成永远展开", () => {
+  it("受控展开的初次同步不回报用户操作", () => {
     const { onOpenChange } = renderPanel([environment()]);
-    const panel = document.getElementById("environment-panel") as HTMLDetailsElement;
-
-    // 属性被同步成与本次渲染给出的 open 相同的值：这不是用户操作。
-    panel.open = true;
-    fireEvent(panel, new Event("toggle"));
-
+    expect(screen.getByRole("button", { name: "环境（1）" }).getAttribute("aria-expanded")).toBe("true");
     expect(onOpenChange).not.toHaveBeenCalled();
   });
 });

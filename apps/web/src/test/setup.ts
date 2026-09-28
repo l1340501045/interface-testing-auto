@@ -8,6 +8,32 @@ import { configure } from "@testing-library/dom";
 import { afterEach } from "vitest";
 import { cleanup } from "@testing-library/react";
 
+// Ant Design 只查询这些浏览器能力；jsdom 没有真实媒体布局和元素测量。
+// 这里提供接口级替身，让组件能运行，但不伪造几何结果，尺寸与裁剪仍交给桌面浏览器验收。
+if (!window.matchMedia) {
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    value: (query: string): MediaQueryList => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      dispatchEvent: () => false,
+    }),
+  });
+}
+
+if (!globalThis.ResizeObserver) {
+  globalThis.ResizeObserver = class ResizeObserver {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  };
+}
+
 /**
  * 异步等待的预算显式写出来，不靠 Testing Library 默认的 1000ms。
  *

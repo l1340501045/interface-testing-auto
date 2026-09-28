@@ -5,6 +5,7 @@
  * 定位路径；这里只负责渲染与选择，不自行解析 JSON，也不改写定位路径。
  */
 import { useEffect, useMemo, useState } from "react";
+import { Tag, Tree, type TreeDataNode } from "antd";
 
 import type { AssertionResult, AssertionType, CaseAssertion, FieldNode, ValueLiteral } from "../api/types";
 import { Empty, ErrorText, Hint, Loading } from "../components/Feedback";
@@ -51,58 +52,20 @@ export function findSelector(node: FieldNode, key: string): FieldNode | null {
   return null;
 }
 
-function FieldRow({
-  node,
-  depth,
-  activeKey,
-  onSelect,
-}: {
-  node: FieldNode;
-  depth: number;
-  activeKey: string | null;
-  onSelect: (node: FieldNode) => void;
-}) {
+function toTreeNode(node: FieldNode): TreeDataNode {
   const key = JSON.stringify(node.selector);
-  const hasChildren = node.children.length > 0;
-  const [open, setOpen] = useState(depth < 1);
-  return (
-    <li>
-      <div className={activeKey === key ? "field-row field-row-active" : "field-row"}>
-        {hasChildren ? (
-          <button
-            type="button"
-            className="field-toggle"
-            aria-expanded={open}
-            aria-label={`${open ? "收起" : "展开"}${node.label}`}
-            onClick={() => setOpen((value) => !value)}
-          >
-            {open ? "▾" : "▸"}
-          </button>
-        ) : (
-          <span className="field-toggle" aria-hidden="true" />
-        )}
-        <button type="button" className="field-name" onClick={() => onSelect(node)}>
-          {node.label}
-        </button>
-        <span className="field-type">{node.type}</span>
+  return {
+    key,
+    title: (
+      <span className="field-row">
+        <span className="field-name">{node.label}</span>
+        <Tag className="field-type">{node.type}</Tag>
         <span className="field-value">{node.text}</span>
         {node.truncated ? <span className="field-warn">{node.truncated}</span> : null}
-      </div>
-      {hasChildren && open ? (
-        <ul>
-          {node.children.map((child, index) => (
-            <FieldRow
-              key={`${child.label}-${index}`}
-              node={child}
-              depth={depth + 1}
-              activeKey={activeKey}
-              onSelect={onSelect}
-            />
-          ))}
-        </ul>
-      ) : null}
-    </li>
-  );
+      </span>
+    ),
+    children: node.children.map(toTreeNode),
+  };
 }
 
 export function FieldTreePanel({
@@ -157,6 +120,7 @@ export function FieldTreePanel({
     () => (activeKey === null || root === null ? null : findSelector(root, activeKey)),
     [root, activeKey],
   );
+  const treeData = useMemo(() => root === null ? [] : [toTreeNode(root)], [root]);
 
   // 路径在新树里已不存在（例如换了一份结构不同的响应）时收起详情，
   // 避免继续对一棵旧树的路径新增断言。
@@ -180,14 +144,21 @@ export function FieldTreePanel({
         <strong>{title}</strong>
         <span className="caption">共 {tree.tree.node_count} 个节点</span>
       </div>
-      <ul className="tree">
-        <FieldRow
-          node={tree.tree.root}
-          depth={0}
-          activeKey={activeKey}
-          onSelect={(node) => setActiveKey(JSON.stringify(node.selector))}
-        />
-      </ul>
+      <Tree
+        aria-label={title}
+        className="tree"
+        treeData={treeData}
+        selectedKeys={activeKey === null ? [] : [activeKey]}
+        defaultExpandedKeys={[JSON.stringify(tree.tree.root.selector)]}
+        onSelect={(keys) => {
+          // rc-tree 再次点击当前节点时会以空 keys 表示“取消选择”。对字段编辑器而言，
+          // 这不是丢弃未应用断言的业务动作：保持当前 selector，直到用户切换字段、
+          // 来源变化或新树里已经不存在该路径。
+          const key = keys[0];
+          if (key === undefined) return;
+          setActiveKey(String(key));
+        }}
+      />
 
       {active ? (
         <div className="field-detail">

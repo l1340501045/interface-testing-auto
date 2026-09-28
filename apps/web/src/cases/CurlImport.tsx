@@ -12,6 +12,7 @@
  *    送、实际语义不同的请求。
  */
 import { useId, useState } from "react";
+import { Button, Collapse, Input } from "antd";
 
 import { ErrorText, Hint } from "../components/Feedback";
 import { useLeaveReport } from "../hooks/leaveGuard";
@@ -57,14 +58,14 @@ export function CurlImport({
   }
 
   return (
-    <span className="curl-import">
-      <button type="button" onClick={() => setOpen((current) => !current)} disabled={disabled}>
-        {open ? "收起导入" : "导入 cURL"}
-      </button>
-      {open ? (
+    <div className="curl-import">
+      <Collapse
+        activeKey={open ? ["curl"] : []}
+        onChange={(keys) => setOpen(keys.includes("curl"))}
+        items={[{ key: "curl", label: "导入 cURL", collapsible: disabled ? "disabled" : undefined, children: (
         <div className="curl-panel">
           <label htmlFor={`${idPrefix ? `${idPrefix}-` : ""}curl-text`}>粘贴 cURL 命令（只解析文本，不发送请求）</label>
-          <textarea
+          <Input.TextArea
             id={`${idPrefix ? `${idPrefix}-` : ""}curl-text`}
             rows={3}
             value={text}
@@ -73,9 +74,9 @@ export function CurlImport({
             onChange={(event) => { setText(event.target.value); setImported(false); }}
           />
           <div className="actions">
-            <button type="button" onClick={() => void run()} disabled={disabled || loading}>
+            <Button htmlType="button" type="primary" onClick={() => void run()} disabled={disabled || loading}>
               {loading ? "解析中…" : "解析并填入编辑器"}
-            </button>
+            </Button>
           </div>
           {error ? <ErrorText message={error} /> : null}
           {imported ? <Hint>已填入编辑器；导入过程不访问目标，也未执行任何命令。</Hint> : null}
@@ -87,7 +88,7 @@ export function CurlImport({
             </ul>
           ) : null}
         </div>
-      ) : null}
-    </span>
+      ) }]} />
+    </div>
   );
 }

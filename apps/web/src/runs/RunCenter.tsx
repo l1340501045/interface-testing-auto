@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Button, Empty, Select, Space, Table, Tag } from "antd";
+import type { RunSummary } from "../api/types";
 
 import { ApiError, apiSend, projectPath } from "../api/client";
 import type { Environment } from "../api/types";
@@ -81,20 +83,18 @@ export function RunCenter({
         </div>
         <div className="page-tools">
           <label htmlFor={`${mode}-environment`}>环境筛选</label>
-          <select
+          <Select
             id={`${mode}-environment`}
             value={environmentId ?? ""}
-            onChange={(event) => {
-              setEnvironmentId(event.target.value || null);
+            aria-label="环境筛选"
+            data-selected-value={environmentId ?? ""}
+            onChange={(value: string) => {
+              setEnvironmentId(value || null);
               setSelectedRunId(null);
             }}
-          >
-            <option value="">全部环境</option>
-            {environments.map((environment) => (
-              <option key={environment.id} value={environment.id}>{environment.name}</option>
-            ))}
-          </select>
-          <button type="button" onClick={runs.reload} disabled={runs.loading}>刷新</button>
+            options={[{ value: "", label: "全部环境" }, ...environments.map((environment) => ({ value: environment.id, label: environment.name }))]}
+          />
+          <Button htmlType="button" aria-label="刷新" onClick={runs.reload} loading={runs.loading}>刷新</Button>
         </div>
       </header>
 
@@ -103,39 +103,29 @@ export function RunCenter({
         {runs.error ? <ErrorText message={runs.error.message} /> : null}
         {runs.loading && runs.data === null ? <Loading label="正在加载运行记录…" /> : null}
         {runs.data?.length === 0 ? (
-          <Hint>当前筛选下没有最近运行记录。列表范围以服务端当前返回为准。</Hint>
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前筛选下没有最近运行记录" />
         ) : null}
         {runs.data && runs.data.length > 0 ? (
-          <div className="table-scroll">
-            <table className="report-table">
-              <thead>
-                <tr>
-                  <th>运行</th><th>来源</th><th>环境</th><th>状态</th><th>结果</th><th>提交时间</th><th>操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {runs.data.map((run) => (
-                  <tr key={run.id} className={run.id === selectedRunId ? "row-active" : undefined}>
-                    <td>{run.id.slice(0, 8)}</td>
-                    <td>{runTargetLabel(run)}</td>
-                    <td>{environments.find((item) => item.id === run.environment_id)?.name ?? run.environment_id.slice(0, 8)}</td>
-                    <td>{runStateLabel(run)}</td>
-                    <td>{runOutcomeLabel(run)}{runReasonLabel(run) ? `（${runReasonLabel(run)}）` : ""}</td>
-                    <td><time dateTime={run.created_at} title={run.created_at}>{runTimeLabel(run.created_at)}</time></td>
-                    <td className="inline-actions">
-                      <button
-                        type="button"
-                        onClick={() => mode === "reports" ? setSelectedRunId(run.id) : onOpenReport?.(run.id)}
-                      >查看报告</button>
-                      {mode === "tasks" && canCancel && !isTerminal(run) ? (
-                        <button type="button" className="danger" onClick={() => void cancel(run.id)}>取消</button>
-                      ) : null}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <Table
+            className="report-table"
+            size="small"
+            pagination={false}
+            rowKey="id"
+            dataSource={runs.data}
+            rowClassName={(run) => run.id === selectedRunId ? "row-active" : ""}
+            columns={[
+              { title: "运行", render: (_: unknown, run: RunSummary) => run.id.slice(0, 8) },
+              { title: "来源", render: (_: unknown, run: RunSummary) => runTargetLabel(run) },
+              { title: "环境", render: (_: unknown, run: RunSummary) => environments.find((item) => item.id === run.environment_id)?.name ?? run.environment_id.slice(0, 8) },
+              { title: "状态", render: (_: unknown, run: RunSummary) => <Tag>{runStateLabel(run)}</Tag> },
+              { title: "结果", render: (_: unknown, run: RunSummary) => `${runOutcomeLabel(run)}${runReasonLabel(run) ? `（${runReasonLabel(run)}）` : ""}` },
+              { title: "提交时间", render: (_: unknown, run: RunSummary) => <time dateTime={run.created_at} title={run.created_at}>{runTimeLabel(run.created_at)}</time> },
+              { title: "操作", render: (_: unknown, run: RunSummary) => <Space size={4}>
+                <Button htmlType="button" size="small" onClick={() => mode === "reports" ? setSelectedRunId(run.id) : onOpenReport?.(run.id)}>查看报告</Button>
+                {mode === "tasks" && canCancel && !isTerminal(run) ? <Button htmlType="button" size="small" danger aria-label="取消" onClick={() => void cancel(run.id)}>取消</Button> : null}
+              </Space> },
+            ]}
+          />
         ) : null}
       </section>
 

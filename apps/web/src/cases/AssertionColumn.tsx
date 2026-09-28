@@ -5,6 +5,7 @@
  * 执行结果按断言标识回填，与配置并列显示，便于对照期望与实际。
  */
 import { useId, useState } from "react";
+import { Button, Space, Tag } from "antd";
 
 import type { AssertionResult, AssertionType, CaseAssertion, LocatorStep, ValueLiteral } from "../api/types";
 import { describeValue } from "../api/literals";
@@ -91,11 +92,11 @@ export function AssertionColumn({
           const result = results.get(item.id);
           return (
             <li key={item.id}>
-              <span className="assertion-label">
+              <Tag className="assertion-label" color={item.severity === "warning" ? "warning" : "blue"}>
                 {type ? summarize(type, item.parameters) : item.type}
                 {item.severity === "warning" ? "（仅提示）" : ""}
                 {item.enabled ? "" : "（已停用）"}
-              </span>
+              </Tag>
               {result ? (
                 <span className="assertion-result">
                   <StatusTag status={result.status} />
@@ -109,20 +110,22 @@ export function AssertionColumn({
                 </span>
               ) : null}
               {readOnly ? null : (
-                <span className="inline-actions">
-                  <button
-                    type="button"
+                <Space className="inline-actions" size={4}>
+                  <Button
+                    htmlType="button"
+                    size="small"
+                    aria-label="修改"
                     onClick={() => {
                       setEditingId(item.id);
                       setOpen(true);
                     }}
                   >
                     修改
-                  </button>
-                  <button type="button" onClick={() => onRemove(item.id)}>
+                  </Button>
+                  <Button htmlType="button" size="small" danger aria-label="删除" onClick={() => onRemove(item.id)}>
                     删除
-                  </button>
-                </span>
+                  </Button>
+                </Space>
               )}
             </li>
           );
@@ -154,8 +157,9 @@ export function AssertionColumn({
           />
         )
       ) : readOnly ? null : (
-        <button
-          type="button"
+        <Button
+          htmlType="button"
+          type="dashed"
           className="add-assertion"
           onClick={() => {
             setEditingId(null);
@@ -163,7 +167,7 @@ export function AssertionColumn({
           }}
         >
           ＋添加断言
-        </button>
+        </Button>
       )}
     </div>
   );

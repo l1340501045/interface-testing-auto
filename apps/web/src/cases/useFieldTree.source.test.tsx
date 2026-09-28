@@ -8,7 +8,7 @@
  * 这里用一个真实 Harness：真实 `useFieldTree` + 真实字段面板，字段树响应由用例控制何时
  * 放行。断言的是“能不能点到”，不是内部状态。
  */
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../api/client", async (importOriginal) => {
@@ -17,6 +17,7 @@ vi.mock("../api/client", async (importOriginal) => {
 });
 
 import { apiSend, projectPath } from "../api/client";
+import { selectAntOption } from "../test/antd";
 import { FieldTreePanel } from "./FieldTreePanel";
 import { useFieldTree } from "./useFieldTree";
 
@@ -119,14 +120,52 @@ function Harness({ text, sourceKey, enabled = true }: { text: string; sourceKey:
  * `data` 出现，直接等 `id` 只会超时。
  */
 async function expandToId(): Promise<void> {
-  const data = await screen.findByRole("button", { name: "展开data" });
-  fireEvent.click(data);
-  await screen.findByRole("button", { name: "id" });
+  const data = await findTreeItem("data");
+  if (data.getAttribute("aria-expanded") !== "true") {
+    const switcher = data.querySelector(".ant-tree-switcher");
+    if (!(switcher instanceof HTMLElement)) throw new Error("data 节点展开入口未挂载");
+    fireEvent.click(switcher);
+    await waitFor(() => expect(data.getAttribute("aria-expanded")).toBe("true"));
+  }
+  await findTreeItem("id");
 }
 
 /** 选中 data.id 那一行。 */
 function selectDataId(): void {
-  fireEvent.click(screen.getByRole("button", { name: "id" }));
+  const item = queryTreeItem("id");
+  const title = item?.querySelector(".ant-tree-title");
+  if (!(title instanceof HTMLElement)) throw new Error("id 节点标题未挂载");
+  fireEvent.click(title);
+}
+
+function treeRoot(): HTMLElement | null {
+  return document.querySelector('[role="tree"][aria-label="响应正文字段"]');
+}
+
+function queryTreeItem(label: string): HTMLElement | null {
+  const tree = treeRoot();
+  if (tree === null) return null;
+  return Array.from(tree.querySelectorAll<HTMLElement>('[role="treeitem"]'))
+    .find((item) => item.querySelector(".field-name")?.textContent?.trim() === label) ?? null;
+}
+
+async function findTreeItem(label: string): Promise<HTMLElement> {
+  await waitFor(() => expect(queryTreeItem(label) instanceof HTMLElement).toBe(true));
+  const item = queryTreeItem(label);
+  if (item === null) throw new Error(`${label} 树节点未挂载`);
+  return item;
+}
+
+async function waitForFieldTreeRequest(text: string): Promise<void> {
+  await waitFor(() => expect(apiSendMock.mock.calls.some(([, method, body]) =>
+    method === "POST" && (body as { text?: string } | undefined)?.text === text
+  )).toBe(true));
+}
+
+function fieldTreeRequestCount(text: string): number {
+  return apiSendMock.mock.calls.filter(([, method, body]) =>
+    method === "POST" && (body as { text?: string } | undefined)?.text === text
+  ).length;
 }
 
 function detailText(): string {
@@ -135,7 +174,7 @@ function detailText(): string {
 
 /** `id` 那一行的整行文本：包含类型与**样例值**（试算用的就是它）。 */
 function idRowText(): string {
-  const row = screen.getByRole("button", { name: "id" }).closest(".field-row");
+  const row = queryTreeItem("id")?.querySelector(".field-row");
   return row?.textContent ?? "";
 }
 
@@ -161,9 +200,6 @@ describe("新来源加载期间不开放旧字段树", () => {
     const { rerender } = render(<Harness text={r1} sourceKey="run-1" />);
     // r1 的树：integer = 1。
     bodies[r1] = treeFor("integer", "1");
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    });
     await expandToId();
     selectDataId();
     expect(detailText()).toContain("integer");
@@ -172,13 +208,11 @@ describe("新来源加载期间不开放旧字段树", () => {
     // 切到 r2，并挂起它的字段树响应。
     hold(r2);
     rerender(<Harness text={r2} sourceKey="run-2" />);
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    });
+    await waitForFieldTreeRequest(r2);
 
     // 关键：r1 的节点此刻一个都不该在页面上——它们属于另一份响应。
-    expect(screen.queryByRole("button", { name: "id" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "展开data" })).toBeNull();
+    expect(queryTreeItem("id")).toBeNull();
+    expect(queryTreeItem("data")).toBeNull();
     expect(document.querySelector(".field-row-active")).toBeNull();
     expect(detailText()).toBe("");
     // 草稿与已配置断言不受影响：这里没有任何 onChange。
@@ -204,17 +238,12 @@ describe("新来源加载期间不开放旧字段树", () => {
     bodies[after] = treeFor("string", "x");
 
     const { rerender } = render(<Harness text={before} sourceKey={before} />);
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    });
     await expandToId();
 
     hold(after);
     rerender(<Harness text={after} sourceKey={after} />);
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    });
-    expect(screen.queryByRole("button", { name: "id" })).toBeNull();
+    await waitForFieldTreeRequest(after);
+    expect(queryTreeItem("id")).toBeNull();
 
     await act(async () => {
       releaseFor(after, bodies[after]);
@@ -228,23 +257,22 @@ describe("新来源加载期间不开放旧字段树", () => {
     const text = '{"data":{"id":1}}';
     bodies[text] = treeFor("integer", "1");
     const { rerender } = render(<Harness text={text} sourceKey="same" />);
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    });
     await expandToId();
     selectDataId();
     expect(detailText()).toContain("integer");
     fireEvent.click(screen.getByRole("button", { name: "＋添加断言" }));
-    fireEvent.change(screen.getByLabelText("断言类型"), { target: { value: "equals" } });
+    await selectAntOption("断言类型", "等于");
     fireEvent.change(screen.getByLabelText("期望值"), { target: { value: "未应用条件" } });
+    const readsBeforeHide = fieldTreeRequestCount(text);
 
     rerender(<Harness text={text} sourceKey="same" enabled={false} />);
-    expect(screen.getByRole("button", { name: "id" })).toBeTruthy();
+    expect(queryTreeItem("id")).toBeTruthy();
     expect(detailText()).toContain("integer");
     expect(screen.getByDisplayValue("未应用条件")).toBeTruthy();
 
     rerender(<Harness text={text} sourceKey="same" enabled />);
     expect(screen.getByDisplayValue("未应用条件")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "id" })).toBeTruthy();
+    expect(queryTreeItem("id")).toBeTruthy();
+    expect(fieldTreeRequestCount(text)).toBe(readsBeforeHide);
   });
 });
