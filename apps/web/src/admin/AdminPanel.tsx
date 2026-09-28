@@ -8,6 +8,7 @@
  * 让管理员手抄 id 是最容易出错的一步，默认值应当来自他此刻看到的东西。
  */
 import type { Environment } from "../api/types";
+import { Flex } from "antd";
 import { CredentialsPanel } from "./CredentialsPanel";
 import { PoolTargetsPanel } from "./PoolTargetsPanel";
 import { VariablesPanel } from "./VariablesPanel";
@@ -52,7 +53,7 @@ export function AdminPanel({
   const canAdmin = role === "admin";
 
   return (
-    <div className="admin-stack" id={anchorId} tabIndex={anchorId ? -1 : undefined}>
+    <Flex className="admin-stack" id={anchorId} tabIndex={anchorId ? -1 : undefined} vertical gap="middle">
       <VariablesPanel
         workspaceId={workspaceId}
         projectId={projectId}
@@ -72,6 +73,6 @@ export function AdminPanel({
         open={credentialsOpen}
         onOpenChange={onCredentialsOpenChange}
       />
-    </div>
+    </Flex>
   );
 }

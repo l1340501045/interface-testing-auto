@@ -12,6 +12,7 @@
  */
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { selectAntOption } from "./test/antd";
 
 const WORKSPACE_ID = "11111111-1111-4111-8111-111111111111";
 const PROJECT_ID = "22222222-2222-4222-8222-222222222222";
@@ -338,73 +339,107 @@ function route(rawPath: string, method: string, body?: unknown): unknown {
   throw new Error(`测试未覆盖的请求：${method} ${path}`);
 }
 
-  // 装配阶段的等待预算：这里等的是“用例编辑器挂载完成”，不是某个断言内容。
-  // 整套测试并行跑十几个 jsdom 环境，CPU 争用会把同一段代码的墙上时间放大数倍
-  // （与 test/setup.ts 记录的同一现象）。断言内容不因此放宽：期望的元素一字未改。
-  const SETUP_WAIT = { timeout: 20000 };
+function exactButton(root: ParentNode, text: string): HTMLButtonElement {
+  const matches = Array.from(root.querySelectorAll("button"))
+    .filter((button) => button.textContent?.trim() === text && button.closest('[hidden], [aria-hidden="true"], [style*="display: none"]') === null);
+  const button = matches[0];
+  if (!(button instanceof HTMLButtonElement) || matches.length !== 1) {
+    throw new Error(`按钮“${text}”数量不是 1：${matches.length}`);
+  }
+  return button;
+}
+
+function selectedValue(label: string): string | null {
+  const input = document.querySelector(`[aria-label="${label}"]`);
+  return input?.closest<HTMLElement>("[data-selected-value]")?.dataset.selectedValue ?? null;
+}
+
+function versionBlock(): HTMLElement {
+  const heading = Array.from(document.querySelectorAll<HTMLElement>(".block h2"))
+    .find((item) => item.textContent?.trim() === "执行已发布版本");
+  const block = heading?.closest<HTMLElement>(".block");
+  if (block === null || block === undefined) throw new Error("已发布版本执行区未挂载");
+  return block;
+}
+
+function openVersionPanel(): void {
+  const trigger = Array.from(document.querySelectorAll<HTMLElement>(".ant-collapse-header"))
+    .find((item) => item.textContent?.trim() === "版本执行与发布记录");
+  if (trigger === undefined) throw new Error("版本执行与发布记录折叠入口未挂载");
+  if (trigger.getAttribute("aria-expanded") !== "true") fireEvent.click(trigger);
+  expect(trigger.getAttribute("aria-expanded")).toBe("true");
+}
+
+function openSection(root: ParentNode, labelPrefix: string): void {
+  const trigger = Array.from(root.querySelectorAll<HTMLElement>(".ant-collapse-header"))
+    .find((item) => item.textContent?.trim().startsWith(labelPrefix));
+  if (trigger === undefined) throw new Error(`折叠入口“${labelPrefix}”未挂载`);
+  if (trigger.getAttribute("aria-expanded") !== "true") fireEvent.click(trigger);
+  expect(trigger.getAttribute("aria-expanded")).toBe("true");
+}
 
 /** 打开项目与用例，返回编辑器容器。 */
 async function openCase(): Promise<void> {
   render(<App />);
-  const projectSelect = (await screen.findByLabelText("项目")) as HTMLSelectElement;
-  await waitFor(() => expect(projectSelect.value).toBe(PROJECT_ID), SETUP_WAIT);
+  await waitFor(() => expect(selectedValue("项目")).toBe(PROJECT_ID));
   await act(async () => {});
-  const browser = await screen.findByLabelText("用例目录");
-  fireEvent.click(await within(browser).findByRole("button", { name: /查询订单/ }));
-  await waitFor(
-    () => expect((screen.getByLabelText("用例名称") as HTMLInputElement).value).toBe("查询订单"),
-    SETUP_WAIT,
-  );
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 450));
+  const browser = document.querySelector('[aria-label="用例目录"]');
+  if (!(browser instanceof HTMLElement)) throw new Error("用例目录未挂载");
+  const caseButton = Array.from(browser.querySelectorAll("button")).find((button) => button.textContent?.includes("查询订单"));
+  if (!(caseButton instanceof HTMLButtonElement)) throw new Error("查询订单入口未挂载");
+  fireEvent.click(caseButton);
+  await waitFor(() => {
+    const input = document.querySelector(".case-name-input");
+    expect(input instanceof HTMLInputElement ? input.value : null).toBe("查询订单");
   });
-  await act(async () => {});
+  await waitFor(() => expect(calls.some((call) => call.endsWith("/debug-preflight"))).toBe(true));
 }
 
 /** 执行已发布版本（真实 RunPanel 的「保存并执行」），返回提交次数。 */
 async function runVersion(): Promise<void> {
-  const history = screen.getByRole("heading", { name: "执行已发布版本" }).closest(".block");
-  fireEvent.click(within(history as HTMLElement).getByRole("button", { name: "保存并执行" }));
-  await act(async () => {});
+  openVersionPanel();
+  const before = runSeq;
+  fireEvent.click(exactButton(versionBlock(), "保存并执行"));
+  await waitFor(() => expect(runSeq).toBe(before + 1));
 }
 
-function assertionColumnText(): string {
-  fireEvent.click(screen.getByRole("tab", { name: /^断言/ }));
-  return (document.querySelector(".assertion-column") as HTMLElement).textContent ?? "";
+function openAssertionColumn(): HTMLElement {
+  const tab = Array.from(document.querySelectorAll<HTMLElement>('[role="tab"]'))
+    .find((item) => item.textContent?.trim().startsWith("断言"));
+  if (tab === undefined) throw new Error("断言标签未挂载");
+  if (tab.getAttribute("aria-selected") !== "true") fireEvent.click(tab);
+  const column = document.querySelector(".assertion-column");
+  if (!(column instanceof HTMLElement)) throw new Error("断言结果列未挂载");
+  return column;
 }
 
 async function expectCurrentPassed(): Promise<void> {
-  try {
-    await waitFor(() => expect(assertionColumnText()).toContain("通过"));
-  } catch (cause) {
-    // eslint-disable-next-line no-console
-    console.log("DIAG-HIST", JSON.stringify((screen.getByRole("heading", { name: "执行已发布版本" }).closest(".block") as HTMLElement).textContent?.slice(0, 300)), "| calls:", JSON.stringify(calls.slice(-6)));
-    throw cause;
-  }
+  const column = openAssertionColumn();
+  await waitFor(() => expect(column.textContent?.includes("通过")).toBe(true));
 }
 
 async function expectNotCurrent(): Promise<void> {
+  const column = openAssertionColumn();
   await waitFor(() => {
-    const text = assertionColumnText();
-    expect(text).toContain("未执行");
-    expect(text).not.toContain("通过");
+    const text = column.textContent ?? "";
+    expect({ unexecuted: text.includes("未执行"), passed: text.includes("通过") }).toEqual({ unexecuted: true, passed: false });
   });
 }
 
 function admin(): HTMLElement {
-  const panel = screen.queryByRole("region", { name: "环境配置" });
-  if (panel === null) throw new Error("管理入口未挂载");
-  return panel as HTMLElement;
+  const panel = document.querySelector('section[aria-label="环境配置"]');
+  if (!(panel instanceof HTMLElement)) throw new Error("管理入口未挂载");
+  return panel;
 }
 
 async function openAdmin(): Promise<HTMLElement> {
-  fireEvent.click(screen.getByRole("button", { name: "环境配置" }));
+  fireEvent.click(exactButton(document, "环境配置"));
   await act(async () => {});
   return admin();
 }
 
 function returnWorkbench(): void {
-  fireEvent.click(screen.getByRole("button", { name: "接口工作台" }));
+  fireEvent.click(exactButton(document, "接口工作台"));
 }
 
 beforeEach(() => {
@@ -448,18 +483,23 @@ describe("R5 版本配置依据在 POST 前固定", () => {
 
     // 发起版本执行，但让 202 一直不回来。
     holdNextRun();
-    const history = screen.getByRole("heading", { name: "执行已发布版本" }).closest(".block");
-    fireEvent.click(within(history as HTMLElement).getByRole("button", { name: "保存并执行" }));
-    await act(async () => {});
+    openVersionPanel();
+    fireEvent.click(exactButton(versionBlock(), "保存并执行"));
+    await waitFor(() => expect({
+      runSeq,
+      posted: calls.some((call) => call.startsWith("POST ") && call.endsWith("/runs")),
+    }).toEqual({ runSeq: 1, posted: true }));
     expect(runGate.pending).not.toBeNull();
 
     // 202 还没到，配置保存成功（真实管理入口）→ 配置世代推进。
     const panel = await openAdmin();
-    fireEvent.click(within(panel).getByRole("button", { name: "编辑" }));
-    const baseInput = await within(panel).findByLabelText("服务地址");
+    openSection(panel, "环境（");
+    fireEvent.click(exactButton(panel, "编辑"));
+    const baseInput = panel.querySelector("#env-edit-url");
+    if (!(baseInput instanceof HTMLInputElement)) throw new Error("环境服务地址输入框未挂载");
     fireEvent.change(baseInput, { target: { value: "http://echo-alt.test" } });
     await act(async () => {
-      fireEvent.click(within(panel).getByRole("button", { name: "保存环境" }));
+      fireEvent.click(exactButton(panel, "保存环境"));
     });
     returnWorkbench();
 
@@ -471,13 +511,10 @@ describe("R5 版本配置依据在 POST 前固定", () => {
 
     // 这次运行是按**旧**配置提交的：不得因为响应迟到而被登记成新配置的依据。
     // 报告本身仍可查看。
-    const response = screen.getByRole("region", { name: "响应" });
-    await waitFor(() => expect(response.textContent).toContain("已结束"));
-    await waitFor(() => {
-      const text = assertionColumnText();
-      expect(text).toContain("未执行");
-      expect(text).not.toContain("通过");
-    });
+    const response = document.querySelector('[aria-label="响应"]');
+    if (!(response instanceof HTMLElement)) throw new Error("响应区未挂载");
+    await waitFor(() => expect(response.textContent?.includes("已结束")).toBe(true));
+    await expectNotCurrent();
   });
 
   it("新配置下明确重新执行后：当前结论恢复", async () => {
@@ -487,11 +524,13 @@ describe("R5 版本配置依据在 POST 前固定", () => {
 
     // 改配置 → 失效。
     const panel = await openAdmin();
-    fireEvent.click(within(panel).getByRole("button", { name: "编辑" }));
-    const baseInput = await within(panel).findByLabelText("服务地址");
+    openSection(panel, "环境（");
+    fireEvent.click(exactButton(panel, "编辑"));
+    const baseInput = panel.querySelector("#env-edit-url");
+    if (!(baseInput instanceof HTMLInputElement)) throw new Error("环境服务地址输入框未挂载");
     fireEvent.change(baseInput, { target: { value: "http://echo-alt.test" } });
     await act(async () => {
-      fireEvent.click(within(panel).getByRole("button", { name: "保存环境" }));
+      fireEvent.click(exactButton(panel, "保存环境"));
     });
     returnWorkbench();
     await expectNotCurrent();
@@ -514,11 +553,13 @@ describe("版本运行当前结论的执行配置依据", () => {
     await expectCurrentPassed();
 
     const panel = await openAdmin();
-    fireEvent.click(within(panel).getByRole("button", { name: "编辑" }));
-    const baseInput = await within(panel).findByLabelText("服务地址");
+    openSection(panel, "环境（");
+    fireEvent.click(exactButton(panel, "编辑"));
+    const baseInput = panel.querySelector("#env-edit-url");
+    if (!(baseInput instanceof HTMLInputElement)) throw new Error("环境服务地址输入框未挂载");
     fireEvent.change(baseInput, { target: { value: "http://echo-alt.test" } });
     await act(async () => {
-      fireEvent.click(within(panel).getByRole("button", { name: "保存环境" }));
+      fireEvent.click(exactButton(panel, "保存环境"));
     });
     returnWorkbench();
 
@@ -534,11 +575,12 @@ describe("版本运行当前结论的执行配置依据", () => {
     await expectCurrentPassed();
 
     const panel = await openAdmin();
-    fireEvent.click(within(panel).getByRole("button", { name: "＋添加变量" }));
+    openSection(panel, "项目普通变量");
+    fireEvent.click(exactButton(panel, "＋添加变量"));
     const nameInput = await within(panel).findByLabelText("名称");
     fireEvent.change(nameInput, { target: { value: "shared" } });
     await act(async () => {
-      fireEvent.click(within(panel).getByRole("button", { name: "保存为新版本" }));
+      fireEvent.click(exactButton(panel, "保存为新版本"));
     });
     returnWorkbench();
 
@@ -553,12 +595,14 @@ describe("版本运行当前结论的执行配置依据", () => {
     await expectCurrentPassed();
 
     const panel = await openAdmin();
-    // 版本下拉的可访问名是 `aria-label="秘密版本"`（旁边那句可见的「版本」标签的 htmlFor
-    // 指向一个并不存在的 id，因此不构成可访问名——那是既有缺陷，已记入剩余项）。
-    const versionSelect = (await within(panel).findByLabelText("秘密版本")) as HTMLSelectElement;
-    fireEvent.change(versionSelect, { target: { value: "sv-2" } });
+    openSection(panel, "人工凭证");
+    // 使用组件明确提供的“秘密版本”可访问名驱动真实 Select 弹层；可见“版本”标签的
+    // htmlFor 已与当前控件 id 对齐，两者共同保证键盘和辅助技术都能到达该选择器。
+    await waitFor(() => expect(selectedValue("秘密版本")).toBe("sv-1"));
+    await selectAntOption("秘密版本", "第 2 版");
+    expect(selectedValue("秘密版本")).toBe("sv-2");
     await act(async () => {
-      fireEvent.click(within(panel).getByRole("button", { name: "保存整份绑定集合" }));
+      fireEvent.click(exactButton(panel, "保存整份绑定集合"));
     });
     returnWorkbench();
 
@@ -572,8 +616,9 @@ describe("版本运行当前结论的执行配置依据", () => {
     await expectCurrentPassed();
 
     const panel = await openAdmin();
+    openSection(panel, "人工凭证");
     await act(async () => {
-      fireEvent.click(within(panel).getByRole("button", { name: "撤销授权" }));
+      fireEvent.click(exactButton(panel, "撤销授权"));
     });
     returnWorkbench();
 
@@ -587,11 +632,13 @@ describe("版本运行当前结论的执行配置依据", () => {
 
     // 改配置 → 失效。
     const panel = await openAdmin();
-    fireEvent.click(within(panel).getByRole("button", { name: "编辑" }));
-    const baseInput = await within(panel).findByLabelText("服务地址");
+    openSection(panel, "环境（");
+    fireEvent.click(exactButton(panel, "编辑"));
+    const baseInput = panel.querySelector("#env-edit-url");
+    if (!(baseInput instanceof HTMLInputElement)) throw new Error("环境服务地址输入框未挂载");
     fireEvent.change(baseInput, { target: { value: "http://echo-alt.test" } });
     await act(async () => {
-      fireEvent.click(within(panel).getByRole("button", { name: "保存环境" }));
+      fireEvent.click(exactButton(panel, "保存环境"));
     });
     returnWorkbench();
     await expectNotCurrent();

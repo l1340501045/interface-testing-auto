@@ -2,6 +2,8 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { CaseAssertion } from "../api/types";
+import { AppProviders } from "../theme/AppProviders";
+import { selectAntOption } from "../test/antd";
 import { AssertionTab } from "./AssertionTab";
 import type { RawRequest } from "./requestDraft";
 
@@ -34,15 +36,16 @@ function request(rowId = CURRENT, enabled = true): RawRequest {
 function view(onChange = vi.fn(), readOnly = false, currentRequest = request()) {
   render(
     <AssertionTab workspaceId="w" projectId="p" types={[]} typesError={null} assertions={[assertion]} results={new Map()} readOnly={readOnly} onChange={onChange} bodyTree={{ tree: null, error: null, loading: false }} bodySourceKey="" bodyHint="空" request={currentRequest} />,
+    { wrapper: AppProviders },
   );
   return onChange;
 }
 
 describe("孤立 row 条件处理", () => {
-  it("明确标记字段已删除，并由用户选择当前同类字段重绑，尾部语义保持", () => {
+  it("明确标记字段已删除，并由用户选择当前同类字段重绑，尾部语义保持", async () => {
     const onChange = view();
     expect(screen.getByText(/字段已删除/)).toBeTruthy();
-    fireEvent.change(screen.getByLabelText("重新绑定条件 orphan-1"), { target: { value: CURRENT } });
+    await selectAntOption("重新绑定条件 orphan-1", "1. fresh");
     const next = onChange.mock.calls[0][0][0] as CaseAssertion;
     expect(next.selector).toEqual([{ kind: "row", row_id: CURRENT }, { kind: "key", key: "value" }]);
     expect(next.parameters).toEqual(assertion.parameters);

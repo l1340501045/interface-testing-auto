@@ -8,7 +8,8 @@
  * 键盘可用是硬要求：标签栏按 WAI-ARIA 的 tabs 模式实现左右方向键与 Home／End，
  * 焦点只在标签之间移动，面板本身不参与 Tab 序列的额外跳转。
  */
-import { useRef, type KeyboardEvent, type ReactNode } from "react";
+import { Tabs } from "antd";
+import { useEffect, useRef, type ReactNode } from "react";
 
 export interface RequestTab {
   id: string;
@@ -34,62 +35,32 @@ export function RequestTabs({
   onChange: (id: string) => void;
   idPrefix?: string;
 }) {
-  const refs = useRef<Record<string, HTMLButtonElement | null>>({});
-
-  function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
-    const index = tabs.findIndex((tab) => tab.id === activeId);
-    if (index < 0) return;
-    let next = index;
-    if (event.key === "ArrowRight") next = (index + 1) % tabs.length;
-    else if (event.key === "ArrowLeft") next = (index - 1 + tabs.length) % tabs.length;
-    else if (event.key === "Home") next = 0;
-    else if (event.key === "End") next = tabs.length - 1;
-    else return;
-    event.preventDefault();
-    const target = tabs[next];
-    onChange(target.id);
-    refs.current[target.id]?.focus();
-  }
+  const rootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    rootRef.current?.querySelector<HTMLElement>('[role="tablist"]')?.setAttribute("aria-label", "请求编辑");
+  }, [tabs.length]);
 
   return (
-    <div className="request-tabs">
-      <div className="tab-bar" role="tablist" aria-label="请求编辑" onKeyDown={onKeyDown}>
-        {tabs.map((tab) => {
-          const selected = tab.id === activeId;
-          return (
-            <button
-              key={tab.id}
-              type="button"
-              role="tab"
-              id={`${idPrefix}-tab-${tab.id}`}
-              aria-selected={selected}
-              aria-controls={`${idPrefix}-panel-${tab.id}`}
-              tabIndex={selected ? 0 : -1}
-              className={selected ? "tab tab-active" : "tab"}
-              ref={(node) => {
-                refs.current[tab.id] = node;
-              }}
-              onClick={() => onChange(tab.id)}
-            >
+    <div ref={rootRef} className="request-tabs">
+      <Tabs
+        id={idPrefix}
+        aria-label="请求编辑"
+        activeKey={activeId}
+        onChange={onChange}
+        destroyOnHidden={false}
+        items={tabs.map((tab) => ({
+          key: tab.id,
+          forceRender: true,
+          label: (
+            <span>
               {tab.label}
               {tab.summary ? <span className="tab-badge">{tab.summary}</span> : null}
               {tab.badge ? <span className="tab-badge">{tab.badge}</span> : null}
-            </button>
-          );
-        })}
-      </div>
-      {tabs.map((tab) => (
-        <div
-          key={tab.id}
-          role="tabpanel"
-          id={`${idPrefix}-panel-${tab.id}`}
-          aria-labelledby={`${idPrefix}-tab-${tab.id}`}
-          hidden={tab.id !== activeId}
-          className="tab-panel"
-        >
-          {tab.content}
-        </div>
-      ))}
+            </span>
+          ),
+          children: <div className="tab-panel">{tab.content}</div>,
+        }))}
+      />
     </div>
   );
 }

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type CSSProperties, type PointerEvent, type ReactNode } from "react";
+import { Segmented } from "antd";
 
 type Direction = "vertical" | "horizontal";
 
@@ -34,10 +35,11 @@ export function ResizableWorkbench({
   function updateFromPointer(event: PointerEvent<HTMLDivElement>) {
     const bounds = frame.current?.getBoundingClientRect();
     if (!bounds) return;
-    const raw = direction === "horizontal"
-      ? ((event.clientX - bounds.left) / bounds.width) * 100
-      : ((event.clientY - bounds.top) / bounds.height) * 100;
-    setRatio(Math.min(75, Math.max(25, Math.round(raw))));
+    const axisLength = direction === "horizontal" ? bounds.width : bounds.height;
+    if (axisLength <= 0) return;
+    const offset = direction === "horizontal" ? event.clientX - bounds.left : event.clientY - bounds.top;
+    const next = Math.round((offset / axisLength) * 100);
+    setRatio(Math.min(75, Math.max(25, next)));
   }
 
   return (
@@ -45,22 +47,16 @@ export function ResizableWorkbench({
       {controls ? <div className="workbench-controls">{controls}</div> : null}
       <div className="layout-toolbar" aria-label="工作区布局">
         <span className="caption">请求与响应布局</span>
-        <button
-          type="button"
-          className={direction === "vertical" ? "layout-choice active" : "layout-choice"}
-          aria-pressed={direction === "vertical"}
-          onClick={() => setDirection("vertical")}
-        >上下</button>
-        <button
-          type="button"
-          className={direction === "horizontal" ? "layout-choice active" : "layout-choice"}
-          aria-pressed={direction === "horizontal"}
-          onClick={() => setDirection("horizontal")}
-        >左右</button>
+        <Segmented<Direction>
+          aria-label="请求与响应布局"
+          value={direction}
+          options={[{ label: "上下", value: "vertical" }, { label: "左右", value: "horizontal" }]}
+          onChange={setDirection}
+        />
       </div>
       <div
         ref={frame}
-        className={`workbench-split workbench-${direction}`}
+        className={`workbench-split-frame workbench-split workbench-${direction}`}
         style={{ "--split-ratio": `${ratio}%` } as CSSProperties}
       >
         <div className="workbench-request">{request}</div>

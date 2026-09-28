@@ -12,6 +12,9 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { AssertionType, FieldNode, FieldTree } from "../api/types";
+import { AppProviders } from "../theme/AppProviders";
+import { selectAntOption } from "../test/antd";
+import { LeaveGuardProvider, useLeaveAggregate } from "../hooks/leaveGuard";
 import { FieldTreePanel } from "./FieldTreePanel";
 
 const TYPES: AssertionType[] = [
@@ -59,7 +62,7 @@ function treeWith(type: string, text: string): FieldNode {
   };
 }
 
-function panel(node: FieldNode, sourceKey: string) {
+function panel(node: FieldNode, sourceKey: string, onChange = vi.fn()) {
   const tree: FieldTree = { root: node, node_count: 3 };
   return (
     <FieldTreePanel
@@ -74,17 +77,23 @@ function panel(node: FieldNode, sourceKey: string) {
       assertions={[]}
       results={new Map()}
       readOnly={false}
-      onChange={vi.fn()}
+      onChange={onChange}
       emptyHint="（空）"
     />
   );
 }
 
+function DirtyProbe() {
+  const state = useLeaveAggregate();
+  return <output aria-label="字段断言离开状态">{state.dirty ? "dirty" : "clean"}</output>;
+}
+
 /** 选中 data.id 那一行；`data` 默认收起，先展开它。 */
 function selectDataId(): void {
-  const expand = screen.queryByRole("button", { name: "展开data" });
-  if (expand !== null) fireEvent.click(expand);
-  fireEvent.click(screen.getByRole("button", { name: "id" }));
+  const data = screen.getByRole("treeitem", { name: /data object/ });
+  const switcher = data.querySelector<HTMLElement>(".ant-tree-switcher");
+  if (data.getAttribute("aria-expanded") === "false" && switcher !== null) fireEvent.click(switcher);
+  fireEvent.click(screen.getByText("id"));
 }
 
 /** 详情区文本：包含当前字段的类型与定位路径。 */
@@ -94,8 +103,37 @@ function detailText(): string {
 }
 
 describe("字段面板的选中节点跟随当前树", () => {
+  it("再次点击当前字段时保留未应用断言实例、离开登记与最终 selector", async () => {
+    const onChange = vi.fn();
+    render(
+      <LeaveGuardProvider>
+        {panel(treeWith("string", "abc"), "run-1", onChange)}
+        <DirtyProbe />
+      </LeaveGuardProvider>,
+      { wrapper: AppProviders },
+    );
+
+    selectDataId();
+    fireEvent.click(screen.getByRole("button", { name: "＋添加断言" }));
+    await selectAntOption("断言类型", "等于");
+    const expectedInput = screen.getByLabelText("期望值") as HTMLInputElement;
+    fireEvent.change(expectedInput, { target: { value: "未应用值" } });
+    expect(screen.getByLabelText("字段断言离开状态").textContent).toBe("dirty");
+
+    // Tree 对已选节点再次触发 onSelect 时传空 keys；业务表单必须保持同一实例。
+    fireEvent.click(screen.getByText("id"));
+    expect(screen.getByLabelText("期望值")).toBe(expectedInput);
+    expect(expectedInput.value).toBe("未应用值");
+    expect(screen.getByLabelText("字段断言离开状态").textContent).toBe("dirty");
+
+    fireEvent.click(screen.getByRole("button", { name: "添加这条断言" }));
+    const submitted = onChange.mock.calls[0]?.[0]?.[0];
+    expect(submitted.selector).toEqual([{ kind: "key", key: "data" }, { kind: "key", key: "id" }]);
+    expect(submitted.parameters).toEqual({ expected: { type: "string", text: "未应用值" } });
+  });
+
   it("同一路径在新树里换了类型与值：详情与试算都用新节点", () => {
-    const { rerender } = render(panel(treeWith("string", "abc"), "run-1"));
+    const { rerender } = render(panel(treeWith("string", "abc"), "run-1"), { wrapper: AppProviders });
     selectDataId();
     expect(detailText()).toContain("string");
     expect(detailText()).toContain("id");
@@ -109,22 +147,22 @@ describe("字段面板的选中节点跟随当前树", () => {
     expect(document.body.textContent).toContain("9007199254740993");
     expect(document.body.textContent).not.toContain("abc");
     // 选中状态没有被无谓地清掉：路径还在。
-    expect(document.querySelector(".field-row-active")).not.toBeNull();
+    expect(document.querySelector(".ant-tree-node-selected")).not.toBeNull();
   });
 
   it("来源换代时清掉选中：路径还在也不能沿用", () => {
-    const { rerender } = render(panel(treeWith("string", "abc"), "run-1"));
+    const { rerender } = render(panel(treeWith("string", "abc"), "run-1"), { wrapper: AppProviders });
     selectDataId();
-    expect(document.querySelector(".field-row-active")).not.toBeNull();
+    expect(document.querySelector(".ant-tree-node-selected")).not.toBeNull();
 
     // 换了一条运行（或换了一份样例）：路径碰巧还在，但它指向另一份数据。
     rerender(panel(treeWith("string", "xyz"), "run-2"));
-    expect(document.querySelector(".field-row-active")).toBeNull();
+    expect(document.querySelector(".ant-tree-node-selected")).toBeNull();
     expect(detailText()).toBe("");
   });
 
   it("路径在新树里消失时收起详情", () => {
-    const { rerender } = render(panel(treeWith("string", "abc"), "run-1"));
+    const { rerender } = render(panel(treeWith("string", "abc"), "run-1"), { wrapper: AppProviders });
     selectDataId();
     expect(detailText()).not.toBe("");
 
@@ -143,7 +181,7 @@ describe("字段面板的选中节点跟随当前树", () => {
 
   it("同一路径的类型变化后，用它试算的是新值", () => {
     // “试算”走的是字段行旁的断言列，样例来自当前节点。
-    const { rerender } = render(panel(treeWith("string", "first"), "run-1"));
+    const { rerender } = render(panel(treeWith("string", "first"), "run-1"), { wrapper: AppProviders });
     selectDataId();
     const detail = document.querySelector(".field-detail") as HTMLElement;
     expect(within(detail).getByRole("button", { name: /添加|保存/ })).toBeTruthy();

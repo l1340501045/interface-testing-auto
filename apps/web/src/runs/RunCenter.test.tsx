@@ -35,6 +35,7 @@ vi.mock("./useRuns", async (importOriginal) => {
 });
 
 import { apiSend } from "../api/client";
+import { AppProviders } from "../theme/AppProviders";
 import { RunCenter } from "./RunCenter";
 
 const environments = [{
@@ -56,7 +57,7 @@ describe("独立任务与报告页面", () => {
   it("任务中心按真实运行 id 取消并刷新列表", async () => {
     vi.mocked(apiSend).mockResolvedValue({});
     const openReport = vi.fn();
-    render(<RunCenter workspaceId="ws-1" projectId="project-1" environments={environments} canCancel mode="tasks" active onOpenReport={openReport} />);
+    render(<RunCenter workspaceId="ws-1" projectId="project-1" environments={environments} canCancel mode="tasks" active onOpenReport={openReport} />, { wrapper: AppProviders });
 
     fireEvent.click(screen.getAllByRole("button", { name: "查看报告" })[0]!);
     expect(openReport).toHaveBeenCalledWith(run.id);
@@ -71,16 +72,17 @@ describe("独立任务与报告页面", () => {
   });
 
   it("测试报告只有显式选择后才展示详情", () => {
-    render(<RunCenter workspaceId="ws-1" projectId="project-1" environments={environments} canCancel={false} mode="reports" active />);
-    expect(screen.queryByText("最终结果：")).toBeNull();
+    render(<RunCenter workspaceId="ws-1" projectId="project-1" environments={environments} canCancel={false} mode="reports" active />, { wrapper: AppProviders });
+    expect(screen.queryByText("最终结果")).toBeNull();
     fireEvent.click(screen.getAllByRole("button", { name: "查看报告" })[0]!);
-    expect(screen.getByText("最终结果：")).toBeTruthy();
+    expect(screen.getByText("最终结果")).toBeTruthy();
   });
 
   it("任务跳转只消费一次；切页不覆盖新选择，同一运行的新跳转仍生效", () => {
     const firstRequest = { runId: run.id, token: 1, workspaceId: "ws-1", projectId: "project-1" };
     const view = render(
       <RunCenter workspaceId="ws-1" projectId="project-1" environments={environments} canCancel={false} mode="reports" active reportRequest={firstRequest} />,
+      { wrapper: AppProviders },
     );
     expect(screen.getByRole("heading", { name: `运行 ${run.id.slice(0, 8)} 的报告` })).toBeTruthy();
 
@@ -106,6 +108,7 @@ describe("独立任务与报告页面", () => {
         active
         reportRequest={{ runId: run.id, token: 1, workspaceId: "ws-1", projectId: "project-1" }}
       />,
+      { wrapper: AppProviders },
     );
     expect(screen.queryByRole("heading", { name: `运行 ${run.id.slice(0, 8)} 的报告` })).toBeNull();
   });

@@ -9,6 +9,7 @@
  * 断言编辑，这里的“全部条件”只是汇总视图，不是要求用户先建公共规则。
  */
 import type { AssertionResult, AssertionType, CaseAssertion } from "../api/types";
+import { Button, Select, Space, Table, Tag } from "antd";
 import { Hint } from "../components/Feedback";
 import { AssertionColumn } from "./AssertionColumn";
 import { FieldTreePanel } from "./FieldTreePanel";
@@ -138,18 +139,14 @@ function AssertionSummary({
     );
   }
   return (
-    <table className="report-table">
-      <thead>
-        <tr>
-          <th>字段</th>
-          <th>类型</th>
-          <th>严重级别</th>
-          <th>最近结论</th>
-          <th>处理</th>
-        </tr>
-      </thead>
-      <tbody>
-        {assertions.map((item) => {
+    <Table
+      className="report-table"
+      size="small"
+      pagination={false}
+      rowKey="id"
+      dataSource={assertions}
+      columns={[
+        { title: "字段", render: (_: unknown, item: CaseAssertion) => {
           const first = item.selector[0];
           const rows = item.target_source === "request.query"
             ? request.query_params
@@ -157,51 +154,41 @@ function AssertionSummary({
               ? request.headers
               : [];
           const orphaned = first?.kind === "row" && !rows.some((row) => row.row_id === first.row_id);
-          const canRebind = first?.kind === "row" && (item.target_source === "request.query" || item.target_source === "request.header");
-          return (
-          <tr key={item.id}>
-            <td>
+          return <>
               {item.target_source}
               {item.selector.length > 0 ? ` · ${item.selector.length} 级定位` : ""}
-              {orphaned ? <strong className="field-warn"> · 字段已删除</strong> : null}
+              {orphaned ? <Tag color="error">字段已删除</Tag> : null}
               {first && first.kind !== "row" && (item.target_source === "request.query" || item.target_source === "request.header") ? <span className="caption"> · 历史位置条件</span> : null}
-            </td>
-            <td>{item.type}</td>
-            <td>{item.severity === "error" ? "必需" : "提示"}</td>
-            <td>{assertionResultLabel(results.get(item.id))}</td>
-            <td>
-              {readOnly ? null : (
-                <span className="inline-actions">
+          </>;
+        } },
+        { title: "类型", dataIndex: "type" },
+        { title: "严重级别", render: (_: unknown, item: CaseAssertion) => item.severity === "error" ? "必需" : "提示" },
+        { title: "最近结论", render: (_: unknown, item: CaseAssertion) => assertionResultLabel(results.get(item.id)) },
+        { title: "处理", render: (_: unknown, item: CaseAssertion) => {
+          const first = item.selector[0];
+          const rows = item.target_source === "request.query" ? request.query_params : item.target_source === "request.header" ? request.headers : [];
+          const orphaned = first?.kind === "row" && !rows.some((row) => row.row_id === first.row_id);
+          const canRebind = first?.kind === "row" && (item.target_source === "request.query" || item.target_source === "request.header");
+          return readOnly ? null : (
+                <Space className="inline-actions" size={4}>
                   {orphaned && canRebind ? (
-                    <label>
-                      重新绑定
-                      <select
-                        aria-label={`重新绑定条件 ${item.id}`}
-                        value=""
-                        onChange={(event) => {
-                          const rowId = event.target.value;
-                          if (rowId === "" || first?.kind !== "row") return;
-                          onChange(assertions.map((assertion) => assertion.id === item.id ? { ...assertion, selector: [{ kind: "row", row_id: rowId }, ...assertion.selector.slice(1)] } : assertion));
-                        }}
-                      >
-                        <option value="">选择当前字段…</option>
-                        {rows.map((row, index) => row.row_id ? (
-                          <option key={row.row_id} value={row.row_id}>
-                            {index + 1}. {row.name || "未命名字段"}{row.enabled === false ? "（已停用）" : ""}
-                          </option>
-                        ) : null)}
-                      </select>
-                    </label>
+                    <Select
+                      aria-label={`重新绑定条件 ${item.id}`}
+                      value={undefined}
+                      placeholder="选择当前字段…"
+                      onChange={(rowId: string) => {
+                        if (first?.kind !== "row") return;
+                        onChange(assertions.map((assertion) => assertion.id === item.id ? { ...assertion, selector: [{ kind: "row", row_id: rowId }, ...assertion.selector.slice(1)] } : assertion));
+                      }}
+                      options={rows.flatMap((row, index) => row.row_id ? [{ value: row.row_id, label: `${index + 1}. ${row.name || "未命名字段"}${row.enabled === false ? "（已停用）" : ""}` }] : [])}
+                    />
                   ) : null}
-                  <button type="button" onClick={() => onChange(removeAssertion(assertions, item.id))}>删除</button>
-                </span>
-              )}
-            </td>
-          </tr>
+                  <Button htmlType="button" size="small" danger aria-label="删除" onClick={() => onChange(removeAssertion(assertions, item.id))}>删除</Button>
+                </Space>
           );
-        })}
-      </tbody>
-    </table>
+        } },
+      ]}
+    />
   );
 }
 

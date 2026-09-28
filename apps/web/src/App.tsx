@@ -4,7 +4,9 @@
  * 范围（工作空间、项目、环境）只保存在组件状态里，任何一次范围切换都会清空
  * 下游选择，避免把上一个项目的用例或环境带到当前项目显示。
  */
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { ArrowLeftOutlined, LogoutOutlined, PlusOutlined, SettingOutlined } from "@ant-design/icons";
+import { Alert, Button, Input, Layout, Modal, Select, Tabs } from "antd";
 
 import { ApiError, apiSend, invalidateClientSession } from "./api/client";
 import type { SessionInfo } from "./api/types";
@@ -13,6 +15,7 @@ import { CaseBrowser } from "./cases/CaseBrowser";
 import { CaseEditor } from "./cases/CaseEditor";
 import { useFolders } from "./cases/useCases";
 import { Empty, ErrorText, Hint, Loading } from "./components/Feedback";
+import { trapModalTabEndpoints } from "./components/modalFocus";
 import { LeaveGuardProvider, useLeaveAggregate, useLeaveReport } from "./hooks/leaveGuard";
 import type { LeaveState } from "./hooks/leaveGuard";
 import { PAGE_LABEL, pageFromHash, pageHash, type AppPage } from "./navigation";
@@ -21,6 +24,7 @@ import { useEnvironments, useProjects } from "./projects/useProjects";
 import { RunCenter } from "./runs/RunCenter";
 import { LoginPage } from "./session/LoginPage";
 import { useSession } from "./session/useSession";
+import { AppProviders } from "./theme/AppProviders";
 
 /** 与后端 permissions.py 的中文角色名保持一致的展示文案。 */
 const ROLE_LABEL: Record<string, string> = { admin: "管理员", editor: "编辑者", viewer: "查看者" };
@@ -54,6 +58,15 @@ interface EditorTarget {
   method: string;
   dirty: boolean;
   busy: boolean;
+}
+
+interface LeaveIntent {
+  attemptId: number;
+  owner: string;
+  except?: string;
+  allowBusy: boolean;
+  message: string;
+  action: () => void;
 }
 
 function newTabId(): string {
@@ -96,27 +109,27 @@ function ProjectCreateForm({
   return (
     <div className="project-create">
       <label htmlFor={`${idPrefix}-key`}>项目键（字母、数字、下划线或短横线）</label>
-      <input
+      <Input
         id={`${idPrefix}-key`}
         value={projectKey}
         disabled={busy}
         onChange={(event) => onKeyChange(event.target.value)}
       />
       <label htmlFor={`${idPrefix}-name`}>项目名称</label>
-      <input
+      <Input
         id={`${idPrefix}-name`}
         value={projectName}
         disabled={busy}
         onChange={(event) => onNameChange(event.target.value)}
       />
       <div className="actions">
-        <button type="button" onClick={onSubmit} disabled={busy}>
+        <Button type="primary" htmlType="button" onClick={onSubmit} loading={busy}>
           {busy ? "创建中…" : "创建项目"}
-        </button>
+        </Button>
         {onCancel ? (
-          <button type="button" onClick={onCancel} disabled={busy}>
+          <Button htmlType="button" onClick={onCancel} disabled={busy}>
             取消
-          </button>
+          </Button>
         ) : null}
       </div>
       {error ? <ErrorText message={error} /> : null}
@@ -126,6 +139,8 @@ function ProjectCreateForm({
 
 function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => void }) {
   const [page, setPage] = useState<AppPage>(() => pageFromHash(window.location.hash));
+  const appHeadRef = useRef<HTMLElement | null>(null);
+  const [appHeadHeight, setAppHeadHeight] = useState(73);
   const [workspaceId, setWorkspaceId] = useState<string | null>(session.workspaces[0]?.id ?? null);
   const [projectId, setProjectId] = useState<string | null>(null);
   const [environmentId, setEnvironmentId] = useState<string | null>(null);
@@ -142,12 +157,11 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   const [closeDialog, setCloseDialog] = useState<{ tabIds: string[]; attemptId: number; saving: boolean } | null>(null);
   const closeAttemptRef = useRef(0);
   const closeSavingAttemptRef = useRef<number | null>(null);
-  const workspaceTabRefs = useRef(new Map<string, HTMLButtonElement>());
-  const workspaceTabScrollRef = useRef<HTMLDivElement | null>(null);
   const newRequestButtonRef = useRef<HTMLButtonElement | null>(null);
   const closeDialogCancelRef = useRef<HTMLButtonElement | null>(null);
   const closeDialogReturnFocusRef = useRef<HTMLElement | null>(null);
-  const closeDialogWasOpenRef = useRef(false);
+  const [leaveIntent, setLeaveIntent] = useState<LeaveIntent | null>(null);
+  const leaveAttemptRef = useRef(0);
   const [selectedCaseId, setSelectedCaseId] = useState<string | null>(null);
   const [reportRequest, setReportRequest] = useState<{
     runId: string;
@@ -157,47 +171,8 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   } | null>(null);
   const reportRequestToken = useRef(0);
 
-  const revealActiveTab = useCallback(() => {
-    if (activeEditorId === null) return;
-    const scroller = workspaceTabScrollRef.current;
-    const tab = workspaceTabRefs.current.get(activeEditorId);
-    if (scroller === null || tab === undefined) return;
-    const viewport = scroller.getBoundingClientRect();
-    const item = tab.getBoundingClientRect();
-    if (item.left < viewport.left) scroller.scrollLeft -= viewport.left - item.left;
-    else if (item.right > viewport.right) scroller.scrollLeft += item.right - viewport.right;
-  }, [activeEditorId]);
-
-  useLayoutEffect(() => {
-    revealActiveTab();
-  }, [revealActiveTab, editor?.name, editor?.method, editor?.dirty, editor?.busy]);
-
   useEffect(() => {
-    const scroller = workspaceTabScrollRef.current;
-    if (scroller === null) return;
-    const handleResize = () => revealActiveTab();
-    window.addEventListener("resize", handleResize);
-    if (typeof ResizeObserver === "undefined") return () => window.removeEventListener("resize", handleResize);
-    const observer = new ResizeObserver(handleResize);
-    observer.observe(scroller);
-    return () => {
-      observer.disconnect();
-      window.removeEventListener("resize", handleResize);
-    };
-  }, [revealActiveTab]);
-
-  useEffect(() => {
-    if (closeDialog !== null) {
-      closeDialogWasOpenRef.current = true;
-      closeDialogCancelRef.current?.focus();
-      return;
-    }
-    if (!closeDialogWasOpenRef.current) return;
-    closeDialogWasOpenRef.current = false;
-    const previous = closeDialogReturnFocusRef.current;
-    closeDialogReturnFocusRef.current = null;
-    if (previous?.isConnected && !(previous instanceof HTMLButtonElement && previous.disabled)) previous.focus();
-    else newRequestButtonRef.current?.focus();
+    if (closeDialog !== null) closeDialogCancelRef.current?.focus();
   }, [closeDialog]);
 
   const [caseRefresh, setCaseRefresh] = useState(0);
@@ -210,6 +185,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   const [newProjectKey, setNewProjectKey] = useState("");
   const [newProjectName, setNewProjectName] = useState("");
   const [projectError, setProjectError] = useState<string | null>(null);
+  const [shellFeedback, setShellFeedback] = useState<string | null>(null);
   /** 已经有项目时新建表单默认收起，避免把选择区挤走；空态则一直展开。 */
   const [projectCreateOpen, setProjectCreateOpen] = useState(false);
   /**
@@ -280,6 +256,20 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
       window.history.replaceState(null, "", pageHash(pageFromHash(window.location.hash)));
     }
     return () => window.removeEventListener("hashchange", syncPage);
+  }, []);
+
+  useEffect(() => {
+    const head = appHeadRef.current;
+    if (head === null) return;
+    const update = () => setAppHeadHeight(head.getBoundingClientRect().height || 73);
+    update();
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", update);
+      return () => window.removeEventListener("resize", update);
+    }
+    const observer = new ResizeObserver(update);
+    observer.observe(head);
+    return () => observer.disconnect();
   }, []);
   const [settingsFocusTarget, setSettingsFocusTarget] = useState<string | null>(null);
   const [settingsSourceTabId, setSettingsSourceTabId] = useState<string | null>(null);
@@ -366,7 +356,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
       return;
     }
     if (editors.length >= 20) {
-      window.alert("当前项目最多打开 20 个请求，请先关闭一个标签。");
+      setShellFeedback("当前项目最多打开 20 个请求，请先关闭一个标签。");
       return;
     }
     const tabId = newTabId();
@@ -406,23 +396,57 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
    * 不在这里拦一次，每个入口都得各写一份判断，漏掉任何一个就是静默丢数据。正在
    * 保存或发布时同样拦截：请求会完成，但用户看不到结果，等于把结论丢掉了。
    */
-  const confirmLeaveEditor = useCallback(
-    (except?: string): boolean => {
+  const requestLeaveEditor = useCallback(
+    (action: () => void, except?: string, allowBusy = false, message = "当前有未保存的修改（表单或用例），离开后这些修改会丢失。确定离开吗？") => {
       // 取调用**当下**的汇总，而不是本函数被创建那一帧的：异步回调里的判断同样要
       // 看得见等待期间新产生的草稿。
       const current = liveLeaveState.current;
       // 由某个表单自己发起的离开（见下面的新建项目）要把它自己排除掉，否则它自己的
       // 草稿会把这次切换判成“有未保存修改”，弹一个无所指的确认框。
       const state = except === undefined ? current : current.without(except);
-      if (!state.dirty && !state.busy) return true;
-      if (state.busy) {
-        window.alert("当前有保存、发布或受理结果待确认；普通切换不能丢弃该操作，请先回到标签处理。只有明确退出登录可清除本地确认依据。");
-        return false;
+      if (!state.dirty && !state.busy) {
+        action();
+        return;
       }
-      return window.confirm("当前有未保存的修改（表单或用例），离开后这些修改会丢失。确定离开吗？");
+      if (state.busy && !allowBusy) {
+        setShellFeedback("当前有保存、发布或受理结果待确认；普通切换不能丢弃该操作，请先回到标签处理。只有明确退出登录可清除本地确认依据。");
+        return;
+      }
+      leaveAttemptRef.current += 1;
+      setLeaveIntent({
+        attemptId: leaveAttemptRef.current,
+        owner: `${scope}/${session.user.user_id}`,
+        except,
+        allowBusy,
+        message,
+        action,
+      });
     },
-    [],
+    [scope, session.user.user_id],
   );
+
+  const cancelLeaveIntent = useCallback(() => {
+    leaveAttemptRef.current += 1;
+    setLeaveIntent(null);
+  }, []);
+
+  const confirmLeaveIntent = useCallback(() => {
+    const intent = leaveIntent;
+    if (intent === null || intent.attemptId !== leaveAttemptRef.current) return;
+    if (intent.owner !== `${liveScope.current}/${session.user.user_id}`) {
+      cancelLeaveIntent();
+      return;
+    }
+    const current = liveLeaveState.current;
+    const state = intent.except === undefined ? current : current.without(intent.except);
+    if (state.busy && !intent.allowBusy) {
+      cancelLeaveIntent();
+      setShellFeedback("当前有保存、发布或受理结果待确认；普通切换不能丢弃该操作，请先回到标签处理。只有明确退出登录可清除本地确认依据。");
+      return;
+    }
+    setLeaveIntent(null);
+    intent.action();
+  }, [cancelLeaveIntent, leaveIntent, session.user.user_id]);
 
   // 关闭页签或窗口同样会丢掉草稿，且没有第二次机会。只在确有未保存内容或进行中
   // 的操作时挂上监听，平时不打扰正常的关闭动作。
@@ -475,7 +499,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
     if (mode === "discard") {
       const state = liveLeaveState.current.matching(targets.map((item) => `case-tab:${item.tabId}`));
       if (closeSavingAttemptRef.current === attemptId || state.busy || targets.some((item) => closeControllers.current.get(item.tabId)?.state().busy)) {
-        window.alert("保存仍在进行，不能放弃并关闭；可以取消本次关闭，保存结果仍会保留。");
+        setShellFeedback("保存仍在进行，不能放弃并关闭；可以取消本次关闭，保存结果仍会保留。");
         return;
       }
     }
@@ -487,7 +511,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
           if (controller === undefined) {
             closeSavingAttemptRef.current = null;
             setCloseDialog((current) => current?.attemptId === attemptId ? { ...current, saving: false } : current);
-            window.alert("保存未完成或保存期间出现了新输入，目标标签均保留；已经成功的服务端保存不会回滚。");
+            setShellFeedback("保存未完成或保存期间出现了新输入，目标标签均保留；已经成功的服务端保存不会回滚。");
             return;
           }
           const saved = await controller.save();
@@ -498,7 +522,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
           if (!saved) {
             closeSavingAttemptRef.current = null;
             setCloseDialog((current) => current?.attemptId === attemptId ? { ...current, saving: false } : current);
-            window.alert("保存未完成或保存期间出现了新输入，目标标签均保留；已经成功的服务端保存不会回滚。");
+            setShellFeedback("保存未完成或保存期间出现了新输入，目标标签均保留；已经成功的服务端保存不会回滚。");
             return;
           }
           const root = controller.state();
@@ -506,7 +530,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
           if (root.busy || root.dirty || child.busy || child.dirty) {
             closeSavingAttemptRef.current = null;
             setCloseDialog((current) => current?.attemptId === attemptId ? { ...current, saving: false } : current);
-            window.alert("保存完成后又出现新输入或新操作，目标标签均保留；已经成功的服务端保存不会回滚。");
+            setShellFeedback("保存完成后又出现新输入或新操作，目标标签均保留；已经成功的服务端保存不会回滚。");
             return;
           }
         }
@@ -522,7 +546,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
         if (latestTargetState.busy || latestTargetState.dirty) {
           closeSavingAttemptRef.current = null;
           setCloseDialog((current) => current?.attemptId === attemptId ? { ...current, saving: false } : current);
-          window.alert("仍有尚未应用的 cURL、断言或批量输入，请先回到对应标签应用或明确放弃。");
+          setShellFeedback("仍有尚未应用的 cURL、断言或批量输入，请先回到对应标签应用或明确放弃。");
           return;
         }
         closeSavingAttemptRef.current = null;
@@ -537,11 +561,21 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
     setCloseDialog(null);
   }, []);
 
+  const restoreCloseDialogFocus = useCallback(() => {
+    const previous = closeDialogReturnFocusRef.current;
+    closeDialogReturnFocusRef.current = null;
+    // Modal 自身负责把焦点还给仍存在的触发按钮。只有成功关闭标签使原按钮
+    // 已卸载或禁用时，才补上业务上的后备落点，避免与框架焦点锁竞争。
+    if (!previous?.isConnected || (previous instanceof HTMLButtonElement && previous.disabled)) {
+      newRequestButtonRef.current?.focus();
+    }
+  }, []);
+
   const requestCloseEditors = useCallback((tabIds: readonly string[]) => {
     const targets = liveEditors.current.filter((item) => tabIds.includes(item.tabId));
     const state = liveLeaveState.current.matching(targets.map((item) => `case-tab:${item.tabId}`));
     if (state.busy || targets.some((item) => closeControllers.current.get(item.tabId)?.state().busy)) {
-      window.alert("目标标签仍有保存、发布或受理结果待确认，请等待或回到标签处理后再关闭。");
+      setShellFeedback("目标标签仍有保存、发布或受理结果待确认，请等待或回到标签处理后再关闭。");
       return;
     }
     if (!state.dirty && targets.every((item) => !closeControllers.current.get(item.tabId)?.state().dirty)) {
@@ -557,35 +591,25 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
     if (tabId !== null) requestCloseEditors([tabId]);
   }, [activeEditorId, requestCloseEditors]);
 
-  const handleCloseDialogKeyDown = useCallback((event: KeyboardEvent<HTMLElement>) => {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      cancelCloseDialog();
-      return;
-    }
-    if (event.key !== "Tab") return;
-    const focusable = Array.from(
-      event.currentTarget.querySelectorAll<HTMLElement>('button:not([disabled]), select:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'),
-    );
-    if (focusable.length === 0) return;
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
-    }
-  }, [cancelCloseDialog]);
-
   const requestLogout = useCallback(() => {
     const current = liveLeaveState.current;
-    if (current.busy && !window.confirm("仍有操作的受理结果未知。退出会清除本地标签，但不会取消远端运行；之后需要重新登录并到任务中心核对。仍要退出吗？")) return;
-    if (!current.busy && current.dirty && !window.confirm("仍有未保存修改，退出会清除这些本地内容。仍要退出吗？")) return;
-    invalidateClientSession();
-    onLogout();
-  }, [onLogout]);
+    const action = () => {
+      invalidateClientSession();
+      onLogout();
+    };
+    if (!current.dirty && !current.busy) {
+      action();
+      return;
+    }
+    requestLeaveEditor(
+      action,
+      undefined,
+      true,
+      current.busy
+        ? "仍有操作的受理结果未知。退出会清除本地标签，但不会取消远端运行；之后需要重新登录并到任务中心核对。仍要退出吗？"
+        : "仍有未保存修改，退出会清除这些本地内容。仍要退出吗？",
+    );
+  }, [onLogout, requestLeaveEditor]);
 
   /**
    * 保存成功后的选中：只认发起保存时所在的范围。
@@ -712,7 +736,9 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
       // 切到新项目同样会卸载编辑器：先问一次，用户不确认就只建项目、不切范围。
       // 排除创建表单自己：它的草稿刚被清掉、结果也已经看到，把它算进“未保存内容”会弹出
       // 一个无所指的确认框（真实页面上确实弹了）。
-      if (typeof id === "string" && confirmLeaveEditor("project-create")) setProjectId(id);
+      if (typeof id === "string") requestLeaveEditor(() => {
+        if (liveWorkspace.current === startedIn) setProjectId(id);
+      }, "project-create");
     } catch (cause) {
       // 失败提示同理：属于旧工作空间的失败不该挂在新工作空间的界面上。
       if (liveWorkspace.current !== startedIn) return;
@@ -729,17 +755,17 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
         <h1>还没有可访问的工作空间</h1>
         <Hint>账号已登录，但还没有加入任何工作空间；请由管理员在本机初始化命令中创建。</Hint>
         <div className="actions">
-          <button type="button" onClick={requestLogout}>
+          <Button htmlType="button" icon={<LogoutOutlined aria-hidden="true" />} onClick={requestLogout}>
             退出登录
-          </button>
+          </Button>
         </div>
       </main>
     );
   }
 
   return (
-    <div className="app">
-      <header className="app-head">
+    <Layout className="app" style={{ "--app-head-height": `${appHeadHeight}px` } as CSSProperties}>
+      <Layout.Header ref={appHeadRef} className="app-head">
         <div className="brand">
           <span className="eyebrow">接口测试与巡检平台</span>
           <h1>接口工作台</h1>
@@ -748,39 +774,28 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
         <div className="scope">
           <span className="param">
             <label htmlFor="scope-workspace">工作空间</label>
-            <select
+            <Select
               id="scope-workspace"
+              aria-label="工作空间"
+              data-selected-value={workspaceId}
               value={workspaceId}
-              onChange={(event) => {
-                if (!confirmLeaveEditor()) return;
-                setWorkspaceId(event.target.value);
-              }}
-            >
-              {session.workspaces.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.name}
-                </option>
-              ))}
-            </select>
+              options={session.workspaces.map((item) => ({ value: item.id, label: item.name }))}
+              onChange={(value) => requestLeaveEditor(() => setWorkspaceId(value))}
+            />
           </span>
           <span className="param">
             <label htmlFor="scope-project">项目</label>
-            <select
+            <Select
               id="scope-project"
+              aria-label="项目"
+              data-selected-value={projectId ?? ""}
               value={projectId ?? ""}
               disabled={projectList.length === 0}
-              onChange={(event) => {
-                if (!confirmLeaveEditor()) return;
-                setProjectId(event.target.value || null);
-              }}
-            >
-              {projectList.length === 0 ? <option value="">暂无项目</option> : null}
-              {projectList.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.name}
-                </option>
-              ))}
-            </select>
+              options={projectList.length === 0
+                ? [{ value: "", label: "暂无项目" }]
+                : projectList.map((item) => ({ value: item.id, label: item.name }))}
+              onChange={(value) => requestLeaveEditor(() => setProjectId(value || null))}
+            />
           </span>
           {/*
             新建项目的入口不能只留在空态：工作空间里已经有项目时，管理员/编辑者仍然
@@ -788,13 +803,15 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
             查看者不显示这个入口，也不显示可提交的表单。
           */}
           {canCreateProject && projectList.length > 0 ? (
-            <button
-              type="button"
+            <Button
+              htmlType="button"
+              icon={<PlusOutlined aria-hidden="true" />}
+              aria-label={projectCreateOpen ? "收起新建项目" : "＋新建项目"}
               onClick={() => setProjectCreateOpen((open) => !open)}
               disabled={projectBusy}
             >
-              {projectCreateOpen ? "收起新建项目" : "＋新建项目"}
-            </button>
+              {projectCreateOpen ? "收起新建项目" : "新建项目"}
+            </Button>
           ) : null}
         </div>
 
@@ -803,12 +820,15 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
             {session.user.display_name}
             {currentWorkspace ? `（${roleLabel(currentWorkspace.role)}）` : ""}
           </span>
-          <button type="button" onClick={requestLogout}>
+          <Button htmlType="button" icon={<LogoutOutlined aria-hidden="true" />} onClick={requestLogout}>
             退出登录
-          </button>
+          </Button>
         </div>
-      </header>
+      </Layout.Header>
 
+      {shellFeedback ? (
+        <Alert className="shell-feedback" type="warning" showIcon closable title={shellFeedback} onClose={() => setShellFeedback(null)} />
+      ) : null}
       {projects.error ? <ErrorText message={projects.error.message} /> : null}
 
       {/**
@@ -832,9 +852,10 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
       {projectList.length > 0 ? (
         <nav className="primary-nav" aria-label="主要功能">
           {(Object.keys(PAGE_LABEL) as AppPage[]).map((item) => (
-            <button
+            <Button
               key={item}
-              type="button"
+              htmlType="button"
+              type="text"
               className={page === item ? "nav-item nav-item-active" : "nav-item"}
               aria-current={page === item ? "page" : undefined}
               onClick={() => {
@@ -843,7 +864,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
               }}
             >
               {PAGE_LABEL[item]}
-            </button>
+            </Button>
           ))}
         </nav>
       ) : null}
@@ -887,62 +908,60 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
               B 的列表仍按 A 的目录过滤（看起来像“B 项目没有用例”），新建还会把 A 的
               目录 id 提交给 B，被服务端按“目录不存在”拒绝。
             */}
-            <CaseBrowser
-              key={`cases:${scope}`}
-              workspaceId={workspaceId}
-              projectId={projectId ?? ""}
-              canEdit={canEdit(currentProject?.role ?? null)}
-              selectedCaseId={selectedCaseId}
-              onSelect={changeCase}
-              onCreate={createCase}
-              folders={folders.data ?? []}
-              foldersLoading={folders.loading}
-              foldersError={folders.error ? folders.error.message : null}
-              onFoldersChanged={onFoldersChanged}
-              refreshToken={caseRefresh}
-            />
+            <div>
+              <CaseBrowser
+                key={`cases:${scope}`}
+                workspaceId={workspaceId}
+                projectId={projectId ?? ""}
+                canEdit={canEdit(currentProject?.role ?? null)}
+                selectedCaseId={selectedCaseId}
+                onSelect={changeCase}
+                onCreate={createCase}
+                folders={folders.data ?? []}
+                foldersLoading={folders.loading}
+                foldersError={folders.error ? folders.error.message : null}
+                onFoldersChanged={onFoldersChanged}
+                refreshToken={caseRefresh}
+              />
+            </div>
 
-              <button type="button" className="sidebar-config-link" onClick={() => { setSettingsSourceTabId(null); navigate("environments"); }}>
+              <Button htmlType="button" icon={<SettingOutlined aria-hidden="true" />} className="sidebar-config-link" onClick={() => { setSettingsSourceTabId(null); navigate("environments"); }}>
                 环境与身份配置
-              </button>
+              </Button>
             </aside>
 
             <div className="main-pane">
               <div className="workspace-tabs">
-                <div ref={workspaceTabScrollRef} className="workspace-tab-scroll" role="tablist" aria-label="已打开的请求">
-                  {editors.map((item) => (
-                    <button
-                      key={item.tabId}
-                      type="button"
-                      role="tab"
-                      aria-selected={item.tabId === activeEditorId}
-                      aria-label={`${item.method} ${item.name}`}
-                      className={item.tabId === activeEditorId ? "workspace-tab workspace-tab-active" : "workspace-tab"}
-                      title={`${item.method} ${item.name}`}
-                      ref={(node) => {
-                        if (node === null) workspaceTabRefs.current.delete(item.tabId);
-                        else workspaceTabRefs.current.set(item.tabId, node);
-                      }}
-                      onClick={() => {
-                        setActiveEditorId(item.tabId);
-                        setSelectedCaseId(item.id);
-                      }}
-                    >
+                <Tabs
+                  className="workspace-tab-scroll"
+                  aria-label="已打开的请求"
+                  styles={{ content: { display: "none" } }}
+                  activeKey={activeEditorId ?? undefined}
+                  onChange={(tabId) => {
+                    const target = editors.find((item) => item.tabId === tabId);
+                    setActiveEditorId(tabId);
+                    setSelectedCaseId(target?.id ?? null);
+                  }}
+                  items={editors.map((item) => ({
+                    key: item.tabId,
+                    label: (
+                      <span className="workspace-tab" title={`${item.method} ${item.name}`}>
                       <span className="workspace-tab-method">{item.method}</span>
                       <span className="workspace-tab-name">{item.name}</span>
                       {item.dirty ? <span aria-label="有未保存修改">●</span> : null}
                       {item.busy ? <span aria-label="操作进行中">处理中</span> : null}
-                    </button>
-                  ))}
-                </div>
+                      </span>
+                    ),
+                  }))}
+                />
                 <div className="workspace-tab-actions" aria-label="请求标签操作">
                   <span className={editors.length >= 20 ? "tab-limit tab-limit-reached" : "tab-limit"}>
                     已打开 {editors.length}/20{editors.length >= 20 ? "，已达上限" : ""}
                   </span>
-                  <button ref={newRequestButtonRef} type="button" title={editors.length >= 20 ? "已达到 20 个标签上限，请先关闭标签" : undefined} onClick={() => createCase(null)} disabled={editors.length >= 20 || !canEdit(currentProject?.role ?? null)}>＋新请求</button>
-                  {editor ? <button type="button" onClick={() => closeEditor()}>关闭当前</button> : null}
-                  {editors.length > 1 ? <button type="button" onClick={() => requestCloseEditors(editors.filter((item) => item.tabId !== activeEditorId).map((item) => item.tabId))}>关闭其他</button> : null}
-                  {editors.length > 0 ? <button type="button" onClick={() => requestCloseEditors(editors.map((item) => item.tabId))}>关闭全部</button> : null}
+                  <Button ref={newRequestButtonRef} htmlType="button" title={editors.length >= 20 ? "已达到 20 个标签上限，请先关闭标签" : undefined} onClick={() => createCase(null)} disabled={editors.length >= 20 || !canEdit(currentProject?.role ?? null)}>＋新请求</Button>
+                  {editor ? <Button htmlType="button" onClick={() => closeEditor()}>关闭当前</Button> : null}
+                  {editors.length > 1 ? <Button htmlType="button" onClick={() => requestCloseEditors(editors.filter((item) => item.tabId !== activeEditorId).map((item) => item.tabId))}>关闭其他</Button> : null}
+                  {editors.length > 0 ? <Button htmlType="button" onClick={() => requestCloseEditors(editors.map((item) => item.tabId))}>关闭全部</Button> : null}
                 </div>
               </div>
               {editors.length === 0 ? <Empty label="从左侧选择一条用例开始编辑，或点击“＋新请求”。" /> : null}
@@ -994,7 +1013,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
                 <h2>环境配置</h2>
                 <p className="caption">维护请求目标、普通变量、访问规则和身份凭证。</p>
               </div>
-              <button type="button" onClick={() => {
+              <Button htmlType="button" icon={<ArrowLeftOutlined aria-hidden="true" />} onClick={() => {
                 const source = editors.find((item) => item.tabId === settingsSourceTabId);
                 if (source) {
                   setActiveEditorId(source.tabId);
@@ -1002,7 +1021,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
                 }
                 setSettingsSourceTabId(null);
                 navigate("workbench");
-              }}>返回接口工作台</button>
+              }}>返回接口工作台</Button>
             </header>
             <div className="settings-grid">
               <EnvironmentPanel
@@ -1080,12 +1099,39 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
           </section>
         </div>
       )}
-      {closeDialog ? (
-        <div className="dialog-backdrop">
-          <section className="close-dialog" role="dialog" aria-modal="true" aria-labelledby="close-dialog-title" onKeyDown={handleCloseDialogKeyDown}>
-            <h2 id="close-dialog-title">关闭请求标签</h2>
+      <Modal
+        open={leaveIntent !== null}
+        title="确认离开"
+        destroyOnHidden={false}
+        mask={{ closable: true }}
+        wrapProps={{ onKeyDown: trapModalTabEndpoints }}
+        onCancel={cancelLeaveIntent}
+        footer={[
+          <Button key="leave" danger htmlType="button" onClick={confirmLeaveIntent}>继续离开</Button>,
+          <Button key="cancel" htmlType="button" autoFocus onClick={cancelLeaveIntent}>取消</Button>,
+        ]}
+      >
+        <p>{leaveIntent?.message}</p>
+      </Modal>
+      <Modal
+        open={closeDialog !== null}
+        title="关闭请求标签"
+        destroyOnHidden={false}
+        mask={{ closable: true }}
+        focusable={{ trap: true, focusTriggerAfterClose: true }}
+        wrapProps={{ onKeyDown: trapModalTabEndpoints }}
+        onCancel={cancelCloseDialog}
+        afterClose={restoreCloseDialogFocus}
+        footer={closeDialog === null ? null : [
+          <Button key="save" type="primary" htmlType="button" loading={closeDialog.saving} onClick={() => void finishCloseEditors(closeDialog.tabIds, "save", closeDialog.attemptId)}>保存并关闭</Button>,
+          <Button key="discard" danger htmlType="button" disabled={closeDialog.saving} onClick={() => void finishCloseEditors(closeDialog.tabIds, "discard", closeDialog.attemptId)}>放弃修改并关闭</Button>,
+          <Button key="cancel" ref={closeDialogCancelRef} htmlType="button" autoFocus onClick={cancelCloseDialog}>取消</Button>,
+        ]}
+      >
+        {closeDialog ? (
+          <div className="close-dialog-content">
             <p>以下标签包含尚未保存或尚未应用的内容，请选择一种处理方式。</p>
-            <ul className="close-dialog-list">
+            <ul className="close-dialog-list" tabIndex={0} aria-label="待关闭的请求标签">
               {liveEditors.current.filter((item) => closeDialog.tabIds.includes(item.tabId)).map((item) => {
                 const root = closeControllers.current.get(item.tabId)?.state() ?? { dirty: item.dirty, busy: item.busy };
                 const child = liveLeaveState.current.descendants(`case-tab:${item.tabId}`);
@@ -1099,19 +1145,14 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
                 return <li key={item.tabId}><strong>{item.method} {item.name}</strong><span>{status}</span></li>;
               })}
             </ul>
-            <div className="actions">
-              <button type="button" className="primary" disabled={closeDialog.saving} onClick={() => void finishCloseEditors(closeDialog.tabIds, "save", closeDialog.attemptId)}>{closeDialog.saving ? "正在保存…" : "保存并关闭"}</button>
-              <button type="button" className="danger" disabled={closeDialog.saving} onClick={() => void finishCloseEditors(closeDialog.tabIds, "discard", closeDialog.attemptId)}>放弃修改并关闭</button>
-              <button ref={closeDialogCancelRef} type="button" onClick={cancelCloseDialog}>取消</button>
-            </div>
-          </section>
-        </div>
-      ) : null}
-    </div>
+          </div>
+        ) : null}
+      </Modal>
+    </Layout>
   );
 }
 
-export function App() {
+function AppContent() {
   const { session, loading, error, expired, login, logout } = useSession();
   const [busy, setBusy] = useState(false);
 
@@ -1151,5 +1192,14 @@ export function App() {
     <LeaveGuardProvider>
       <Shell session={session} onLogout={() => void logout()} />
     </LeaveGuardProvider>
+  );
+}
+
+/** 产品与组件测试共用同一根上下文，避免测试绕过中文、主题或弹层配置。 */
+export function App() {
+  return (
+    <AppProviders>
+      <AppContent />
+    </AppProviders>
   );
 }

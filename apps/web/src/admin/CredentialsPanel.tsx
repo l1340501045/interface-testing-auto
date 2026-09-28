@@ -18,6 +18,8 @@
  *   拒绝一次，绝不让“保存了两行”的成功提示建立在只生效一行之上。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ComponentRef } from "react";
+import { Button, Checkbox, Collapse, Flex, Input, Select, Typography } from "antd";
 
 import { ApiError, apiDelete, apiSend, projectPath } from "../api/client";
 import {
@@ -146,6 +148,7 @@ function setToRows(set: CredentialSet | null): BindingRow[] {
  * 只是把当前值单独作为一个选项列出来，避免出现“显示第一项、提交另一个值”。
  */
 function SecretVersionSelect({
+  id,
   workspaceId,
   projectId,
   secretId,
@@ -154,6 +157,7 @@ function SecretVersionSelect({
   disabled,
   onChange,
 }: {
+  id: string;
   workspaceId: string;
   projectId: string;
   secretId: string;
@@ -162,6 +166,7 @@ function SecretVersionSelect({
   disabled: boolean;
   onChange: (versionId: string) => void;
 }) {
+  const selectRef = useRef<ComponentRef<typeof Select>>(null);
   const versions = useResource<SecretVersion[]>(
     secretId ? `${workspaceId}/${projectId}/secrets/${secretId}/versions` : null,
     (signal) =>
@@ -176,27 +181,32 @@ function SecretVersionSelect({
   const list = versions.data ?? [];
   const loading = versions.loading && versions.data === null;
   const missing = !loading && value !== "" && !list.some((item) => item.version_id === value);
+  const options = [
+    ...(loading ? [{ value, label: "正在读取版本…" }] : []),
+    ...(!loading && value === "" ? [{ value: "", label: "请选择版本" }] : []),
+    ...(missing
+      ? [{
+          value,
+          label: knownVersion === null ? "当前绑定版本" : `当前绑定第 ${knownVersion} 版`,
+        }]
+      : []),
+    ...list.map((item) => ({ value: item.version_id, label: `第 ${item.version} 版` })),
+  ];
 
   return (
-    <select
-      aria-label="秘密版本"
-      value={value}
-      disabled={disabled || loading}
-      onChange={(event) => onChange(event.target.value)}
-    >
-      {loading ? <option value={value}>正在读取版本…</option> : null}
-      {!loading && value === "" ? <option value="">请选择版本</option> : null}
-      {missing ? (
-        <option value={value}>
-          {knownVersion === null ? "当前绑定版本" : `当前绑定第 ${knownVersion} 版`}
-        </option>
-      ) : null}
-      {list.map((item) => (
-        <option key={item.version_id} value={item.version_id}>
-          第 {item.version} 版
-        </option>
-      ))}
-    </select>
+    <>
+      <label htmlFor={id} onClick={() => selectRef.current?.focus()}>版本</label>
+      <Select
+        ref={selectRef}
+        id={id}
+        aria-label="秘密版本"
+        data-selected-value={value}
+        value={value}
+        disabled={disabled || loading}
+        options={options}
+        onChange={onChange}
+      />
+    </>
   );
 }
 
@@ -378,9 +388,9 @@ function ProfileBindings({
           title={`当前集合已被别人切换到 epoch ${serverSet?.epoch}，你的表单基于 epoch ${expectedEpoch}；原样提交会被拒绝。`}
         >
           <div className="actions">
-            <button type="button" onClick={adoptServerSet}>
+            <Button htmlType="button" onClick={adoptServerSet}>
               改用服务端当前集合
-            </button>
+            </Button>
           </div>
         </Notice>
       ) : null}
@@ -401,50 +411,52 @@ function ProfileBindings({
               <div className="binding-row" key={row.key}>
                 <span className="param">
                   <label htmlFor={`binding-slot-${row.key}`}>槽位</label>
-                  <select
+                  <Select
                     id={`binding-slot-${row.key}`}
+                    data-selected-value={row.slot}
                     value={row.slot}
                     disabled={busy}
-                    onChange={(event) => updateRow(row.key, { slot: event.target.value })}
-                  >
-                    {row.slot === "" ? <option value="">请选择槽位</option> : null}
-                    {!available ? <option value={row.slot}>{row.slot}（不在声明范围内）</option> : null}
-                    {profile.allowed_auth_slots.map((slot) => {
+                    options={[
+                      ...(row.slot === "" ? [{ value: "", label: "请选择槽位" }] : []),
+                      ...(!available ? [{ value: row.slot, label: `${row.slot}（不在声明范围内）` }] : []),
+                      ...profile.allowed_auth_slots.map((slot) => {
                       // 已被别行占用的槽位不可再选：同一个槽位绑两个版本时，后一行
                       // 会在组装成映射时覆盖前一行，而提示仍按行数报告。
                       const takenByOther = drafts.some(
                         (item) => item.key !== row.key && item.slot.trim() === slot,
                       );
-                      return (
-                        <option key={slot} value={slot} disabled={takenByOther}>
-                          {slot}
-                          {takenByOther ? "（已被另一行使用）" : ""}
-                        </option>
-                      );
-                    })}
-                  </select>
+                        return {
+                          value: slot,
+                          label: `${slot}${takenByOther ? "（已被另一行使用）" : ""}`,
+                          disabled: takenByOther,
+                        };
+                      }),
+                    ]}
+                    onChange={(value) => updateRow(row.key, { slot: value })}
+                  />
                 </span>
                 <span className="param">
                   <label htmlFor={`binding-secret-${row.key}`}>秘密</label>
-                  <select
+                  <Select
                     id={`binding-secret-${row.key}`}
+                    data-selected-value={row.secretId}
                     value={row.secretId}
                     disabled={busy}
-                    onChange={(event) =>
-                      updateRow(row.key, { secretId: event.target.value, versionId: "", knownVersion: null })
+                    options={[
+                      { value: "", label: "请选择秘密" },
+                      ...secrets.map((secret) => ({
+                        value: secret.id,
+                        label: `${secret.name}（最新第 ${secret.latest_version} 版）`,
+                      })),
+                    ]}
+                    onChange={(value) =>
+                      updateRow(row.key, { secretId: value, versionId: "", knownVersion: null })
                     }
-                  >
-                    <option value="">请选择秘密</option>
-                    {secrets.map((secret) => (
-                      <option key={secret.id} value={secret.id}>
-                        {secret.name}（最新第 {secret.latest_version} 版）
-                      </option>
-                    ))}
-                  </select>
+                  />
                 </span>
                 <span className="param">
-                  <label htmlFor={`binding-version-${row.key}`}>版本</label>
                   <SecretVersionSelect
+                    id={`binding-version-${row.key}`}
                     workspaceId={workspaceId}
                     projectId={projectId}
                     secretId={row.secretId}
@@ -454,27 +466,27 @@ function ProfileBindings({
                     onChange={(versionId) => updateRow(row.key, { versionId })}
                   />
                 </span>
-                <button
-                  type="button"
+                <Button
+                  htmlType="button"
                   disabled={busy || drafts.length <= 1}
                   onClick={() => setRows(drafts.filter((item) => item.key !== row.key))}
                 >
                   移除这行
-                </button>
+                </Button>
               </div>
             );
           })}
           <div className="actions">
-            <button
-              type="button"
+            <Button
+              htmlType="button"
               onClick={addRow}
               disabled={busy || profile.allowed_auth_slots.length === 0}
             >
               ＋添加槽位
-            </button>
-            <button type="button" onClick={() => void saveAll()} disabled={busy || !dirty || drafts.length === 0}>
+            </Button>
+            <Button type="primary" htmlType="button" onClick={() => void saveAll()} disabled={busy || !dirty || drafts.length === 0}>
               {busy ? "保存中…" : "保存整份绑定集合"}
-            </button>
+            </Button>
           </div>
           <Hint>
             提交的是整份集合：这里列出的每个槽位都会一起生效，没列出的槽位不保留。
@@ -867,37 +879,35 @@ export function CredentialsPanel({
 
   if (!canAdmin) {
     return (
-      <details
-        className="block"
-        id={anchorId}
-        tabIndex={anchorId ? -1 : undefined}
-        open={open}
-        onToggle={(event) => {
-          if (open !== undefined && event.currentTarget.open === open) return;
-          onOpenChange?.(event.currentTarget.open);
-        }}
-      >
-        <summary>人工凭证</summary>
-        <Hint>秘密、身份配置与用途授权都需要管理员权限；当前角色只能查看环境与用例。</Hint>
-      </details>
+      <div className="block" id={anchorId} tabIndex={anchorId ? -1 : undefined}>
+        <Collapse
+          activeKey={open === undefined ? undefined : open ? ["credentials"] : []}
+          defaultActiveKey={["credentials"]}
+          onChange={(keys) => onOpenChange?.(Array.isArray(keys) ? keys.includes("credentials") : keys === "credentials")}
+          items={[{
+            key: "credentials",
+            label: "人工凭证",
+            children: <Hint>秘密、身份配置与用途授权都需要管理员权限；当前角色只能查看环境与用例。</Hint>,
+          }]}
+        />
+      </div>
     );
   }
 
   return (
-    <details
-      className="block"
-      id={anchorId}
-      tabIndex={anchorId ? -1 : undefined}
-      open={open}
-      onToggle={(event) => {
-        if (open !== undefined && event.currentTarget.open === open) return;
-        onOpenChange?.(event.currentTarget.open);
-      }}
-    >
-      <summary>人工凭证</summary>
-      <p className="caption">
+    <div className="block" id={anchorId} tabIndex={anchorId ? -1 : undefined}>
+      <Collapse
+        activeKey={open === undefined ? undefined : open ? ["credentials"] : []}
+        defaultActiveKey={["credentials"]}
+        onChange={(keys) => onOpenChange?.(Array.isArray(keys) ? keys.includes("credentials") : keys === "credentials")}
+        items={[{
+          key: "credentials",
+          label: "人工凭证",
+          children: (
+            <Flex vertical gap="middle">
+      <Typography.Paragraph type="secondary">
         秘密只保存不显示；身份配置按版本新增，当前集合按槽位绑定秘密版本；用途授权固定到某一条用例版本，而不是整个项目，并按签发时的普通变量冻结输入。
-      </p>
+      </Typography.Paragraph>
       {message ? <Notice tone="info" title={message} /> : null}
       {failure ? <ErrorText message={failure} /> : null}
 
@@ -914,35 +924,33 @@ export function CredentialsPanel({
                 {secret.name}（{secret.kind} · 最新第 {secret.latest_version} 版）
               </span>
               <label htmlFor={`rotate-${secret.id}`}>新值</label>
-              <input
+              <Input.Password
                 id={`rotate-${secret.id}`}
-                type="password"
                 value={rotateValue[secret.id] ?? ""}
                 disabled={busy}
                 onChange={(event) =>
                   setRotateValue((current) => ({ ...current, [secret.id]: event.target.value }))
                 }
               />
-              <button type="button" onClick={() => void rotate(secret)} disabled={busy}>
+              <Button htmlType="button" onClick={() => void rotate(secret)} disabled={busy}>
                 轮换
-              </button>
+              </Button>
             </li>
           ))}
         </ul>
       )}
       <div className="credential-create">
         <label htmlFor="secret-name">秘密名称</label>
-        <input id="secret-name" value={secretName} onChange={(event) => setSecretName(event.target.value)} />
+        <Input id="secret-name" value={secretName} onChange={(event) => setSecretName(event.target.value)} />
         <label htmlFor="secret-value">秘密值（保存后不再显示）</label>
-        <input
+        <Input.Password
           id="secret-value"
-          type="password"
           value={secretValue}
           onChange={(event) => setSecretValue(event.target.value)}
         />
-        <button type="button" onClick={() => void createSecret()} disabled={busy}>
+        <Button type="primary" htmlType="button" onClick={() => void createSecret()} disabled={busy}>
           保存秘密
-        </button>
+        </Button>
       </div>
 
       <h3>身份配置</h3>
@@ -976,22 +984,18 @@ export function CredentialsPanel({
       )}
       <div className="credential-create">
         <label htmlFor="profile-env">环境</label>
-        <select
+        <Select
           id="profile-env"
+          data-selected-value={identityEnvironmentId}
           value={identityEnvironmentId}
-          onChange={(event) => {
+          options={environments.map((item) => ({ value: item.id, label: item.name }))}
+          onChange={(value) => {
             setIdentityTouched(true);
-            setIdentityEnvironmentId(event.target.value);
+            setIdentityEnvironmentId(value);
           }}
-        >
-          {environments.map((item) => (
-            <option key={item.id} value={item.id}>
-              {item.name}
-            </option>
-          ))}
-        </select>
+        />
         <label htmlFor="profile-name">身份名称</label>
-        <input
+        <Input
           id="profile-name"
           value={identityName}
           onChange={(event) => {
@@ -1005,25 +1009,21 @@ export function CredentialsPanel({
             <div className="auth-location" key={`auth-${index}`}>
               <span className="param">
                 <label htmlFor={`auth-scheme-${index}`}>认证方式</label>
-                <select
+                <Select
                   id={`auth-scheme-${index}`}
+                  data-selected-value={location.scheme}
                   value={location.scheme}
-                  onChange={(event) =>
-                    setAuthLocation(index, applyScheme(location, event.target.value as AuthSchemeId))
+                  options={AUTH_SCHEMES.map((item) => ({ value: item.id, label: item.label }))}
+                  onChange={(value) =>
+                    setAuthLocation(index, applyScheme(location, value as AuthSchemeId))
                   }
-                >
-                  {AUTH_SCHEMES.map((item) => (
-                    <option key={item.id} value={item.id}>
-                      {item.label}
-                    </option>
-                  ))}
-                </select>
+                />
               </span>
               <span className="param">
                 <label htmlFor={`auth-name-${index}`}>
                   {location.scheme === "query" ? "参数名" : "请求头名"}
                 </label>
-                <input
+                <Input
                   id={`auth-name-${index}`}
                   value={location.name}
                   placeholder={location.scheme === "query" ? "access_token" : "Authorization"}
@@ -1032,7 +1032,7 @@ export function CredentialsPanel({
               </span>
               <span className="param">
                 <label htmlFor={`auth-prefix-${index}`}>值前缀</label>
-                <input
+                <Input
                   id={`auth-prefix-${index}`}
                   value={location.prefix}
                   placeholder="Bearer "
@@ -1040,20 +1040,20 @@ export function CredentialsPanel({
                 />
               </span>
               <span className="caption">将注入到 {authSlot(location) || "（请填写名称）"}</span>
-              <button
-                type="button"
+              <Button
+                htmlType="button"
                 disabled={auth.locations.length <= 1}
                 onClick={() =>
                   patchAuth({ locations: auth.locations.filter((_, position) => position !== index) })
                 }
               >
                 移除
-              </button>
+              </Button>
             </div>
           ))}
           <div className="actions">
-            <button
-              type="button"
+            <Button
+              htmlType="button"
               onClick={() =>
                 patchAuth({
                   locations: [
@@ -1064,15 +1064,14 @@ export function CredentialsPanel({
               }
             >
               ＋添加认证位置
-            </button>
+            </Button>
           </div>
           <div className="invalid-rules">
             <span className="caption">失效判据：</span>
             {INVALIDATION_CODES.map((code) => (
               <label key={code} htmlFor={`invalid-${code}`}>
-                <input
+                <Checkbox
                   id={`invalid-${code}`}
-                  type="checkbox"
                   checked={auth.invalidation.statusCodes.includes(code)}
                   onChange={(event) =>
                     patchAuth({
@@ -1089,9 +1088,8 @@ export function CredentialsPanel({
               </label>
             ))}
             <label htmlFor="invalid-redirect">
-              <input
+              <Checkbox
                 id="invalid-redirect"
-                type="checkbox"
                 checked={auth.invalidation.redirectToLogin}
                 onChange={(event) =>
                   patchAuth({
@@ -1108,7 +1106,7 @@ export function CredentialsPanel({
           </p>
         </fieldset>
         <label htmlFor="profile-targets">允许的目标（逗号分隔，可留空表示不限）</label>
-        <input
+        <Input
           id="profile-targets"
           value={identityTargets}
           onChange={(event) => {
@@ -1116,9 +1114,9 @@ export function CredentialsPanel({
             setIdentityTargets(event.target.value);
           }}
         />
-        <button type="button" onClick={() => void createProfile()} disabled={busy}>
+        <Button type="primary" htmlType="button" onClick={() => void createProfile()} disabled={busy}>
           创建身份配置
-        </button>
+        </Button>
       </div>
 
       <h3>用途授权</h3>
@@ -1147,122 +1145,125 @@ export function CredentialsPanel({
                 {grant.expires_at ? `到期 ${grant.expires_at}` : "长期有效"}
                 {grant.used_at ? ` · 已使用 ${grant.used_at}` : ""}
               </span>
-              <button type="button" onClick={() => void revoke(grant)} disabled={busy}>
+              <Button danger htmlType="button" onClick={() => void revoke(grant)} disabled={busy}>
                 撤销授权
-              </button>
+              </Button>
             </li>
           ))}
         </ul>
       )}
       <div className="credential-create">
         <label htmlFor="grant-profile">身份配置</label>
-        <select
+        <Select
           id="grant-profile"
+          data-selected-value={grantProfileId}
           value={grantProfileId}
-          onChange={(event) => {
+          options={[
+            { value: "", label: "请选择身份" },
+            ...profileList.map((profile) => ({
+              value: profile.id,
+              label: `${profile.name}（${environmentName(profile.environment_id)}）`,
+            })),
+          ]}
+          onChange={(value) => {
             setGrantTouched(true);
-            setGrantProfileId(event.target.value);
+            setGrantProfileId(value);
             setGrantSlots([]);
           }}
-        >
-          <option value="">请选择身份</option>
-          {profileList.map((profile) => (
-            <option key={profile.id} value={profile.id}>
-              {profile.name}（{environmentName(profile.environment_id)}）
-            </option>
-          ))}
-        </select>
+        />
         <label htmlFor="grant-principal">被授权主体（当前工作空间成员）</label>
         {members.error ? <ErrorText message={members.error.message} /> : null}
-        <select
+        <Select
           id="grant-principal"
+          data-selected-value={grantPrincipalId}
           value={grantPrincipalId}
           disabled={members.loading && members.data === null}
-          onChange={(event) => {
+          options={[
+            ...(members.loading && members.data === null
+              ? [{ value: grantPrincipalId, label: "正在读取成员…" }]
+              : []),
+            ...memberList.map((member) => ({
+              value: member.user_id,
+              label: `${member.display_name}${member.user_id === currentUser.user_id ? "（我）" : ""} · ${ROLE_LABEL[member.role] ?? member.role}`,
+            })),
+          ]}
+          onChange={(value) => {
             setGrantTouched(true);
-            setGrantPrincipalId(event.target.value);
+            setGrantPrincipalId(value);
           }}
-        >
-          {members.loading && members.data === null ? (
-            <option value={grantPrincipalId}>正在读取成员…</option>
-          ) : null}
-          {memberList.map((member) => (
-            <option key={member.user_id} value={member.user_id}>
-              {member.display_name}
-              {member.user_id === currentUser.user_id ? "（我）" : ""} · {ROLE_LABEL[member.role] ?? member.role}
-            </option>
-          ))}
-        </select>
+        />
         <span className="caption">
           授权只在签发时声明的环境上生效；来源环境：{selectedProfile ? environmentName(selectedProfile.environment_id) : "（先选身份）"}
         </span>
         <label htmlFor="grant-type">授权类型</label>
-        <select
+        <Select
           id="grant-type"
+          data-selected-value={grantType}
           value={grantType}
-          onChange={(event) => {
+          options={[
+            { value: "case_version", label: "固定用例版本" },
+            { value: "debug_snapshot", label: "调试快照" },
+          ]}
+          onChange={(value) => {
             setGrantTouched(true);
-            setGrantType(event.target.value as typeof grantType);
+            setGrantType(value as typeof grantType);
           }}
-        >
-          <option value="case_version">固定用例版本</option>
-          <option value="debug_snapshot">调试快照</option>
-        </select>
+        />
         {grantType === "case_version" ? (
           <>
             <label htmlFor="grant-case">用例</label>
             {cases.error ? <ErrorText message={cases.error.message} /> : null}
-            <select
+            <Select
               id="grant-case"
+              data-selected-value={grantCaseId}
               value={grantCaseId}
-              onChange={(event) => {
+              options={[
+                { value: "", label: "请选择用例" },
+                ...(grantCaseId !== "" && !caseList.some((item) => item.id === grantCaseId)
+                  ? [{ value: grantCaseId, label: `${caseLabel(grantCaseId)}（尚未读入列表）` }]
+                  : []),
+                ...caseList.map((item) => ({
+                  value: item.id,
+                  label: `${item.name}${item.id === currentCase?.caseId ? "（当前打开的用例）" : ""}`,
+                })),
+              ]}
+              onChange={(value) => {
                 setGrantTouched(true);
-                setGrantCaseId(event.target.value);
+                setGrantCaseId(value);
                 setGrantCaseVersionId("");
               }}
-            >
-              <option value="">请选择用例</option>
-              {/* 值不在选项里时下拉会回退显示“请选择用例”，提交的却仍是那个 id：
-                  这里补一条与当前值同名的选项，屏幕上显示的就是实际会签发的那条用例。 */}
-              {grantCaseId !== "" && !caseList.some((item) => item.id === grantCaseId) ? (
-                <option value={grantCaseId}>{caseLabel(grantCaseId)}（尚未读入列表）</option>
-              ) : null}
-              {caseList.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.name}
-                  {item.id === currentCase?.caseId ? "（当前打开的用例）" : ""}
-                </option>
-              ))}
-            </select>
+            />
             <label htmlFor="grant-version">已发布版本</label>
             {grantVersions.error ? <ErrorText message={grantVersions.error.message} /> : null}
-            <select
+            <Select
               id="grant-version"
+              data-selected-value={grantCaseVersionId}
               value={grantCaseVersionId}
               disabled={!grantCaseId || (grantVersions.loading && grantVersions.data === null)}
-              onChange={(event) => {
+              options={[
+                {
+                  value: "",
+                  label: !grantCaseId
+                    ? "请先选择用例"
+                    : (grantVersions.data ?? []).length === 0 && !grantVersions.loading
+                      ? "这条用例还没有已发布版本"
+                      : "请选择版本",
+                },
+                ...((grantVersions.data ?? []).length > 0 &&
+                grantCaseVersionId !== "" &&
+                !(grantVersions.data ?? []).some((item) => item.id === grantCaseVersionId)
+                  ? [{ value: grantCaseVersionId, label: "已选版本（不在本用例的版本列表中）" }]
+                  : []),
+                ...(grantVersions.data ?? []).map((item) => ({
+                  value: item.id,
+                  label: `${caseLabel(grantCaseId)} · 第 ${item.version} 版 · ${item.created_at}`,
+                })),
+              ]}
+              onChange={(value) => {
                 setGrantTouched(true);
-                setGrantCaseVersionId(event.target.value);
+                setGrantCaseVersionId(value);
               }}
-            >
-              <option value="">
-                {!grantCaseId
-                  ? "请先选择用例"
-                  : (grantVersions.data ?? []).length === 0 && !grantVersions.loading
-                    ? "这条用例还没有已发布版本"
-                    : "请选择版本"}
-              </option>
-              {(grantVersions.data ?? []).length > 0 &&
-              grantCaseVersionId !== "" &&
-              !(grantVersions.data ?? []).some((item) => item.id === grantCaseVersionId) ? (
-                <option value={grantCaseVersionId}>已选版本（不在本用例的版本列表中）</option>
-              ) : null}
-              {(grantVersions.data ?? []).map((item) => (
-                <option key={item.id} value={item.id}>
-                  {caseLabel(grantCaseId)} · 第 {item.version} 版 · {item.created_at}
-                </option>
-              ))}
-            </select>
+            />
             <span className="caption">
               {grantCaseVersionId && currentCase?.versionId === grantCaseVersionId
                 ? "已预选当前打开用例对应的那一版；如需授权别的版本请在上面改选。"
@@ -1272,7 +1273,7 @@ export function CredentialsPanel({
         ) : (
           <>
             <label htmlFor="grant-snapshot">调试快照摘要</label>
-            <input
+            <Input
               id="grant-snapshot"
               value={grantSnapshotHash}
               onChange={(event) => {
@@ -1293,9 +1294,8 @@ export function CredentialsPanel({
           <div className="grant-slots">
             {selectedProfile.allowed_auth_slots.map((slot) => (
               <label key={slot} htmlFor={`grant-slot-${slot}`}>
-                <input
+                <Checkbox
                   id={`grant-slot-${slot}`}
-                  type="checkbox"
                   checked={grantSlots.includes(slot)}
                   onChange={(event) => {
                     setGrantTouched(true);
@@ -1311,10 +1311,14 @@ export function CredentialsPanel({
             ))}
           </div>
         )}
-        <button type="button" onClick={() => void createGrant()} disabled={busy}>
+        <Button type="primary" htmlType="button" onClick={() => void createGrant()} disabled={busy}>
           签发用途授权
-        </button>
+        </Button>
       </div>
-    </details>
+            </Flex>
+          ),
+        }]}
+      />
+    </div>
   );
 }

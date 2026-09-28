@@ -15,6 +15,8 @@ vi.mock("../api/client", async (importOriginal) => {
 
 import { ApiError, apiSend } from "../api/client";
 import type { Environment } from "../api/types";
+import { AppProviders } from "../theme/AppProviders";
+import { selectAntOption } from "../test/antd";
 import { AdminPanel } from "./AdminPanel";
 
 const WS = "11111111-1111-4111-8111-111111111111";
@@ -101,6 +103,7 @@ function renderPanel(role: string) {
       currentCase={null}
       onExecutionConfigChanged={onExecutionConfigChanged}
     />,
+    { wrapper: AppProviders },
   );
 }
 
@@ -314,7 +317,7 @@ describe("管理页面", () => {
     );
     fireEvent.change(screen.getByLabelText("身份名称"), { target: { value: "闭环验收身份" } });
     // 认证位置由表单生成：这里只选方案、填头名，配置 JSON 由界面拼（V5）。
-    fireEvent.change(screen.getByLabelText("认证方式"), { target: { value: "raw_header" } });
+    await selectAntOption("认证方式", "请求头（原样值）");
     fireEvent.change(screen.getByLabelText("请求头名"), { target: { value: "X-Demo-Token" } });
     fireEvent.click(screen.getByRole("button", { name: "创建身份配置" }));
 
@@ -350,7 +353,7 @@ describe("管理页面", () => {
     await screen.findByLabelText("环境");
     fireEvent.change(screen.getByLabelText("身份名称"), { target: { value: "闭环验收身份" } });
     // “请求头（原样值）”没有默认头名，正是最容易漏填的一档。
-    fireEvent.change(screen.getByLabelText("认证方式"), { target: { value: "raw_header" } });
+    await selectAntOption("认证方式", "请求头（原样值）");
     fireEvent.click(screen.getByRole("button", { name: "创建身份配置" }));
 
     await screen.findByText("认证位置的头名或参数名不能为空。");

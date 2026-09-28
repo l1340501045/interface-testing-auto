@@ -13,6 +13,7 @@
  * 这类条件仍逐条显示并可修改删除，页面文案标明“按实际运行结果核对”。
  */
 import { useMemo, useState } from "react";
+import { Button, Input, Select } from "antd";
 
 import type {
   AssertionResult,
@@ -134,18 +135,14 @@ function OutsideTreeRow({
         <strong>响应正文 {formatSelector(selector)}</strong>
         <span className="param">
           <label htmlFor={typeSelectId}>字段类型</label>
-          <select
+          <Select
             id={typeSelectId}
+            aria-label="字段类型"
             value={fieldType}
             disabled={readOnly}
-            onChange={(event) => setFieldType(event.target.value)}
-          >
-            {FIELD_TYPES.map((name) => (
-              <option key={name} value={name}>
-                {name}
-              </option>
-            ))}
-          </select>
+            onChange={setFieldType}
+            options={FIELD_TYPES.map((name) => ({ value: name, label: name }))}
+          />
         </span>
       </div>
       <AssertionColumn
@@ -178,6 +175,7 @@ export function ResponseFieldPanel({
   onChange,
   pendingPrefix,
   idPrefix = "response",
+  active = true,
 }: {
   workspaceId: string;
   projectId: string;
@@ -191,6 +189,8 @@ export function ResponseFieldPanel({
   onChange: (next: CaseAssertion[]) => void;
   pendingPrefix?: string;
   idPrefix?: string;
+  /** 隐藏标签保留草稿，但暂停只用于展示的字段树读取。 */
+  active?: boolean;
 }) {
   const [sample, setSample] = useState("");
   const [manualPath, setManualPath] = useState("");
@@ -204,7 +204,7 @@ export function ResponseFieldPanel({
    * 两处用同一个身份，才不会出现“树换了但选中还留着”的缝隙。
    */
   const treeSourceKey = usingRun ? `${report?.run.id ?? "no-run"}#run` : `manual#${sample}`;
-  const tree = useFieldTree(workspaceId, projectId, usingRun ? runBody : sample, treeSourceKey);
+  const tree = useFieldTree(workspaceId, projectId, usingRun ? runBody : sample, treeSourceKey, active);
   const root = tree.tree?.root ?? null;
 
   const manualSelector = manualPath.trim() === "" ? [] : parsePathInput(manualPath);
@@ -257,7 +257,7 @@ export function ResponseFieldPanel({
       ) : (
         <div className="body-editor">
           <label htmlFor={`${idPrefix}-sample`}>响应样例</label>
-          <textarea
+          <Input.TextArea
             id={`${idPrefix}-sample`}
             rows={5}
             value={sample}
@@ -300,20 +300,20 @@ export function ResponseFieldPanel({
         <div className="actions">
           <span className="param grow">
             <label htmlFor={`${idPrefix}-manual-field-path`}>字段路径</label>
-            <input
+            <Input
               id={`${idPrefix}-manual-field-path`}
               value={manualPath}
               placeholder="例如 data.name 或 items[0].price"
               onChange={(event) => setManualPath(event.target.value)}
             />
           </span>
-          <button
-            type="button"
+          <Button
+            htmlType="button"
             disabled={readOnly || manualInvalid}
             onClick={addExpectedField}
           >
             添加预期字段
-          </button>
+          </Button>
         </div>
         {manualInvalid ? (
           <p className="caption">

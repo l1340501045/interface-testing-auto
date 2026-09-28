@@ -10,6 +10,7 @@
  */
 import type { Folder } from "../api/types";
 import { UNFILED_LABEL } from "./folderLabels";
+import { Button, Input, Select, Space, Tag } from "antd";
 
 export function CaseHeading({
   name,
@@ -56,7 +57,7 @@ export function CaseHeading({
       <label className="visually-hidden" htmlFor={`${idPrefix}-name`}>
         用例名称
       </label>
-      <input
+      <Input
         id={`${idPrefix}-name`}
         className="case-name-input"
         value={name}
@@ -67,44 +68,36 @@ export function CaseHeading({
       <label className="visually-hidden" htmlFor={`${idPrefix}-folder`}>
         所属目录
       </label>
-      <select
+      <Select
         id={`${idPrefix}-folder`}
         className="case-folder-select"
         value={folderId ?? ""}
         disabled={readOnly}
-        onChange={(event) => onFolderChange(event.target.value === "" ? null : event.target.value)}
-      >
-        <option value="">{UNFILED_LABEL}</option>
-        {/*
-          当前归属不在可选清单里时补一条占位选项，只为把真实状态显示出来。没有它，
-          `value` 匹配不到任何选项，浏览器会显示第一项「未分组」——正好是这个改动
-          最不该造成的误解：用户没动过目录，界面却看起来已经改成未分组了。
-        */}
-        {folderUnavailable && folderId !== null ? (
-          <option value={folderId}>{folderPlaceholder}</option>
-        ) : null}
-        {folders.map((item) => (
-          <option key={item.id} value={item.id}>
-            {item.name}
-          </option>
-        ))}
-      </select>
+        aria-label="所属目录"
+        data-selected-value={folderId ?? ""}
+        onChange={(value: string) => onFolderChange(value === "" ? null : value)}
+        options={[
+          { value: "", label: UNFILED_LABEL },
+          ...(folderUnavailable && folderId !== null ? [{ value: folderId, label: folderPlaceholder }] : []),
+          ...folders.map((item) => ({ value: item.id, label: item.name })),
+        ]}
+      />
 
-      {dirty ? <span className="tag tag-warn">有未保存修改</span> : null}
-      {creating ? <span className="tag">新用例</span> : null}
-      {versionCount > 0 ? <span className="tag">已发布 {versionCount} 版</span> : null}
+      {dirty ? <Tag color="warning">有未保存修改</Tag> : null}
+      {creating ? <Tag>新用例</Tag> : null}
+      {versionCount > 0 ? <Tag color="blue">已发布 {versionCount} 版</Tag> : null}
 
-      <div className="head-actions">
-        <button type="button" onClick={onSave} disabled={busy || readOnly}>
+      <Space className="head-actions" size={6}>
+        <Button htmlType="button" type="primary" onClick={onSave} disabled={busy || readOnly}>
           {busy ? "处理中…" : isNew ? "创建用例" : "保存草稿"}
-        </button>
-        <button type="button" onClick={onPublish} disabled={busy || readOnly}>
+        </Button>
+        <Button htmlType="button" onClick={onPublish} disabled={busy || readOnly}>
           保存并发布
-        </button>
-        <button type="button" onClick={onClose}>
+        </Button>
+        <Button htmlType="button" aria-label="关闭" onClick={onClose}>
           关闭
-        </button>
-      </div>
+        </Button>
+      </Space>
     </header>
   );
 }

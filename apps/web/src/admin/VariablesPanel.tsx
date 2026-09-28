@@ -15,6 +15,7 @@
  * 都会丢东西，而这里丢的是别人或自己的配置。
  */
 import { useEffect, useMemo, useState } from "react";
+import { Button, Collapse, Flex, Space, Typography } from "antd";
 
 import { ApiError, apiSend, projectPath } from "../api/client";
 import { toVariablesSet } from "../api/guards";
@@ -131,14 +132,13 @@ export function VariablesPanel({
     }
   }
 
-  return (
-    <details className="block">
-      <summary>项目普通变量（当前第 {current?.version ?? 0} 版）</summary>
-      <p className="caption">
+  const content = (
+    <Flex vertical gap="small">
+      <Typography.Paragraph type="secondary">
         普通变量用于替换请求中的占位内容，随执行环境一起生效；口令等秘密必须走身份凭证配置。
         变量参与请求的最终形态，凭证用途授权会按签发时的变量冻结输入：改动这里的值之后，
         原来的凭证授权不再适用于新的请求，需要在“人工凭证”里重新签发。
-      </p>
+      </Typography.Paragraph>
       {!ready && variables.loading ? <Loading label="正在加载项目变量…" /> : null}
       {variables.error ? <ErrorText message={variables.error.message} /> : null}
       {ready && current.version === 0 && rows.length === 0 ? (
@@ -151,20 +151,20 @@ export function VariablesPanel({
               tone="warning"
               title={`服务端已保存到第 ${current.version} 版，你的草稿基于第 ${draft?.baseVersion} 版。`}
             >
-              <div className="actions">
-                <button
-                  type="button"
+              <Space className="actions">
+                <Button
+                  htmlType="button"
                   onClick={() => {
                     setDraft(null);
                     setMessage(`已改用服务端第 ${current.version} 版；未保存的草稿已丢弃。`);
                   }}
                 >
                   改用服务端第 {current.version} 版
-                </button>
-                <button type="button" onClick={() => setDraft({ baseVersion: current.version, rows })}>
+                </Button>
+                <Button htmlType="button" onClick={() => setDraft({ baseVersion: current.version, rows })}>
                   在第 {current.version} 版基础上继续用我的内容
-                </button>
-              </div>
+                </Button>
+              </Space>
             </Notice>
           ) : null}
           <VariableRowsEditor
@@ -176,21 +176,35 @@ export function VariablesPanel({
             emptyHint="还没有变量；点“＋添加变量”开始配置。"
           />
           {canEdit ? (
-            <div className="actions">
-              <button
-                type="button"
+            <Space className="actions">
+              <Button
+                type="primary"
+                htmlType="button"
                 onClick={() => void save()}
                 disabled={busy || !ready || draft === null || stale}
               >
                 {busy ? "保存中…" : "保存为新版本"}
-              </button>
-            </div>
+              </Button>
+            </Space>
           ) : null}
         </>
       ) : null}
       {message ? <Notice tone="info" title={message} /> : null}
       {failure ? <ErrorText message={failure} /> : null}
       {!ready && !variables.loading && !variables.error ? <Hint>暂时读不到项目变量。</Hint> : null}
-    </details>
+    </Flex>
+  );
+
+  return (
+    <div className="block">
+      <Collapse
+        defaultActiveKey={["variables"]}
+        items={[{
+          key: "variables",
+          label: `项目普通变量（当前第 ${current?.version ?? 0} 版）`,
+          children: content,
+        }]}
+      />
+    </div>
   );
 }

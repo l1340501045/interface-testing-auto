@@ -12,6 +12,7 @@
  */
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { antSelectedValue, selectAntOption } from "./test/antd";
 
 const WORKSPACE_ID = "11111111-1111-4111-8111-111111111111";
 const WORKSPACE_ID_B = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -270,8 +271,8 @@ function route(rawPath: string, method: string, body?: unknown): unknown {
 /** 打开项目并选中用例，返回编辑器就绪后的容器。 */
 async function openCase(): Promise<void> {
   render(<App />);
-  const projectSelect = (await screen.findByLabelText("项目")) as HTMLSelectElement;
-  await waitFor(() => expect(projectSelect.value).toBe(PROJECT_ID), SETUP_WAIT);
+  await screen.findByLabelText("项目");
+  await waitFor(() => expect(antSelectedValue("项目")).toBe(PROJECT_ID), SETUP_WAIT);
   await act(async () => {});
   // 等侧栏（目录／用例列表）真正挂载：项目选择到位不等于环境与目录已经读完。
   const browser = await screen.findByLabelText("用例目录");
@@ -280,15 +281,15 @@ async function openCase(): Promise<void> {
     () => expect((screen.getByLabelText("用例名称") as HTMLInputElement).value).toBe("查询订单"),
     SETUP_WAIT,
   );
-  // 等编辑防抖触发的展示性预检落定（400ms）。
+  // 等编辑防抖触发的展示性预检真实进入 API 边界。
   //
   // “当前通过”的判据要求存在一份**针对当前内容**的预检结论——这是设计：没有它就无法
   // 说明这份报告对应的配置。因此在这里等它出现，而不是把断言放宽成“包含 200 就算通过”，
   // 后者会让“结论过期”伪装成通过。
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 450));
-  });
-  await act(async () => {});
+  await waitFor(
+    () => expect(calls.some((call) => call.method === "POST" && call.path.endsWith("/debug-preflight"))).toBe(true),
+    SETUP_WAIT,
+  );
 }
 
 /**
@@ -297,12 +298,78 @@ async function openCase(): Promise<void> {
  * 环境编辑与凭证管理同在这个折叠区里（环境在侧栏，凭证在其下的 #admin-panel）；
  * 只取 #admin-panel 会漏掉环境面板，测出来的“改环境不失效”其实是没找到控件。
  */
+function environmentCollapseTrigger(panel: HTMLElement): HTMLElement {
+  const trigger = Array.from(panel.querySelectorAll<HTMLElement>('.ant-collapse-header[role="button"]'))
+    .find((item) => /^环境（\d+）$/.test(item.textContent?.trim() ?? ""));
+  if (trigger === undefined) throw new Error("环境折叠入口未挂载");
+  return trigger;
+}
+
 async function openAdmin(): Promise<HTMLElement> {
   fireEvent.click(screen.getByRole("button", { name: "环境配置" }));
   await act(async () => {});
   const panel = screen.getByRole("region", { name: "环境配置" });
   if (panel === null) throw new Error("管理入口未挂载");
+  const environmentTrigger = environmentCollapseTrigger(panel as HTMLElement);
+  if (environmentTrigger.getAttribute("aria-expanded") !== "true") {
+    fireEvent.click(environmentTrigger);
+    await waitFor(() => expect(environmentTrigger.getAttribute("aria-expanded")).toBe("true"));
+  }
   return panel as HTMLElement;
+}
+
+/**
+ * App 会持续挂载四个页面；测试只在当前可见页面内驱动控件，避免全局可访问树把同名隐藏页
+ * 一并扫描。真实浏览器同样只把未 hidden 的页面作为当前操作区域。
+ */
+async function activePageRegion(label: "任务中心" | "测试报告"): Promise<HTMLElement> {
+  const selector = `section[aria-label="${label}"]`;
+  const current = () => Array.from(document.querySelectorAll<HTMLElement>(selector))
+    .find((region) => !region.hasAttribute("hidden"));
+  await waitFor(() => expect(current() instanceof HTMLElement).toBe(true));
+  const region = current();
+  if (region === undefined) throw new Error(`当前${label}页面未挂载`);
+  return region;
+}
+
+async function waitForReportHeading(region: HTMLElement, runId: string): Promise<void> {
+  const expected = `运行 ${runId.slice(0, 8)} 的报告`;
+  await waitFor(() => expect(
+    Array.from(region.querySelectorAll("h1, h2, h3, h4, h5, h6"))
+      .some((heading) => heading.textContent?.trim() === expected),
+  ).toBe(true));
+}
+
+async function waitForRunRow(region: HTMLElement, runId: string): Promise<HTMLElement> {
+  const shortId = runId.slice(0, 8);
+  await waitFor(() => expect(
+    Array.from(region.querySelectorAll("tr"))
+      .some((row) => row.textContent?.includes(shortId)),
+  ).toBe(true));
+  const row = Array.from(region.querySelectorAll<HTMLElement>("tr"))
+    .find((candidate) => candidate.textContent?.includes(shortId));
+  if (row === undefined) throw new Error(`运行 ${shortId} 的表格行未挂载`);
+  return row;
+}
+
+function viewReportButton(row: HTMLElement): HTMLButtonElement {
+  const button = Array.from(row.querySelectorAll<HTMLButtonElement>("button"))
+    .find((candidate) => candidate.textContent?.trim() === "查看报告");
+  if (button === undefined) throw new Error("运行行没有查看报告入口");
+  return button;
+}
+
+function primaryNavButton(label: "接口工作台" | "任务中心" | "测试报告"): HTMLButtonElement {
+  const button = Array.from(document.querySelectorAll<HTMLButtonElement>(".primary-nav .nav-item"))
+    .find((candidate) => candidate.textContent?.trim() === label);
+  if (button === undefined) throw new Error(`主导航没有“${label}”入口`);
+  return button;
+}
+
+function selectedValueById(id: string): string {
+  const control = document.getElementById(id);
+  const root = control?.closest<HTMLElement>("[data-selected-value]");
+  return root?.dataset.selectedValue ?? "";
 }
 
 /** 发一次调试并等它显示真实结论，返回响应区。 */
@@ -322,7 +389,6 @@ beforeEach(() => {
   failWrites = false;
   preflightOverride = null;
   historyRuns = [];
-  window.confirm = vi.fn(() => true);
   apiGetMock.mockReset();
   apiSendMock.mockReset();
   apiSendWithMetaMock.mockReset();
@@ -420,22 +486,23 @@ describe("环境地址无效时的真实入口", () => {
     expect(screen.getByText(/环境地址不合法，暂时无法确定/)).toBeTruthy();
     expect(screen.queryByText(/实际目标：target-service:8080/)).toBeNull();
 
-    const panel = document.getElementById("environment-panel") as HTMLDetailsElement;
+    const panel = document.getElementById("environment-panel") as HTMLElement;
+    const environmentTrigger = environmentCollapseTrigger(panel);
     /*
       只断言 `sidebar.open` 是不够的：外层展开后，“环境（N）”这一层仍可能是折叠的，
       用户点进来看到的还是一个没有编辑入口的空标题。这里必须断言**内层**的 open。
 
-      为什么不断言“编辑按钮可见”：jsdom 不建模 details 折叠对内容可见性的影响，折叠时
-      同样能找到按钮——那样的断言恒真，测不出这个缺陷。`open` 才是用户看到的状态。
+      为什么不断言“编辑按钮可见”：折叠内容仍可能保留 DOM；真实 Collapse 的
+      `aria-expanded` 才是用户看到的展开状态。
     */
-    expect(panel.open).toBe(false);
+    expect(environmentTrigger.getAttribute("aria-expanded")).toBe("false");
 
     fireEvent.click(entry);
     await act(async () => {});
 
     expect(screen.getByRole("region", { name: "环境配置" })).toBeTruthy();
     expect(window.location.hash).toBe("#/environments");
-    expect(panel.open).toBe(true);
+    expect(environmentTrigger.getAttribute("aria-expanded")).toBe("true");
 
     // 进入配置页必须保住同一份未保存用例：工作台只是隐藏，编辑器没有重挂载。
     expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/echo");
@@ -448,8 +515,8 @@ describe("环境地址无效时的真实入口", () => {
     fireEvent.click(await screen.findByRole("button", { name: "前往环境设置" }));
     await act(async () => {});
 
-    const panel = document.getElementById("environment-panel") as HTMLDetailsElement;
-    expect(panel.open).toBe(true);
+    const panel = document.getElementById("environment-panel") as HTMLElement;
+    expect(environmentCollapseTrigger(panel).getAttribute("aria-expanded")).toBe("true");
     // 面板内的编辑入口真的可用：点开后能看到地址输入框。
     fireEvent.click(within(panel).getByRole("button", { name: "编辑" }));
     expect((await within(panel).findByLabelText("服务地址")) as HTMLInputElement).toBeTruthy();
@@ -458,17 +525,17 @@ describe("环境地址无效时的真实入口", () => {
   it("缺协议的地址在环境面板里就地挡住，不发写请求", async () => {
     environment = makeEnvironment("target-service:8080");
     await openCase();
-    await screen.findByRole("button", { name: "前往环境设置" });
-
-    const admin = await openAdmin();
+    const entry = await screen.findByRole("button", { name: "前往环境设置" });
+    fireEvent.click(entry);
+    const admin = await screen.findByRole("region", { name: "环境配置" });
+    await waitFor(() => expect(environmentCollapseTrigger(admin).getAttribute("aria-expanded")).toBe("true"));
     fireEvent.click(within(admin).getByRole("button", { name: "编辑" }));
     const baseInput = await within(admin).findByLabelText("服务地址");
     // 不改地址直接保存：服务端会拒绝这条存量值，本地也应当先挡住。
     const writesBefore = calls.filter((call) => call.method === "PATCH").length;
-    await act(async () => {
-      fireEvent.click(within(admin).getByRole("button", { name: "保存环境" }));
-    });
+    fireEvent.click(within(admin).getByRole("button", { name: "保存环境" }));
 
+    await within(admin).findByText("环境地址不合法，请按提示修正后再保存。");
     expect(calls.filter((call) => call.method === "PATCH")).toHaveLength(writesBefore);
     expect((baseInput as HTMLInputElement).value).toBe("target-service:8080");
   });
@@ -476,16 +543,16 @@ describe("环境地址无效时的真实入口", () => {
   it("把环境地址修好之后，同一份未保存草稿可以继续调试", async () => {
     environment = makeEnvironment("target-service:8080");
     await openCase();
-    await screen.findByRole("button", { name: "前往环境设置" });
+    const entry = await screen.findByRole("button", { name: "前往环境设置" });
+    fireEvent.click(entry);
 
     // 走真实环境编辑表单改地址。
-    const admin = await openAdmin();
+    const admin = await screen.findByRole("region", { name: "环境配置" });
+    await waitFor(() => expect(environmentCollapseTrigger(admin).getAttribute("aria-expanded")).toBe("true"));
     fireEvent.click(within(admin).getByRole("button", { name: "编辑" }));
     const baseInput = await within(admin).findByLabelText("服务地址");
     fireEvent.change(baseInput, { target: { value: "http://echo.test" } });
-    await act(async () => {
-      fireEvent.click(within(admin).getByRole("button", { name: "保存环境" }));
-    });
+    fireEvent.click(within(admin).getByRole("button", { name: "保存环境" }));
 
     // 配置变更由外壳广播；预检按新地址重新给结论，无效提示随之消失。
     await waitFor(() =>
@@ -511,9 +578,10 @@ describe("独立页面的状态归属", () => {
     fireEvent.click(entry);
     await act(async () => {});
 
-    const credentials = document.getElementById("credentials-panel") as HTMLDetailsElement;
+    const credentials = document.getElementById("credentials-panel") as HTMLElement;
+    const credentialsTrigger = within(credentials).getByRole("button", { name: "人工凭证" });
     expect(screen.getByRole("region", { name: "环境配置" })).toBeTruthy();
-    expect(credentials.open).toBe(true);
+    expect(credentialsTrigger.getAttribute("aria-expanded")).toBe("true");
     expect(document.activeElement).toBe(credentials);
     expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/echo");
   });
@@ -524,28 +592,32 @@ describe("独立页面的状态归属", () => {
       { ...RUN_REPORT.run, id: RUN_ID_B, state: "finished", outcome: "failed" },
     ];
     await openCase();
-    const selectedEnvironment = (screen.getByLabelText("执行环境") as HTMLSelectElement).value;
+    const selectedEnvironment = selectedValueById("send-environment");
 
-    fireEvent.click(screen.getByRole("button", { name: "任务中心" }));
-    const rowA = (await screen.findByText(RUN_ID.slice(0, 8))).closest("tr") as HTMLElement;
-    fireEvent.click(within(rowA).getByRole("button", { name: "查看报告" }));
-    await screen.findByRole("heading", { name: `运行 ${RUN_ID.slice(0, 8)} 的报告` });
+    fireEvent.click(primaryNavButton("任务中心"));
+    const tasks = await activePageRegion("任务中心");
+    const rowA = await waitForRunRow(tasks, RUN_ID);
+    fireEvent.click(viewReportButton(rowA));
+    const headingA = await screen.findByRole("heading", { name: `运行 ${RUN_ID.slice(0, 8)} 的报告` });
+    const reports = headingA.closest<HTMLElement>('section[aria-label="测试报告"]');
+    if (reports === null) throw new Error("报告 A 不在测试报告页面内");
 
-    const rowB = (await screen.findByText(RUN_ID_B.slice(0, 8))).closest("tr") as HTMLElement;
-    fireEvent.click(within(rowB).getByRole("button", { name: "查看报告" }));
-    await screen.findByRole("heading", { name: `运行 ${RUN_ID_B.slice(0, 8)} 的报告` });
+    const rowB = await waitForRunRow(reports, RUN_ID_B);
+    fireEvent.click(viewReportButton(rowB));
+    await waitForReportHeading(reports, RUN_ID_B);
 
-    fireEvent.click(screen.getByRole("button", { name: "接口工作台" }));
-    fireEvent.click(screen.getByRole("button", { name: "测试报告" }));
-    expect(screen.getByRole("heading", { name: `运行 ${RUN_ID_B.slice(0, 8)} 的报告` })).toBeTruthy();
+    fireEvent.click(primaryNavButton("接口工作台"));
+    fireEvent.click(primaryNavButton("测试报告"));
+    await waitForReportHeading(await activePageRegion("测试报告"), RUN_ID_B);
 
-    fireEvent.click(screen.getByRole("button", { name: "任务中心" }));
-    const rowAAgain = (await screen.findByText(RUN_ID.slice(0, 8))).closest("tr") as HTMLElement;
-    fireEvent.click(within(rowAAgain).getByRole("button", { name: "查看报告" }));
-    await screen.findByRole("heading", { name: `运行 ${RUN_ID.slice(0, 8)} 的报告` });
+    fireEvent.click(primaryNavButton("任务中心"));
+    const tasksAgain = await activePageRegion("任务中心");
+    const rowAAgain = await waitForRunRow(tasksAgain, RUN_ID);
+    fireEvent.click(viewReportButton(rowAAgain));
+    await waitForReportHeading(await activePageRegion("测试报告"), RUN_ID);
 
-    fireEvent.click(screen.getByRole("button", { name: "接口工作台" }));
-    expect((screen.getByLabelText("执行环境") as HTMLSelectElement).value).toBe(selectedEnvironment);
+    fireEvent.click(primaryNavButton("接口工作台"));
+    expect(selectedValueById("send-environment")).toBe(selectedEnvironment);
     expect(calls.filter((call) => call.method === "POST" && call.path.endsWith("/runs"))).toHaveLength(0);
   });
 
@@ -561,15 +633,16 @@ describe("独立页面的状态归属", () => {
     fireEvent.change(screen.getByLabelText("路径") as HTMLInputElement, {
       target: { value: "/changed" },
     });
-    const projectSelect = screen.getByLabelText("项目") as HTMLSelectElement;
-    vi.mocked(window.confirm).mockReturnValueOnce(false);
-    fireEvent.change(projectSelect, { target: { value: PROJECT_ID_B } });
-    expect(projectSelect.value).toBe(PROJECT_ID);
+    await selectAntOption("项目", "项目乙");
+    const firstLeave = await screen.findByRole("dialog", { name: "确认离开" });
+    fireEvent.click(within(firstLeave).getByRole("button", { name: "取消" }));
+    expect(antSelectedValue("项目")).toBe(PROJECT_ID);
     expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/changed");
 
-    vi.mocked(window.confirm).mockReturnValueOnce(true);
-    fireEvent.change(projectSelect, { target: { value: PROJECT_ID_B } });
-    await waitFor(() => expect(projectSelect.value).toBe(PROJECT_ID_B));
+    await selectAntOption("项目", "项目乙");
+    const secondLeave = await screen.findByRole("dialog", { name: "确认离开" });
+    fireEvent.click(within(secondLeave).getByRole("button", { name: "继续离开" }));
+    await waitFor(() => expect(antSelectedValue("项目")).toBe(PROJECT_ID_B));
     expect(screen.queryByRole("heading", { name: `运行 ${RUN_ID.slice(0, 8)} 的报告` })).toBeNull();
     expect(
       calls.some((call) =>
@@ -587,9 +660,9 @@ describe("独立页面的状态归属", () => {
     fireEvent.click(within(rowA).getByRole("button", { name: "查看报告" }));
     await screen.findByRole("heading", { name: `运行 ${RUN_ID.slice(0, 8)} 的报告` });
 
-    fireEvent.change(screen.getByLabelText("工作空间"), { target: { value: WORKSPACE_ID_B } });
-    await waitFor(() => expect((screen.getByLabelText("工作空间") as HTMLSelectElement).value).toBe(WORKSPACE_ID_B));
-    await waitFor(() => expect((screen.getByLabelText("项目") as HTMLSelectElement).value).toBe(PROJECT_ID_B));
+    await selectAntOption("工作空间", "第二工作空间");
+    await waitFor(() => expect(antSelectedValue("工作空间")).toBe(WORKSPACE_ID_B));
+    await waitFor(() => expect(antSelectedValue("项目")).toBe(PROJECT_ID_B));
     expect(screen.queryByRole("heading", { name: `运行 ${RUN_ID.slice(0, 8)} 的报告` })).toBeNull();
     expect(
       calls.some((call) =>

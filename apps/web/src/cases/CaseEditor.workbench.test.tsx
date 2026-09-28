@@ -37,6 +37,7 @@ vi.mock("../api/client", async (importOriginal) => {
 });
 
 import { apiGet, apiSend, apiSendWithMeta, projectPath } from "../api/client";
+import { AppProviders } from "../theme/AppProviders";
 import { CaseEditor } from "./CaseEditor";
 
 const apiGetMock = vi.mocked(apiGet);
@@ -74,11 +75,11 @@ const CASE_DETAIL = {
     method: "GET",
     path: "/echo",
     query_params: [{ name: "tag", value: "a" }],
-    headers: [],
+    headers: [] as { name: string; value: string }[],
     body_type: "none" as const,
     body: "",
   },
-  assertions: [],
+  assertions: [] as Record<string, unknown>[],
   rev: 3,
   status: "draft",
   latest_version: null,
@@ -126,41 +127,38 @@ function route(method: string, path: string, body: unknown, headers?: Record<str
   throw new Error(`测试未覆盖的请求：${method} ${path}`);
 }
 
-function renderEditor(props: { projectRole?: string | null; strict?: boolean } = {}) {
-  const { strict = false, ...editorProps } = props;
-  const editor = (
+type EditorTestProps = { projectRole?: string | null; strict?: boolean; active?: boolean };
+
+function editorNode(props: Omit<EditorTestProps, "strict"> = {}) {
+  return <AppProviders>
     <CaseEditor
       workspaceId={WORKSPACE_ID}
       projectId={PROJECT_ID}
       caseSummaryId={CASE_ID}
-      environments={[
-        {
-          id: ENV_ID,
-          name: "测试环境",
-          kind: "test",
-          base_url: "http://echo.test",
-          pool_id: null,
-          variables: {},
-          status: "active",
-        },
-      ]}
+      environments={[{ id: ENV_ID, name: "测试环境", kind: "test", base_url: "http://echo.test", pool_id: null, variables: {}, status: "active" }]}
       selectedEnvironmentId={ENV_ID}
       onSelectEnvironment={() => {}}
       onSaved={() => {}}
       onClose={() => {}}
       folders={[]}
       currentUserId="u-1"
-      {...editorProps}
+      {...props}
     />
-  );
+  </AppProviders>;
+}
+
+function renderEditor(props: EditorTestProps = {}) {
+  const { strict = false, ...editorProps } = props;
+  const editor = editorNode(editorProps);
   return render(strict ? <StrictMode>{editor}</StrictMode> : editor);
 }
 
-async function renderLoaded(props: { projectRole?: string | null; strict?: boolean } = {}) {
+async function renderLoaded(props: EditorTestProps = {}) {
   renderEditor(props);
-  await waitFor(() =>
-    expect((screen.getByLabelText("用例名称") as HTMLInputElement).value).toBe("查询订单"),
-  );
+  await waitFor(() => {
+    const input = document.querySelector(".case-name-input");
+    expect(input instanceof HTMLInputElement ? input.value : null).toBe("查询订单");
+  });
 }
 
 function callsTo(path: string, method: string): Call[] {
@@ -168,7 +166,9 @@ function callsTo(path: string, method: string): Call[] {
 }
 
 beforeEach(() => {
-  CASE_DETAIL.request.query_params[0].value = "a";
+  CASE_DETAIL.request.query_params = [{ name: "tag", value: "a" }];
+  CASE_DETAIL.request.headers = [];
+  CASE_DETAIL.assertions = [];
   calls = [];
   reportBody = null;
   curlPreviewGate = null;
@@ -339,20 +339,49 @@ describe("请求调试工作台", () => {
 
   it("v1 直接显示启停、说明和行旁条件，实际操作时才升级 v2", async () => {
     await renderLoaded();
-    expect(screen.queryByText("有未保存修改")).toBeNull();
-    const enabled = screen.getByLabelText("发送") as HTMLInputElement;
+    const heading = document.querySelector<HTMLElement>(".case-head");
+    if (heading === null) throw new Error("用例标题区未挂载");
+    expect(heading.textContent?.includes("有未保存修改")).toBe(false);
+    const enabled = document.querySelector('[aria-label="发送第 1 项查询参数"]');
+    if (!(enabled instanceof HTMLInputElement)) throw new Error("查询参数发送开关未挂载");
     expect(enabled.checked).toBe(true);
     expect(screen.getByLabelText("查询参数说明 1")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "＋添加断言" })).toBeTruthy();
+    const parameterRow = enabled.closest("tr");
+    if (!(parameterRow instanceof HTMLTableRowElement)) throw new Error("查询参数行未挂载");
+    const addAssertion = parameterRow.querySelector(".add-assertion");
+    expect({ isButton: addAssertion instanceof HTMLButtonElement, text: addAssertion?.textContent?.trim() ?? null }).toEqual({
+      isButton: true,
+      text: "＋添加断言",
+    });
 
     fireEvent.click(enabled);
-    expect(screen.getByText("有未保存修改")).toBeTruthy();
+    await waitFor(() => expect(enabled.checked).toBe(false));
+    await waitFor(() => expect(heading.textContent?.includes("有未保存修改")).toBe(true));
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     await waitFor(() => expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")).toHaveLength(1));
     const payload = callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")[0].body as { debug_snapshot: { request: { schema_version?: number; query_params: { row_id?: string; enabled?: boolean }[] } } };
     expect(payload.debug_snapshot.request.schema_version).toBe(2);
     expect(payload.debug_snapshot.request.query_params[0].row_id).toMatch(/^[0-9a-f-]{36}$/i);
     expect(payload.debug_snapshot.request.query_params[0].enabled).toBe(false);
+  });
+
+  it("v1 Query/Header 条件与两表展示ID同源升级", async () => {
+    CASE_DETAIL.request.query_params = [{ name: "tag", value: "a" }, { name: "tag", value: "b" }];
+    CASE_DETAIL.request.headers = [{ name: "X-Trace", value: "one" }];
+    CASE_DETAIL.assertions = [
+      { id: "q-repeat", target_source: "request.query", selector: [{ kind: "repeat_key", key: "tag", occurrence: 1 }], type: "equals", parameters: {}, compare_as: null, severity: "error", enabled: true, sort_order: 0 },
+      { id: "h-index", target_source: "request.header", selector: [{ kind: "index", index: 0 }, { kind: "key", key: "name" }], type: "equals", parameters: {}, compare_as: null, severity: "error", enabled: true, sort_order: 1 },
+    ];
+    await renderLoaded();
+    fireEvent.change(screen.getByLabelText("查询参数值 2"), { target: { value: "b2" } });
+    const confirm = await screen.findByRole("dialog", { name: "确认应用更改" });
+    fireEvent.click(within(confirm).getByRole("button", { name: "继续应用" }));
+    await screen.findByText("有未保存修改");
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")).toHaveLength(1));
+    const snapshot = (callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")[0].body as { debug_snapshot: { request: { query_params: { row_id: string }[]; headers: { row_id: string }[] }; assertions: { id: string; selector: unknown[] }[] } }).debug_snapshot;
+    expect(snapshot.assertions.find((item) => item.id === "q-repeat")?.selector).toEqual([{ kind: "row", row_id: snapshot.request.query_params[1].row_id }, { kind: "key", key: "value" }]);
+    expect(snapshot.assertions.find((item) => item.id === "h-index")?.selector).toEqual([{ kind: "row", row_id: snapshot.request.headers[0].row_id }, { kind: "key", key: "name" }]);
   });
 
   it("先填值后填名称、非法 Header 都保持整棵编辑器可纠正", async () => {
@@ -408,6 +437,34 @@ describe("请求调试工作台", () => {
     expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")).toEqual([]);
   });
 
+  it("v2 请求应用 cURL 前使用受控确认，取消后保留原请求和导入原文", async () => {
+    await renderLoaded();
+    fireEvent.change(screen.getByLabelText("查询参数值 1"), { target: { value: "v2" } });
+    await waitFor(() => expect((screen.getByLabelText("查询参数值 1") as HTMLInputElement).value).toBe("v2"));
+    const toolbar = document.querySelector(".send-bar") as HTMLElement;
+    fireEvent.click(within(toolbar).getByRole("button", { name: "导入 cURL" }));
+    const textarea = within(toolbar).getByLabelText(/粘贴 cURL 命令/) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "curl http://echo.test/replacement" } });
+    fireEvent.click(within(toolbar).getByRole("button", { name: "解析并填入编辑器" }));
+
+    const confirm = await screen.findByRole("dialog", { name: "确认应用更改" });
+    const cancel = within(confirm).getByRole("button", { name: "取消" });
+    const close = confirm.querySelector<HTMLButtonElement>(".ant-modal-close");
+    if (close === null) throw new Error("确认应用更改对话框缺少组件库关闭入口");
+    cancel.focus();
+    expect(document.activeElement).toBe(cancel);
+    fireEvent.keyDown(cancel, { key: "Tab" });
+    expect(document.activeElement).toBe(close);
+    fireEvent.keyDown(close, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(cancel);
+    fireEvent.click(cancel);
+
+    expect(await screen.findByText(/当前请求没有被覆盖/)).toBeTruthy();
+    expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/echo");
+    expect(textarea.value).toBe("curl http://echo.test/replacement");
+    expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")).toEqual([]);
+  });
+
   it("StrictMode 重复 setup/cleanup 后 cURL 解析仍属于当前编辑器", async () => {
     await renderLoaded({ strict: true });
     const toolbar = document.querySelector(".send-bar") as HTMLElement;
@@ -425,8 +482,6 @@ describe("请求调试工作台", () => {
     let resolvePreview!: (value: unknown) => void;
     const promise = new Promise<unknown>((resolve) => { resolvePreview = resolve; });
     curlPreviewGate = { promise, resolve: resolvePreview };
-    window.confirm = vi.fn(() => true);
-
     const toolbar = document.querySelector(".send-bar") as HTMLElement;
     fireEvent.click(within(toolbar).getByRole("button", { name: "导入 cURL" }));
     fireEvent.change(within(toolbar).getByLabelText(/粘贴 cURL 命令/), { target: { value: "curl http://echo.test/new" } });
@@ -441,6 +496,9 @@ describe("请求调试工作台", () => {
       unsupported: [],
       auth_hint: null,
     });
+    const confirm = await screen.findByRole("dialog", { name: "确认应用更改" });
+    expect(confirm.textContent).toContain("解析期间请求已被修改");
+    fireEvent.click(within(confirm).getByRole("button", { name: "继续应用" }));
     await waitFor(() => expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/new"));
 
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
@@ -450,14 +508,72 @@ describe("请求调试工作台", () => {
     expect(payload.debug_snapshot.request.query_params[0].row_id).toBeTruthy();
   });
 
+  it("隐藏编辑器不展示或续接迟到的 cURL 确认", async () => {
+    let resolvePreview!: (value: unknown) => void;
+    const promise = new Promise<unknown>((resolve) => { resolvePreview = resolve; });
+    curlPreviewGate = { promise, resolve: resolvePreview };
+    const view = renderEditor({ active: true });
+    await screen.findByDisplayValue("查询订单");
+    const toolbar = document.querySelector(".send-bar") as HTMLElement;
+    fireEvent.click(within(toolbar).getByRole("button", { name: "导入 cURL" }));
+    const source = within(toolbar).getByLabelText(/粘贴 cURL 命令/) as HTMLTextAreaElement;
+    fireEvent.change(source, { target: { value: "curl http://echo.test/late" } });
+    fireEvent.click(within(toolbar).getByRole("button", { name: "解析并填入编辑器" }));
+    await waitFor(() => expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/imports/curl/preview"), "POST")).toHaveLength(1));
+
+    view.rerender(editorNode({ active: false }));
+    resolvePreview({ draft: { ...CASE_DETAIL.request, path: "/late" }, sendable: true, warnings: [], unsupported: [], auth_hint: null });
+
+    await screen.findByText(/原编辑器当前不可操作/);
+    expect(screen.queryByRole("dialog", { name: "确认应用更改" })).toBeNull();
+    expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/echo");
+    expect(source.value).toBe("curl http://echo.test/late");
+    expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")).toEqual([]);
+  });
+
+  it("已打开的 cURL 确认在编辑器隐藏后失效且不会重放", async () => {
+    const view = renderEditor({ active: true });
+    await screen.findByDisplayValue("查询订单");
+    fireEvent.change(screen.getByLabelText("查询参数值 1"), { target: { value: "v2" } });
+    const toolbar = document.querySelector(".send-bar") as HTMLElement;
+    fireEvent.click(within(toolbar).getByRole("button", { name: "导入 cURL" }));
+    fireEvent.change(within(toolbar).getByLabelText(/粘贴 cURL 命令/), { target: { value: "curl http://echo.test/confirm" } });
+    fireEvent.click(within(toolbar).getByRole("button", { name: "解析并填入编辑器" }));
+    await screen.findByRole("dialog", { name: "确认应用更改" });
+
+    view.rerender(editorNode({ active: false }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "确认应用更改" })).toBeNull());
+    view.rerender(editorNode({ active: true }));
+    expect(screen.queryByRole("dialog", { name: "确认应用更改" })).toBeNull();
+    expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/echo");
+    expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")).toEqual([]);
+  });
+
   it("v1 原始文本编辑期间修改路径不会重建行身份或丢未应用输入", async () => {
     CASE_DETAIL.request.query_params[0].value = "A\r\nB";
     await renderLoaded();
-    fireEvent.click(screen.getByRole("button", { name: "编辑原始文本" }));
+    const editButton = screen.getByText("编辑原始文本").closest("button");
+    if (editButton === null) throw new Error("原始文本编辑入口不是按钮");
+    fireEvent.click(editButton);
     const raw = screen.getByLabelText("查询参数值 1转义文本") as HTMLInputElement;
     fireEvent.change(raw, { target: { value: "A\\r\\nB-edited" } });
-    fireEvent.change(screen.getByLabelText("路径"), { target: { value: "/changed" } });
-    expect(screen.getByDisplayValue("A\\r\\nB-edited")).toBe(raw);
+    const path = document.getElementById("request-path");
+    if (!(path instanceof HTMLInputElement)) throw new Error("路径输入框未挂载");
+    fireEvent.change(path, { target: { value: "/changed" } });
+    const candidates = Array.from(document.querySelectorAll<HTMLInputElement>("input"))
+      .filter((candidate) => candidate.value === "A\\r\\nB-edited");
+    const current = candidates[0];
+    expect({
+      candidateCount: candidates.length,
+      sameNode: Object.is(current, raw),
+      current: current === undefined ? null : { tag: current.tagName, id: current.id, value: current.value },
+      original: { connected: raw.isConnected, tag: raw.tagName, id: raw.id, value: raw.value },
+    }).toEqual({
+      candidateCount: 1,
+      sameNode: true,
+      current: { tag: "INPUT", id: raw.id, value: "A\\r\\nB-edited" },
+      original: { connected: true, tag: "INPUT", id: raw.id, value: "A\\r\\nB-edited" },
+    });
   });
 
   it("响应区在空状态也有自己的标签，样例与预期字段归入「字段与断言」", async () => {
@@ -473,9 +589,9 @@ describe("请求调试工作台", () => {
     expect(within(response).queryByText("状态码")).toBeNull();
 
     // 样例与预期字段只在「字段与断言」标签里出现，正文标签下没有它。
-    expect(within(response).queryByText(/先粘贴一份响应样例/)).toBeNull();
+    expect(within(response).queryByRole("textbox", { name: "响应样例" })).toBeNull();
     fireEvent.click(within(tabs).getByRole("tab", { name: /^字段与断言/ }));
-    expect(within(response).getByText(/先粘贴一份响应样例/)).toBeTruthy();
+    expect(within(response).getByRole("textbox", { name: "响应样例" })).toBeTruthy();
   });
 
   it("响应区在收到报告前保留标题，且不伪造状态码", async () => {

@@ -826,6 +826,8 @@ describe("F6 运行选择驱动来源", () => {
     await act(async () => {
       view.rerender(editorElement());
     });
+    // 历史区现在是默认收起的真实 Collapse；按用户路径展开后再点选报告。
+    fireEvent.click(screen.getByRole("button", { name: "版本执行与发布记录" }));
     fireEvent.click(screen.getByRole("button", { name: "查看报告" }));
     await waitFor(() =>
       expect(screen.getByRole("region", { name: "响应" }).textContent).toContain("500"),
