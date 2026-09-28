@@ -417,11 +417,29 @@ describe("用例目录承载用例的闭环", () => {
     ];
     const browser = await renderShell();
     pickFolder(browser, "A 模块");
-    fireEvent.click(await within(browser).findByRole("button", { name: /归档目录里的用例/ }));
-    await waitFor(() => expect(antSelectedValue("所属目录")).toBe(FOLDER_A));
+    const caseButton = await waitFor(() => {
+      const current = Array.from(browser.querySelectorAll("button"))
+        .find((button) => button.textContent?.includes("归档目录里的用例"));
+      if (!(current instanceof HTMLButtonElement)) throw new Error("归档目录里的用例入口未挂载");
+      return current;
+    });
+    fireEvent.click(caseButton);
+    const editor = await waitFor(() => {
+      const current = document.querySelector<HTMLElement>(".workspace-editor:not([hidden])");
+      if (current === null) throw new Error("活动编辑器未挂载");
+      return current;
+    });
+    const folderSelect = await waitFor(() => {
+      const current = editor.querySelector<HTMLElement>(".case-folder-select[data-selected-value]");
+      if (current === null) throw new Error("所属目录选择器未挂载");
+      expect(current.dataset.selectedValue).toBe(FOLDER_A);
+      return current;
+    });
 
     // 在目录树里归档 A：编辑器拿到的是同一份目录清单，必须立刻反映出来。
-    fireEvent.click(within(browser).getByRole("button", { name: "归档目录 A 模块" }));
+    const archive = browser.querySelector('[aria-label="归档目录 A 模块"]');
+    if (!(archive instanceof HTMLButtonElement)) throw new Error("归档 A 模块入口未挂载");
+    fireEvent.click(archive);
 
     // A 不见与 B 还在必须**同时**成立，所以放在同一个等待条件里。
     //
@@ -429,26 +447,48 @@ describe("用例目录承载用例的闭环", () => {
     // 选择器里只剩失效占位，「A 模块」确实已经不见了，但「B 模块」也还没到——第一段
     // 因此通过，第二段随负载随机失败。这里的结论本来就是一个收敛条件（清单刷新过），
     // 不是某一帧的快照。
-    fireEvent.mouseDown(screen.getByRole("combobox", { name: "所属目录" }));
-    await waitFor(() => expect(screen.getByRole("option", { name: "B 模块" })).toBeTruthy());
-    expect(screen.queryByRole("option", { name: "A 模块" })).toBeNull();
-    fireEvent.keyDown(screen.getByRole("combobox", { name: "所属目录" }), { key: "Escape" });
+    const combobox = folderSelect.querySelector('[role="combobox"]');
+    if (!(combobox instanceof HTMLInputElement)) throw new Error("所属目录选择器未挂载");
+    fireEvent.mouseDown(combobox);
+    const listId = combobox.getAttribute("aria-controls");
+    if (listId === null) throw new Error("所属目录选择器没有关联选项列表");
+    await waitFor(() => {
+      const popup = document.getElementById(listId)?.closest<HTMLElement>(".ant-select-dropdown");
+      const labels = popup === null || popup === undefined
+        ? []
+        : Array.from(popup.querySelectorAll<HTMLElement>(".ant-select-item-option-content"), (item) => item.textContent?.trim() ?? "");
+      expect({ hasA: labels.includes("A 模块"), hasB: labels.includes("B 模块") }).toEqual({ hasA: false, hasB: true });
+    });
+    fireEvent.keyDown(combobox, { key: "Escape" });
     // 关键：失效状态必须如实显示，不能被显示成「未分组」——那等于在界面上宣布一个
     // 用户没做过的改动，用户一保存就真的被移出原目录。
-    expect(selectedFolderLabel()).toContain("已失效");
-    expect(screen.getByText(/不动目录直接保存不会改变它的归属/)).toBeTruthy();
+    expect({ value: folderSelect.dataset.selectedValue, expired: folderSelect.textContent?.includes("已失效") }).toEqual({ value: FOLDER_A, expired: true });
+    expect(editor.textContent?.includes("不动目录直接保存不会改变它的归属")).toBe(true);
 
     // 用户只改了名称：请求里不该出现 folder_id，归属必须原样保留。
-    fireEvent.change(screen.getByLabelText("用例名称"), { target: { value: "归档后改名" } });
-    fireEvent.click(screen.getByRole("button", { name: "保存草稿" }));
+    const nameInput = editor.querySelector(".case-name-input");
+    if (!(nameInput instanceof HTMLInputElement)) throw new Error("用例名称输入框未挂载");
+    fireEvent.change(nameInput, { target: { value: "归档后改名" } });
+    const save = Array.from(editor.querySelectorAll("button")).find((button) => button.textContent?.trim() === "保存草稿");
+    if (!(save instanceof HTMLButtonElement)) throw new Error("保存草稿入口未挂载");
+    fireEvent.click(save);
     await waitFor(() =>
       expect(writes.filter((item) => item.method === "PATCH")).toHaveLength(1),
     );
-    expect("folder_id" in writes.filter((item) => item.method === "PATCH")[0]!.body).toBe(false);
+    const patch = writes.filter((item) => item.method === "PATCH")[0]!;
+    expect({ name: patch.body.name, sentFolder: "folder_id" in patch.body }).toEqual({ name: "归档后改名", sentFolder: false });
     // 服务端替身按同样的三态语义处理，所以这里同时证明用例仍挂在原目录上。
-    expect(cases[0]?.folder_id).toBe(FOLDER_A);
+    expect({ name: cases[0]?.name, folderId: cases[0]?.folder_id }).toEqual({ name: "归档后改名", folderId: FOLDER_A });
     // 再打开一次仍是失效目录，而不是未分组。
-    expect(selectedFolderLabel()).toContain("已失效");
+    await waitFor(() => {
+      const currentEditor = document.querySelector<HTMLElement>(".workspace-editor:not([hidden])");
+      const currentSelect = currentEditor?.querySelector<HTMLElement>(".case-folder-select[data-selected-value]") ?? null;
+      expect({
+        connected: currentSelect?.isConnected ?? false,
+        value: currentSelect?.dataset.selectedValue ?? null,
+        expired: currentSelect?.textContent?.includes("已失效") ?? false,
+      }).toEqual({ connected: true, value: FOLDER_A, expired: true });
+    });
   });
 
   it("所属目录按名称选择，选项只含当前项目的未归档目录，没有填 UUID 的入口", async () => {

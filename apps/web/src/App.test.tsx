@@ -503,18 +503,47 @@ describe("未保存内容的离开保护", () => {
     ];
     await renderShell();
 
-    fireEvent.click(screen.getByRole("button", { name: "环境配置" }));
-    fireEvent.click(await screen.findByRole("button", { name: "环境（1）" }));
-    fireEvent.click(await screen.findByRole("button", { name: "本地测试环境" }));
-    fireEvent.click(await screen.findByRole("button", { name: "编辑" }));
-    fireEvent.change(screen.getByLabelText("值"), { target: { value: "2" } });
-    await act(async () => {});
+    const environmentNav = Array.from(document.querySelectorAll<HTMLButtonElement>(".primary-nav .nav-item"))
+      .find((button) => button.textContent?.trim() === "环境配置");
+    if (environmentNav === undefined) throw new Error("环境配置导航未挂载");
+    fireEvent.click(environmentNav);
+
+    const environmentPanel = document.getElementById("environment-panel");
+    if (!(environmentPanel instanceof HTMLElement)) throw new Error("环境面板未挂载");
+    const environmentTrigger = Array.from(environmentPanel.querySelectorAll<HTMLElement>('.ant-collapse-header[role="button"]'))
+      .find((trigger) => trigger.textContent?.trim() === "环境（1）");
+    if (environmentTrigger === undefined) throw new Error("环境列表折叠入口未挂载");
+    if (environmentTrigger.getAttribute("aria-expanded") !== "true") {
+      fireEvent.click(environmentTrigger);
+      await waitFor(() => expect(environmentTrigger.getAttribute("aria-expanded")).toBe("true"));
+    }
+
+    const environmentButton = Array.from(environmentPanel.querySelectorAll<HTMLButtonElement>("button"))
+      .find((button) => button.textContent?.trim() === "本地测试环境");
+    if (environmentButton === undefined) throw new Error("本地测试环境入口未挂载");
+    fireEvent.click(environmentButton);
+    const environmentCard = environmentButton.closest<HTMLElement>(".ant-card");
+    if (environmentCard === null) throw new Error("本地测试环境卡片未挂载");
+    const editButton = Array.from(environmentCard.querySelectorAll<HTMLButtonElement>("button"))
+      .find((button) => button.textContent?.trim() === "编辑");
+    if (editButton === undefined) throw new Error("环境编辑入口未挂载");
+    fireEvent.click(editButton);
+    const valueInput = within(environmentCard).getByLabelText("值") as HTMLInputElement;
+    fireEvent.change(valueInput, { target: { value: "2" } });
 
     await selectAntOption("项目", "项目乙");
     await cancelLeave();
     // 拒绝离开后仍停在原项目，刚改的值还在输入框里。
     expect(antSelectedValue("项目")).toBe(PROJECT_A);
-    expect((screen.getByLabelText("值") as HTMLInputElement).value).toBe("2");
+    const currentValueInput = within(environmentCard).getByLabelText("值") as HTMLInputElement;
+    expect({
+      connected: valueInput.isConnected,
+      sameNode: Object.is(currentValueInput, valueInput),
+      value: currentValueInput.value,
+    }).toEqual({ connected: true, sameNode: true, value: "2" });
+    expect(casePosts).toHaveLength(0);
+    expect(postCalls).toHaveLength(0);
+    expect(apiSendMock.mock.calls.filter(([, method]) => method !== "GET")).toHaveLength(0);
   });
 
   /**
