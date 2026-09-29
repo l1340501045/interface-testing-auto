@@ -15,7 +15,7 @@ import { ApiError, apiSend, projectPath } from "../api/client";
 import type { CaseVersion, RunReport, RunSummary } from "../api/types";
 import { ErrorText, Hint, Loading, StatusTag } from "../components/Feedback";
 import { describeValue } from "../api/literals";
-import { isTerminal, runOutcomeLabel, runReasonLabel, runStateLabel, runTimeLabel, stepOutcomeLabel, stepStateLabel, useRunReport, useRuns } from "./useRuns";
+import { isTerminal, runOutcomeLabel, runReasonLabel, runStateLabel, runTimeLabel, stepOutcomeLabel, stepStateLabel, uncheckedReasonLabel, useRunReport, useRuns } from "./useRuns";
 
 /** 一次版本提交的执行配置依据：提交**之前**冻结，受理后原样登记。 */
 export interface RunProvenance {
@@ -52,17 +52,40 @@ export function ReportView({ report }: { report: RunReport }) {
 
       <h4>步骤</h4>
       {report.steps.length === 0 ? (
-        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有步骤记录，工作项可能仍在排队" />
+        <Empty
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          description={isTerminal(report.run) ? "没有已保存的步骤记录" : "还没有步骤记录，工作项可能仍在排队"}
+        />
       ) : (
         <ul className="caption">
-          {report.steps.map((step) => (
-            <li key={`${step.step_key}-${step.attempt_no}`}>
-              第 {step.attempt_no} 次 · {stepStateLabel(step.state)}
-              {stepOutcomeLabel(step.outcome) ? ` · ${stepOutcomeLabel(step.outcome)}` : ""}
-              {step.elapsed_ms !== null ? ` · ${step.elapsed_ms} 毫秒` : ""}
-              {step.error_code ? ` · ${step.error_code}` : ""}
-            </li>
-          ))}
+          {report.steps.map((step) => {
+            const displayedOutcome = step.interpretation?.outcome ?? step.outcome;
+            const isUnchecked = displayedOutcome === "completed_unchecked";
+            return (
+              <li key={`${step.step_key}-${step.attempt_no}`}>
+                第 {step.attempt_no} 次 · {stepStateLabel(step.state)}
+                {stepOutcomeLabel(displayedOutcome) ? ` · ${stepOutcomeLabel(displayedOutcome)}` : ""}
+                {step.elapsed_ms !== null ? ` · ${step.elapsed_ms} 毫秒` : ""}
+                {step.outcome === null && isTerminal(report.run)
+                  ? " · 该尝试未保存最终结论"
+                  : ""}
+                {isUnchecked ? ` · ${uncheckedReasonLabel(step.error_code)}` : step.error_code ? ` · ${step.error_code}` : ""}
+                {step.interpretation ? (
+                  <>
+                    <Tag color="warning">历史记录兼容解释</Tag>
+                    <Collapse
+                      size="small"
+                      items={[{
+                        key: "recorded-outcome",
+                        label: "查看原始记录",
+                        children: `原始结果：${stepOutcomeLabel(step.outcome) ?? "无最终结果"}${step.error_code ? `；原始原因：${step.error_code}` : ""}`,
+                      }]}
+                    />
+                  </>
+                ) : null}
+              </li>
+            );
+          })}
         </ul>
       )}
 

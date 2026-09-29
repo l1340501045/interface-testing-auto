@@ -240,6 +240,10 @@ export interface RunStep {
   outcome: string | null;
   elapsed_ms: number | null;
   error_code: string | null;
+  interpretation?: {
+    outcome: "completed_unchecked";
+    reason_code: "legacy_unchecked_mapping";
+  } | null;
 }
 
 export interface AssertionResult {

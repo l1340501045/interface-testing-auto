@@ -155,6 +155,15 @@ const calls: string[] = [];
  * 才读配置，会把按旧配置跑的运行记成按新配置跑的。
  */
 const runGate: { pending: (() => void) | null } = { pending: null };
+const secretVersionsGate: {
+  hold: boolean;
+  startedPath: string | null;
+  pending: (() => void) | null;
+} = {
+  hold: false,
+  startedPath: null,
+  pending: null,
+};
 function holdNextRun(): void {
   runGate.pending = () => undefined;
 }
@@ -163,6 +172,15 @@ function releaseRun(value: unknown): void {
   runGate.pending = null;
   pending?.();
   void value;
+}
+
+function releaseSecretVersions(): void {
+  const pending = secretVersionsGate.pending;
+  if (pending === null) {
+    throw new Error("秘密版本请求尚未进入受控等待，不能提前释放");
+  }
+  secretVersionsGate.pending = null;
+  pending();
 }
 
 function route(rawPath: string, method: string, body?: unknown): unknown {
@@ -210,10 +228,18 @@ function route(rawPath: string, method: string, body?: unknown): unknown {
     return [{ id: SECRET_ID, name: "演示令牌", kind: "static", latest_version: 2, latest_version_id: "sv-2" }];
   }
   if (method === "GET" && path.includes("/credentials/secrets/") && path.endsWith("/versions")) {
-    return [
+    const versions = [
       { secret_id: SECRET_ID, version_id: "sv-1", version: 1 },
       { secret_id: SECRET_ID, version_id: "sv-2", version: 2 },
     ];
+    if (secretVersionsGate.hold) {
+      secretVersionsGate.hold = false;
+      secretVersionsGate.startedPath = path;
+      return new Promise((resolve) => {
+        secretVersionsGate.pending = () => resolve(versions);
+      });
+    }
+    return versions;
   }
   if (method === "GET" && path.endsWith("/credentials/profiles")) {
     return [
@@ -447,6 +473,9 @@ beforeEach(() => {
   runSeq = 0;
   calls.length = 0;
   runGate.pending = null;
+  secretVersionsGate.hold = false;
+  secretVersionsGate.startedPath = null;
+  secretVersionsGate.pending = null;
   lastRunId = RUN_V1;
   envBaseUrl = "http://echo.test";
   variables = { version: 1, variables: [] };
@@ -594,11 +623,31 @@ describe("版本运行当前结论的执行配置依据", () => {
     await runVersion();
     await expectCurrentPassed();
 
+    // 稳定复现 CI 的调度窗口：当前集合已读回，但秘密版本列表仍在请求中。
+    secretVersionsGate.hold = true;
     const panel = await openAdmin();
     openSection(panel, "人工凭证");
     // 使用组件明确提供的“秘密版本”可访问名驱动真实 Select 弹层；可见“版本”标签的
     // htmlFor 已与当前控件 id 对齐，两者共同保证键盘和辅助技术都能到达该选择器。
     await waitFor(() => expect(selectedValue("秘密版本")).toBe("sv-1"));
+    const expectedVersionsPath = `/workspaces/${WORKSPACE_ID}/projects/${PROJECT_ID}`
+      + `/credentials/secrets/${SECRET_ID}/versions`;
+    await waitFor(() => expect({
+      startedPath: secretVersionsGate.startedPath,
+      pending: secretVersionsGate.pending !== null,
+    }).toEqual({ startedPath: expectedVersionsPath, pending: true }));
+    const loadingVersionSelect = within(panel).getByRole("combobox", { name: "秘密版本" });
+    expect(loadingVersionSelect.hasAttribute("disabled")).toBe(true);
+    expect(loadingVersionSelect.getAttribute("aria-controls")).toBeNull();
+    await act(async () => releaseSecretVersions());
+    // 当前绑定集合先提供已选值，版本列表再独立加载；列表到达前 Select 会保持禁用。
+    // 以真实可交互状态为因果边界，不能把“已有选中值”误当成“选项已经可用”。
+    const readyVersionSelect = await waitFor(() => {
+      const current = within(panel).getByRole("combobox", { name: "秘密版本" });
+      expect(current.hasAttribute("disabled")).toBe(false);
+      return current;
+    });
+    expect(readyVersionSelect).toBe(loadingVersionSelect);
     await selectAntOption("秘密版本", "第 2 版");
     expect(selectedValue("秘密版本")).toBe("sv-2");
     await act(async () => {

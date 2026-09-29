@@ -71,6 +71,22 @@ def test_every_column_has_chinese_comment(schema_connection: psycopg.Connection)
     assert missing == [], f"以下列缺少中文 COMMENT：{missing}"
 
 
+def test_run_step_outcome_comment_describes_every_persisted_semantic(
+    schema_connection: psycopg.Connection,
+) -> None:
+    comment = schema_connection.execute(
+        "SELECT col_description('app.run_step_attempts'::regclass, a.attnum) "
+        "FROM pg_attribute a "
+        "WHERE a.attrelid = 'app.run_step_attempts'::regclass "
+        "AND a.attname = 'outcome' AND a.attnum > 0 AND NOT a.attisdropped"
+    ).fetchone()
+    assert comment == (
+        "步骤结果：passed通过、failed断言失败、error执行或配置错误、"
+        "interrupted结果不明、canceled已取消、completed_unchecked响应未校验；"
+        "空表示没有已提交的最终结论",
+    )
+
+
 def test_tenant_tables_force_row_level_security(
     schema_connection: psycopg.Connection,
 ) -> None:

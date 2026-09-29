@@ -15,7 +15,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from sqlalchemy import select, text
@@ -431,9 +431,12 @@ def _required_unchecked(records: list[AssertionRecord]) -> bool:
     )
 
 
+ExecutionOutcome = Literal["passed", "failed", "error", "completed_unchecked"]
+
+
 def _summarize(
     pre_records: list[AssertionRecord], post_records: list[AssertionRecord]
-) -> tuple[str, str | None, str | None]:
+) -> tuple[ExecutionOutcome, str | None, str | None]:
     """汇总运行终态：配置错误优先，其次阻塞失败，最后区分是否真正校验过。"""
     executed_post = [item for item in post_records if item.outcome.status != "skipped"]
     for record in pre_records + post_records:
@@ -1480,7 +1483,6 @@ def _execute(session: Session, settings: Settings, claim: JobClaim) -> str:
         ctx,
     )
     outcome, reason, error_code = _summarize(pre_records, post_records)
-    attempt_outcome = {"passed": "passed", "failed": "failed"}.get(outcome, "error")
     _finalize(
         session,
         claim,
@@ -1488,7 +1490,9 @@ def _execute(session: Session, settings: Settings, claim: JobClaim) -> str:
         outcome=outcome,
         reason_category=reason,
         attempt_state="finished",
-        attempt_outcome=attempt_outcome,
+        # HTTP 已经完成，步骤与运行共享同一份断言汇总结论。这里不能把未校验
+        # 降成 error；其它发送前、网络、取消与结果不明出口仍各自显式传值。
+        attempt_outcome=outcome,
         evidence=StepEvidence(
             request=request_evidence, response=response_evidence, guards_evaluated=True
         ),

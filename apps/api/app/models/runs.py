@@ -98,7 +98,15 @@ class RunStepAttempt(Base):
     step_key: Mapped[str] = mapped_column(String(50), nullable=False, default="main", server_default="main", comment="步骤键，单接口固定为 main")
     attempt_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1", comment="尝试序号，从 1 递增")
     state: Mapped[str] = mapped_column(String(20), nullable=False, comment="步骤状态：queued/sending/finished/skipped")
-    outcome: Mapped[str | None] = mapped_column(String(20), nullable=True, comment="步骤结果：passed/failed/error/interrupted")
+    outcome: Mapped[str | None] = mapped_column(
+        String(20),
+        nullable=True,
+        comment=(
+            "步骤结果：passed通过、failed断言失败、error执行或配置错误、"
+            "interrupted结果不明、canceled已取消、completed_unchecked响应未校验；"
+            "空表示没有已提交的最终结论"
+        ),
+    )
     send_intent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, comment="持久化发送意图的时间")
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, comment="开始执行时间")
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, comment="结束时间")

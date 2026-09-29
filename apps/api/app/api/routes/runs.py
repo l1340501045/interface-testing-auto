@@ -45,6 +45,7 @@ from ..schemas import (
     RunOut,
     RunReportOut,
     RunSourceEnvironment,
+    RunStepInterpretationOut,
     RunStepOut,
 )
 
@@ -73,6 +74,70 @@ def _get_run(session: Session, scope: deps.ProjectScope, run_id: uuid.UUID) -> R
     if run is None:
         raise not_found("运行记录不存在")
     return run
+
+
+def _legacy_unchecked_attempt_id(
+    run: Run, attempts: list[RunStepAttempt]
+) -> uuid.UUID | None:
+    """识别旧 worker 有损映射出的最终 main 尝试；证据不足时不解释。"""
+    if (
+        run.state != "finished"
+        or run.outcome != "completed_unchecked"
+        or run.target_type not in {"case_version", "debug_snapshot"}
+        or not attempts
+    ):
+        return None
+    attempt_numbers = [item.attempt_no for item in attempts]
+    if (
+        any(item.step_key != "main" for item in attempts)
+        or any(number <= 0 for number in attempt_numbers)
+        or len(set(attempt_numbers)) != len(attempt_numbers)
+    ):
+        return None
+    latest = max(attempts, key=lambda item: item.attempt_no)
+    if (
+        latest.state != "finished"
+        or latest.outcome != "error"
+        or latest.send_intent_at is None
+        or latest.started_at is None
+        or latest.finished_at is None
+    ):
+        return None
+    response = latest.response
+    status = response.get("status") if isinstance(response, dict) else None
+    if isinstance(status, bool) or not isinstance(status, int) or not 100 <= status <= 599:
+        return None
+    reason_pair = (run.reason_category, latest.error_code)
+    if reason_pair not in {
+        (None, None),
+        ("assertion", "assertion_not_evaluated"),
+    }:
+        return None
+    return latest.id
+
+
+def _run_steps_out(run: Run, attempts: list[RunStepAttempt]) -> list[RunStepOut]:
+    """两个报告出口共用的只读步骤投影；不修改 ORM，也不重算断言。"""
+    interpreted_id = _legacy_unchecked_attempt_id(run, attempts)
+    return [
+        RunStepOut(
+            step_key=item.step_key,
+            attempt_no=item.attempt_no,
+            state=item.state,
+            outcome=item.outcome,
+            elapsed_ms=item.elapsed_ms,
+            error_code=item.error_code,
+            interpretation=(
+                RunStepInterpretationOut(
+                    outcome="completed_unchecked",
+                    reason_code="legacy_unchecked_mapping",
+                )
+                if item.id == interpreted_id
+                else None
+            ),
+        )
+        for item in attempts
+    ]
 
 
 @router.post(
@@ -236,23 +301,15 @@ def list_steps(
     scope: deps.ProjectScope = _VIEW_SCOPE,
     session: Session = Depends(get_db),
 ) -> list[RunStepOut]:
-    _get_run(session, scope, run_id)
-    items = session.scalars(
-        select(RunStepAttempt)
-        .where(RunStepAttempt.run_id == run_id)
-        .order_by(RunStepAttempt.attempt_no)
-    )
-    return [
-        RunStepOut(
-            step_key=item.step_key,
-            attempt_no=item.attempt_no,
-            state=item.state,
-            outcome=item.outcome,
-            elapsed_ms=item.elapsed_ms,
-            error_code=item.error_code,
+    run = _get_run(session, scope, run_id)
+    attempts = list(
+        session.scalars(
+            select(RunStepAttempt)
+            .where(RunStepAttempt.run_id == run_id)
+            .order_by(RunStepAttempt.attempt_no)
         )
-        for item in items
-    ]
+    )
+    return _run_steps_out(run, attempts)
 
 
 def _report_context(
@@ -341,17 +398,7 @@ def get_report(
     )
     return RunReportOut(
         run=_run_out(run),
-        steps=[
-            RunStepOut(
-                step_key=item.step_key,
-                attempt_no=item.attempt_no,
-                state=item.state,
-                outcome=item.outcome,
-                elapsed_ms=item.elapsed_ms,
-                error_code=item.error_code,
-            )
-            for item in attempts
-        ],
+        steps=_run_steps_out(run, attempts),
         assertions=[
             AssertionResultOut(
                 assertion_id=item.assertion_id,

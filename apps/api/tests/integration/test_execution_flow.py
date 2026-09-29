@@ -104,7 +104,190 @@ def _post_response_assertion(assertion_id: str, target_source: str, type_id: str
     }
 
 
+def _plant_legacy_unchecked_report(
+    run_id: str,
+    *,
+    reason_category: str | None = None,
+    error_code: str | None = None,
+    earlier_sending: bool = False,
+) -> None:
+    """只在隔离测试库造一条旧 worker 的有损步骤结果，不触发任何 HTTP。"""
+    from psycopg.types.json import Jsonb
+
+    connection = migrator_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE app.runs SET state = 'finished', outcome = 'completed_unchecked', "
+                "reason_category = %s WHERE id = %s",
+                (reason_category, run_id),
+            )
+            cursor.execute("UPDATE app.jobs SET state = 'done' WHERE run_id = %s", (run_id,))
+            if earlier_sending:
+                cursor.execute(
+                    "INSERT INTO app.run_step_attempts "
+                    "(id, workspace_id, project_id, run_id, step_key, attempt_no, state, outcome, "
+                    "send_intent_at, started_at, request) "
+                    "SELECT %s, workspace_id, project_id, id, 'main', 1, 'sending', NULL, "
+                    "now(), now(), %s FROM app.runs WHERE id = %s",
+                    (
+                        uuid.uuid4(),
+                        Jsonb({"method": "GET", "url": "http://echo:8080/echo"}),
+                        run_id,
+                    ),
+                )
+            cursor.execute(
+                "INSERT INTO app.run_step_attempts "
+                "(id, workspace_id, project_id, run_id, step_key, attempt_no, state, outcome, "
+                "send_intent_at, started_at, finished_at, request, response, error_code) "
+                "SELECT %s, workspace_id, project_id, id, 'main', %s, 'finished', 'error', "
+                "now(), now(), now(), %s, %s, %s FROM app.runs WHERE id = %s",
+                (
+                    uuid.uuid4(),
+                    2 if earlier_sending else 1,
+                    Jsonb({"method": "GET", "url": "http://echo:8080/echo"}),
+                    Jsonb({"status": 200, "body": None}),
+                    error_code,
+                    run_id,
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 # —— SC-06：真实 HTTP 与持久报告 ——
+
+
+def test_legacy_unchecked_mapping_is_read_only_and_shared_by_both_endpoints(
+    client: TestClient,
+    account: dict,
+    project: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """可信旧记录保留原值，只给最终 main 尝试附同一份兼容解释。"""
+    environment = create_environment(client, account, project, name="历史解释环境")
+    case = create_case(
+        client,
+        account,
+        project,
+        name="历史未校验用例",
+        request=_echo_case_request(),
+        assertions=[],
+    )
+    version = publish_case(client, account, project, case["id"])
+    run = start_run(client, account, project, {
+        "environment_id": environment["id"],
+        "case_version_id": version["id"],
+    })
+    _plant_legacy_unchecked_report(run["id"])
+
+    from app.services import executor
+
+    sends: list[str] = []
+    monkeypatch.setattr(executor, "_send", lambda *_args, **_kwargs: sends.append("unexpected"))
+    connection = migrator_connection()
+    try:
+        before = connection.execute(
+            "SELECT to_jsonb(r), "
+            "(SELECT jsonb_agg(to_jsonb(s) ORDER BY s.attempt_no) "
+            " FROM app.run_step_attempts s WHERE s.run_id = r.id), "
+            "(SELECT count(*) FROM app.jobs j WHERE j.run_id = r.id), "
+            "(SELECT count(*) FROM app.credential_use_grants), "
+            "(SELECT count(*) FROM app.runner_pool_project_grants) "
+            "FROM app.runs r WHERE r.id = %s",
+            (run["id"],),
+        ).fetchone()
+    finally:
+        connection.close()
+
+    base = project_base(account, project)
+    steps_response = client.get(f"{base}/runs/{run['id']}/steps")
+    report_response = client.get(f"{base}/runs/{run['id']}/report")
+    assert steps_response.status_code == 200, steps_response.text
+    assert report_response.status_code == 200, report_response.text
+    expected_interpretation = {
+        "outcome": "completed_unchecked",
+        "reason_code": "legacy_unchecked_mapping",
+    }
+    assert steps_response.json()[0]["outcome"] == "error"
+    assert steps_response.json()[0]["interpretation"] == expected_interpretation
+    assert report_response.json()["steps"][0] == steps_response.json()[0]
+    assert sends == [], "读取历史报告不得调用执行器发送 HTTP"
+
+    connection = migrator_connection()
+    try:
+        after = connection.execute(
+            "SELECT to_jsonb(r), "
+            "(SELECT jsonb_agg(to_jsonb(s) ORDER BY s.attempt_no) "
+            " FROM app.run_step_attempts s WHERE s.run_id = r.id), "
+            "(SELECT count(*) FROM app.jobs j WHERE j.run_id = r.id), "
+            "(SELECT count(*) FROM app.credential_use_grants), "
+            "(SELECT count(*) FROM app.runner_pool_project_grants) "
+            "FROM app.runs r WHERE r.id = %s",
+            (run["id"],),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert after == before, "兼容解释读取不得改写运行、步骤，或新增工作项与授权"
+
+
+@pytest.mark.parametrize(
+    ("reason_category", "error_code", "interpreted"),
+    [
+        ("assertion", "assertion_not_evaluated", True),
+        ("assertion", None, False),
+        (None, "assertion_not_evaluated", False),
+    ],
+)
+def test_legacy_interpretation_requires_the_complete_reason_pair_on_both_endpoints(
+    client: TestClient,
+    account: dict,
+    project: dict,
+    reason_category: str | None,
+    error_code: str | None,
+    interpreted: bool,
+) -> None:
+    environment = create_environment(client, account, project, name="历史原因组合环境")
+    run = start_run(client, account, project, {
+        "environment_id": environment["id"],
+        "debug_snapshot": {"request": _echo_case_request(), "assertions": []},
+    })
+    _plant_legacy_unchecked_report(
+        run["id"], reason_category=reason_category, error_code=error_code
+    )
+    base = project_base(account, project)
+    step = client.get(f"{base}/runs/{run['id']}/steps").json()[0]
+    report_step = client.get(f"{base}/runs/{run['id']}/report").json()["steps"][0]
+    assert (step["interpretation"] is not None) is interpreted
+    assert report_step == step
+
+
+@pytest.mark.parametrize("final_eligible", [True, False])
+def test_only_final_attempt_can_be_interpreted_after_an_unresolved_sending_attempt(
+    client: TestClient,
+    account: dict,
+    project: dict,
+    final_eligible: bool,
+) -> None:
+    environment = create_environment(client, account, project, name="历史多尝试环境")
+    run = start_run(client, account, project, {
+        "environment_id": environment["id"],
+        "debug_snapshot": {"request": _echo_case_request(), "assertions": []},
+    })
+    _plant_legacy_unchecked_report(
+        run["id"],
+        earlier_sending=True,
+        error_code=None if final_eligible else "read_timeout",
+    )
+    base = project_base(account, project)
+    steps = client.get(f"{base}/runs/{run['id']}/steps").json()
+    report_steps = client.get(f"{base}/runs/{run['id']}/report").json()["steps"]
+    assert report_steps == steps
+    assert steps[0]["state"] == "sending"
+    assert steps[0]["outcome"] is None
+    assert steps[0]["interpretation"] is None
+    assert (steps[1]["interpretation"] is not None) is final_eligible
 
 
 def test_worker_sends_real_http_and_persists_report(
@@ -418,10 +601,47 @@ def test_response_not_checked_when_only_pre_request_assertions(
         "case_version_id": version["id"],
     })
 
+    outcome = _run_once(project["pool_id"])
+    report = get_report(client, account, project, run["id"])
+    assert outcome == "completed_unchecked", report
+    assert report["run"]["outcome"] == "completed_unchecked"
+    assert report["steps"][-1]["outcome"] == "completed_unchecked"
+    assert _send_intent_rows(run["id"])[-1][2] == "completed_unchecked"
+    assert report["response"] is not None, "请求确实发出并收到了响应"
+    steps = client.get(f"{project_base(account, project)}/runs/{run['id']}/steps")
+    assert steps.status_code == 200, steps.text
+    assert steps.json()[-1]["outcome"] == "completed_unchecked"
+
+
+@pytest.mark.parametrize("status", [200, 503])
+def test_response_without_assertions_stays_unchecked_for_any_http_status(
+    client: TestClient, account: dict, project: dict, status: int
+) -> None:
+    """HTTP 状态只证明收到响应；没有响应断言时，200 与 503 都不能冒充健康结论。"""
+    environment = create_environment(client, account, project, name=f"无断言{status}环境")
+    case = create_case(
+        client,
+        account,
+        project,
+        name=f"无断言{status}用例",
+        request=_echo_case_request(
+            method="GET", path=f"/status/{status}", body_type="none", body=""
+        ),
+        assertions=[],
+    )
+    version = publish_case(client, account, project, case["id"])
+    run = start_run(client, account, project, {
+        "environment_id": environment["id"],
+        "case_version_id": version["id"],
+    })
+
     assert _run_once(project["pool_id"]) == "completed_unchecked"
     report = get_report(client, account, project, run["id"])
     assert report["run"]["outcome"] == "completed_unchecked"
-    assert report["response"] is not None, "请求确实发出并收到了响应"
+    assert report["steps"][-1]["outcome"] == "completed_unchecked"
+    assert report["steps"][-1]["interpretation"] is None
+    assert report["response"]["status"] == status
+    assert _send_intent_rows(run["id"])[-1][2] == "completed_unchecked"
 
 
 def test_a_required_condition_that_could_not_run_is_not_a_pass(
@@ -468,10 +688,13 @@ def test_a_required_condition_that_could_not_run_is_not_a_pass(
         "case_version_id": version["id"],
     })
 
-    assert _run_once(project["pool_id"]) == "completed_unchecked"
+    outcome = _run_once(project["pool_id"])
     report = get_report(client, account, project, run["id"])
+    assert outcome == "completed_unchecked", report
     assert report["run"]["outcome"] == "completed_unchecked"
     assert report["run"]["reason_category"] == "assertion", "报告要读得出为什么不是通过"
+    assert report["steps"][-1]["outcome"] == "completed_unchecked"
+    assert _send_intent_rows(run["id"])[-1][2] == "completed_unchecked"
     assert report["steps"][-1]["error_code"] == "assertion_not_evaluated"
     assert {item["assertion_id"]: item["status"] for item in report["assertions"]} == {
         "amount-range": "skipped",
@@ -1291,6 +1514,10 @@ def test_terminal_state_is_not_overwritten(
     report = get_report(client, account, project, run["id"])
     assert report["run"]["outcome"] == "canceled"
     assert report["response"] is None, "取消后不得产生任何目标副作用"
+    assert report["steps"] == [], "发送前取消允许没有步骤，读取层不能补造尝试"
+    steps = client.get(f"{project_base(account, project)}/runs/{run['id']}/steps")
+    assert steps.status_code == 200, steps.text
+    assert steps.json() == []
 
 
 def test_queue_deadline_exceeded_does_not_send(

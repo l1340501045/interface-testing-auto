@@ -104,7 +104,9 @@ export function runReasonLabel(run: RunSummary): string | null {
     case "configuration":
       return "断言或请求配置有误";
     case "assertion":
-      return "断言未通过";
+      return run.outcome === "completed_unchecked"
+        ? "有必需的断言条件没有执行"
+        : "断言未通过";
     case "authentication":
       return "认证或凭证被拒绝";
     case "policy":

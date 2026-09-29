@@ -52,6 +52,9 @@ describe("运行状态与原因", () => {
       "认证或凭证被拒绝",
     );
     expect(runReasonLabel(run({ outcome: "passed", reason_category: null }))).toBeNull();
+    expect(runReasonLabel(run({ outcome: "completed_unchecked", reason_category: "assertion" }))).toBe(
+      "有必需的断言条件没有执行",
+    );
   });
 
   it("排队与执行中都不是终态：此时没有可展示的结果", () => {
