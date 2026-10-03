@@ -53,6 +53,7 @@ export function CaseBrowser({
   const [folderId, setFolderId] = useState<string | null>(null);
   const [newFolder, setNewFolder] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const selectedFolderAvailable = folderId === null || folders.some((folder) => folder.id === folderId && folder.availability === "available");
 
   const list = useCaseList(workspaceId, projectId, folderId, refreshToken);
 
@@ -90,7 +91,7 @@ export function CaseBrowser({
     <aside className="browser" aria-label="用例目录">
       <div className="browser-head">
         <h2>用例</h2>
-        <Button htmlType="button" type="primary" onClick={() => onCreate(folderId)} disabled={!canEdit}>
+        <Button htmlType="button" type="primary" onClick={() => onCreate(folderId)} disabled={!canEdit || !selectedFolderAvailable}>
           ＋新建用例
         </Button>
       </div>
@@ -112,7 +113,8 @@ export function CaseBrowser({
             { key: "__all__", title: "全部用例" },
             ...folders.map((folder) => ({
               key: folder.id,
-              title: <Space className="folder-item" size={4}><span>{folder.name}</span>{canEdit ? <Button htmlType="button" type="link" size="small" aria-label={`归档目录 ${folder.name}`} onClick={(event) => { event.stopPropagation(); void archiveFolder(folder.id); }}>归档</Button> : null}</Space>,
+              disabled: folder.availability !== "available",
+              title: <Space className="folder-item" size={4}><span>{folder.name}{folder.availability === "available" ? "" : "（不可用）"}</span>{canEdit && folder.availability === "available" ? <Button htmlType="button" type="link" size="small" aria-label={`归档目录 ${folder.name}`} onClick={(event) => { event.stopPropagation(); void archiveFolder(folder.id); }}>归档</Button> : null}</Space>,
             })),
           ]}
         />

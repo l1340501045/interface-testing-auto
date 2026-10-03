@@ -581,7 +581,7 @@ export function CaseEditor({
    * 清单还在加载时不下这个结论——那时 `folders` 是空的，结论只会是错的。
    */
   const folderUnavailable =
-    !foldersLoading && folderId !== null && !folders.some((item) => item.id === folderId);
+    !foldersLoading && folderId !== null && !folders.some((item) => item.id === folderId && item.availability === "available");
   /** 用户是否真的动过目录选择；只有动过才在保存时提交 `folder_id`（见 save）。 */
   const folderChanged = effectiveBaseline.folderId !== folderId;
 

@@ -66,6 +66,8 @@ interface FolderRow {
   parent_id: string | null;
   name: string;
   archived_at: string | null;
+  rev: number;
+  availability: "available" | "ancestor_archived" | "invalid_parent_chain";
 }
 
 interface CaseRow {
@@ -82,6 +84,7 @@ let folders: FolderRow[] = [];
 let cases: CaseRow[] = [];
 /** 记录写请求，用于断言“发出去的到底是哪一份”。 */
 const writes: { method: string; path: string; body: Record<string, unknown> }[] = [];
+const personalWrites: { method: string; path: string; body: unknown }[] = [];
 
 let nextCaseId = NEW_CASE_ID;
 
@@ -155,6 +158,28 @@ function route(path: string, method: string, body?: Record<string, unknown>): un
   }
   if (method === "GET" && clean.endsWith("/environments")) return [];
   if (method === "GET" && clean.endsWith("/assertion-types")) return [];
+  if (method === "GET" && clean.endsWith("/case-views")) return [];
+  if (method === "GET" && clean.endsWith("/case-library")) {
+    return { items: [], total: 0, next_cursor: null };
+  }
+  if (method === "GET" && clean.endsWith("/asset-folders")) {
+    const query = new URLSearchParams(path.split("?")[1] ?? "");
+    const archived = query.get("state") === "archived";
+    const items = folders.filter((item) => archived ? item.archived_at !== null : item.archived_at === null);
+    return {
+      items: items.map((item) => ({
+        ...item,
+        availability: archived ? "archived" : item.availability,
+        has_children: false,
+        archive_operation_id: null,
+        archive_root_id: null,
+        restore_mode: archived ? "legacy_single" : null,
+        ancestor_path: [],
+      })),
+      total: items.length,
+      next_cursor: null,
+    };
+  }
   if (method === "GET" && clean.endsWith("/folders")) {
     return folders.filter((item) => item.archived_at === null);
   }
@@ -213,6 +238,10 @@ function route(path: string, method: string, body?: Record<string, unknown>): un
     if (row === undefined) throw new Error(`用例不存在：${id}`);
     return caseDetail(row);
   }
+  if (method === "POST" && /\/case-preferences\/[0-9a-f-]{36}\/opened$/.test(clean)) {
+    const caseId = clean.split("/").at(-2) ?? "";
+    return { case_id: caseId, favorite: false, last_opened_at: "2026-10-04T00:00:00Z" };
+  }
   if (method === "GET" && clean.endsWith("/versions")) return [];
   throw new Error(`测试未覆盖的请求：${method} ${path}`);
 }
@@ -223,11 +252,12 @@ beforeEach(() => {
   apiSendWithMetaMock.mockReset();
   vi.mocked(apiDelete).mockReset();
   folders = [
-    { id: FOLDER_A, parent_id: null, name: "A 模块", archived_at: null },
-    { id: FOLDER_B, parent_id: null, name: "B 模块", archived_at: null },
+    { id: FOLDER_A, parent_id: null, name: "A 模块", archived_at: null, rev: 1, availability: "available" },
+    { id: FOLDER_B, parent_id: null, name: "B 模块", archived_at: null, rev: 1, availability: "available" },
   ];
   cases = [];
   writes.length = 0;
+  personalWrites.length = 0;
   nextCaseId = NEW_CASE_ID;
 
   apiGetMock.mockImplementation((async (path: string) => route(path, "GET")) as never);
@@ -243,9 +273,10 @@ function installSendMocks() {
   apiSendMock.mockImplementation((async (
     path: string,
     method: string,
-    body: Record<string, unknown>,
+    body?: Record<string, unknown>,
   ) => {
-    if (method !== "GET") writes.push({ method, path, body });
+    if (/\/case-preferences\/[0-9a-f-]{36}\/opened$/.test(basePath(path))) personalWrites.push({ method, path, body });
+    else if (method !== "GET") writes.push({ method, path, body: body ?? {} });
     return route(path, method, body);
   }) as never);
   apiSendWithMetaMock.mockImplementation((async (
@@ -269,6 +300,17 @@ async function renderShell(): Promise<HTMLElement> {
 
 function browserList(browser: HTMLElement): string[] {
   return Array.from(browser.querySelectorAll(".case-name")).map((node) => node.textContent ?? "");
+}
+
+async function findCaseButton(browser: HTMLElement, name: string): Promise<HTMLButtonElement> {
+  return waitFor(() => {
+    const button = Array.from(browser.querySelectorAll<HTMLButtonElement>(".case-list button"))
+      .find((item) => item.textContent?.includes(name));
+    if (button === undefined) throw new Error(`用例入口未挂载：${name}`);
+    expect(button.type).toBe("button");
+    expect(button.textContent).toContain(name);
+    return button;
+  });
 }
 
 function pickFolder(browser: HTMLElement, name: string) {
@@ -319,7 +361,7 @@ describe("用例目录承载用例的闭环", () => {
     ];
     const browser = await renderShell();
     pickFolder(browser, "A 模块");
-    fireEvent.click(await within(browser).findByRole("button", { name: /已归入 A 的用例/ }));
+    fireEvent.click(await findCaseButton(browser, "已归入 A 的用例"));
 
     await waitFor(() => expect(antSelectedValue("所属目录")).toBe(FOLDER_A));
     await selectAntOption("所属目录", "B 模块");
@@ -331,6 +373,7 @@ describe("用例目录承载用例的闭环", () => {
     await waitFor(() => expect(screen.queryByText("有未保存修改")).toBeNull());
     await waitFor(() => expect(screen.queryByLabelText("操作进行中")).toBeNull());
     expect(writes[0].body.folder_id).toBe(FOLDER_B);
+    await waitFor(() => expect(personalWrites.filter((item) => item.path.endsWith("/opened"))).toHaveLength(1));
     // A 的过滤列表里已经没有它了。
     await waitFor(() => expect(browserList(browser)).toEqual([]));
 
@@ -338,7 +381,7 @@ describe("用例目录承载用例的闭环", () => {
     await waitFor(() => expect(browserList(browser)).toEqual(["已归入 A 的用例"]));
 
     // 再改成未分组：这一步走的是「显式 null」，与「不改目录」只能靠字段是否出现区分。
-    fireEvent.click(within(browser).getByRole("button", { name: /已归入 A 的用例/ }));
+    fireEvent.click(await findCaseButton(browser, "已归入 A 的用例"));
     await waitFor(() => expect(antSelectedValue("所属目录")).toBe(FOLDER_B));
     await selectAntOption("所属目录", "未分组");
     fireEvent.click(screen.getByRole("button", { name: "保存草稿" }));
@@ -346,6 +389,7 @@ describe("用例目录承载用例的闭环", () => {
     await waitFor(() => expect(writes.filter((item) => item.method === "PATCH")).toHaveLength(2));
     expect("folder_id" in writes[1].body).toBe(true);
     expect(writes[1].body.folder_id).toBeNull();
+    await waitFor(() => expect(personalWrites.filter((item) => item.path.endsWith("/opened"))).toHaveLength(2));
     // 两个目录的过滤列表里都不再有它——它现在确实不在任何目录里。
     await waitFor(() => expect(browserList(browser)).toEqual([]));
     pickFolder(browser, "全部用例");
@@ -365,7 +409,7 @@ describe("用例目录承载用例的闭环", () => {
     ];
     const browser = await renderShell();
     pickFolder(browser, "A 模块");
-    fireEvent.click(await within(browser).findByRole("button", { name: /待分组的用例/ }));
+    fireEvent.click(await findCaseButton(browser, "待分组的用例"));
     await waitFor(() => expect(antSelectedValue("所属目录")).toBe(FOLDER_A));
 
     await selectAntOption("所属目录", "B 模块");
@@ -505,5 +549,23 @@ describe("用例目录承载用例的闭环", () => {
     // 没有让用户手写目录 id 的输入框：跨项目目录因此没有入口，
     // 服务端还会再拒一次（见 tests/integration/test_api_flow.py）。
     expect(document.querySelector('input[id="case-folder"]')).toBeNull();
+  });
+
+  it("工作台归档目录后已访问的用例库缓存失效并重读活动/归档桶", async () => {
+    await renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "用例库" }));
+    const library = await screen.findByRole("region", { name: "用例库" });
+    expect(await within(library).findByText("A 模块")).toBeTruthy();
+    const libraryReadsBefore = apiGetMock.mock.calls.filter(([path]) => String(path).includes("/case-library?")).length;
+
+    fireEvent.click(screen.getByRole("button", { name: "接口工作台" }));
+    const browser = screen.getByLabelText("用例目录");
+    fireEvent.click(within(browser).getByRole("button", { name: "归档目录 A 模块" }));
+    await waitFor(() => expect(folders.find((item) => item.id === FOLDER_A)?.archived_at).not.toBeNull());
+
+    fireEvent.click(screen.getByRole("button", { name: "用例库" }));
+    expect(await within(library).findByText("A 模块（已归档）")).toBeTruthy();
+    expect(within(library).queryByText("A 模块", { selector: ".ant-tree-title" })).toBeNull();
+    expect(apiGetMock.mock.calls.filter(([path]) => String(path).includes("/case-library?")).length).toBeGreaterThan(libraryReadsBefore);
   });
 });

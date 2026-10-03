@@ -1,9 +1,10 @@
-export const APP_PAGES = ["workbench", "environments", "tasks", "reports"] as const;
+export const APP_PAGES = ["workbench", "cases", "environments", "tasks", "reports"] as const;
 
 export type AppPage = (typeof APP_PAGES)[number];
 
 export const PAGE_LABEL: Record<AppPage, string> = {
   workbench: "接口工作台",
+  cases: "用例库",
   environments: "环境配置",
   tasks: "任务中心",
   reports: "测试报告",

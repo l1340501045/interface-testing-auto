@@ -4,15 +4,18 @@
  * 范围（工作空间、项目、环境）只保存在组件状态里，任何一次范围切换都会清空
  * 下游选择，避免把上一个项目的用例或环境带到当前项目显示。
  */
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { ArrowLeftOutlined, LogoutOutlined, PlusOutlined, SettingOutlined } from "@ant-design/icons";
 import { Alert, Button, Input, Layout, Modal, Select, Tabs } from "antd";
 
-import { ApiError, apiSend, invalidateClientSession } from "./api/client";
+import { ApiError, apiSend, invalidateClientSession, projectPath } from "./api/client";
+import { toCaseDetail } from "./api/guards";
 import type { SessionInfo } from "./api/types";
 import { AdminPanel } from "./admin/AdminPanel";
 import { CaseBrowser } from "./cases/CaseBrowser";
 import { CaseEditor } from "./cases/CaseEditor";
+import { CaseLibrary, type OpenCaseResult } from "./cases/CaseLibrary";
+import { recordOpened } from "./cases/useCaseLibrary";
 import { useFolders } from "./cases/useCases";
 import { Empty, ErrorText, Hint, Loading } from "./components/Feedback";
 import { trapModalTabEndpoints } from "./components/modalFocus";
@@ -139,8 +142,13 @@ function ProjectCreateForm({
 
 function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => void }) {
   const [page, setPage] = useState<AppPage>(() => pageFromHash(window.location.hash));
+  const [caseLibraryVisited, setCaseLibraryVisited] = useState(() => pageFromHash(window.location.hash) === "cases");
+  const livePage = useRef(page);
+  livePage.current = page;
   const appHeadRef = useRef<HTMLElement | null>(null);
+  const [caseLibrarySectionNode, setCaseLibrarySectionNode] = useState<HTMLElement | null>(null);
   const [appHeadHeight, setAppHeadHeight] = useState(73);
+  const [caseLibraryHeight, setCaseLibraryHeight] = useState<number | null>(null);
   const [workspaceId, setWorkspaceId] = useState<string | null>(session.workspaces[0]?.id ?? null);
   const [projectId, setProjectId] = useState<string | null>(null);
   const [environmentId, setEnvironmentId] = useState<string | null>(null);
@@ -151,6 +159,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   const editor = editors.find((item) => item.tabId === activeEditorId) ?? null;
   const liveEditors = useRef(editors);
   const liveActiveEditorId = useRef(activeEditorId);
+  const focusRevisionRef = useRef(0);
   liveEditors.current = editors;
   liveActiveEditorId.current = activeEditorId;
   const closeControllers = useRef(new Map<string, { save: () => Promise<boolean>; state: () => LeaveState }>());
@@ -209,6 +218,8 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   const scope = `${workspaceId ?? ""}/${projectId ?? ""}`;
   const liveScope = useRef(scope);
   liveScope.current = scope;
+  const openIntentRef = useRef(0);
+  const navigationEpochRef = useRef(0);
 
   /** 当前工作空间；迟到的创建结果按它判断自己是否已经属于上一个工作空间。 */
   const liveWorkspace = useRef(workspaceId);
@@ -240,6 +251,9 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
 
   /** 工作台的纠错动作进入独立配置页，并聚焦真实的环境或身份配置块。 */
   const navigate = useCallback((next: AppPage) => {
+    navigationEpochRef.current += 1;
+    openIntentRef.current += 1;
+    if (next === "cases") setCaseLibraryVisited(true);
     setPage(next);
     const hash = pageHash(next);
     if (window.location.hash === hash) {
@@ -249,13 +263,55 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
     window.location.hash = hash;
   }, []);
 
+  useLayoutEffect(() => {
+    if (page !== "cases") return;
+    const section = caseLibrarySectionNode;
+    if (section === null) return;
+    const measure = () => {
+      let top = section.getBoundingClientRect().top;
+      if (top < 0 || window.scrollY !== 0) {
+        window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+        top = section.getBoundingClientRect().top;
+      }
+      const next = Math.max(0, Math.floor(window.innerHeight - Math.max(0, top)));
+      setCaseLibraryHeight((current) => current === next ? current : next);
+    };
+    measure();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    const header = appHeadRef.current;
+    const nav = document.querySelector<HTMLElement>(".primary-nav");
+    const feedback = document.querySelector<HTMLElement>(".shell-feedback");
+    if (header !== null) observer?.observe(header);
+    if (nav !== null) observer?.observe(nav);
+    if (feedback !== null) observer?.observe(feedback);
+    observer?.observe(section);
+    window.addEventListener("resize", measure);
+    window.addEventListener("scroll", measure, { passive: true });
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", measure);
+      window.removeEventListener("scroll", measure);
+    };
+  }, [appHeadHeight, caseLibrarySectionNode, page, projectCreateOpen, shellFeedback]);
+
   useEffect(() => {
-    const syncPage = () => setPage(pageFromHash(window.location.hash));
+    const syncPage = () => {
+      navigationEpochRef.current += 1;
+      openIntentRef.current += 1;
+      const next = pageFromHash(window.location.hash);
+      if (next === "cases") setCaseLibraryVisited(true);
+      setPage(next);
+    };
     window.addEventListener("hashchange", syncPage);
     if (window.location.hash !== pageHash(pageFromHash(window.location.hash))) {
       window.history.replaceState(null, "", pageHash(pageFromHash(window.location.hash)));
     }
     return () => window.removeEventListener("hashchange", syncPage);
+  }, []);
+
+  useEffect(() => () => {
+    navigationEpochRef.current += 1;
+    openIntentRef.current += 1;
   }, []);
 
   useEffect(() => {
@@ -309,6 +365,8 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   // 换成新的，晚到的上报会被范围守卫丢弃——留着它，新项目的凭证授权表单就会预选
   // 上一个项目的用例版本。
   useEffect(() => {
+    openIntentRef.current += 1;
+    navigationEpochRef.current += 1;
     setProjectId(null);
     setEnvironmentId(null);
     setSettingsEnvironmentId(null);
@@ -324,6 +382,8 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   }, [workspaceId]);
 
   useEffect(() => {
+    openIntentRef.current += 1;
+    navigationEpochRef.current += 1;
     setEnvironmentId(null);
     setSettingsEnvironmentId(null);
     setEditors([]);
@@ -348,16 +408,18 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
     }
   }, [environmentId, environmentList, settingsEnvironmentId]);
 
-  const openCase = useCallback((caseId: string | null, folderId: string | null = null) => {
-    const existing = caseId === null ? undefined : editors.find((item) => item.id === caseId);
+  const openCase = useCallback((caseId: string | null, folderId: string | null = null): OpenCaseResult => {
+    const currentEditors = liveEditors.current;
+    const existing = caseId === null ? undefined : currentEditors.find((item) => item.id === caseId);
     if (existing) {
+      focusRevisionRef.current += 1;
       setActiveEditorId(existing.tabId);
       setSelectedCaseId(existing.id);
-      return;
+      return "focused";
     }
-    if (editors.length >= 20) {
+    if (currentEditors.length >= 20) {
       setShellFeedback("当前项目最多打开 20 个请求，请先关闭一个标签。");
-      return;
+      return "limit_reached";
     }
     const tabId = newTabId();
     const target: EditorTarget = {
@@ -371,10 +433,56 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
       dirty: false,
       busy: false,
     };
-    setEditors((current) => [...current, target]);
+    focusRevisionRef.current += 1;
+    setEditors((current) => current.some((item) => item.id !== null && item.id === caseId) ? current : [...current, target]);
     setActiveEditorId(tabId);
     setSelectedCaseId(caseId);
-  }, [editors, environmentId]);
+    return "opened";
+  }, [environmentId]);
+
+  const openSavedCase = useCallback(async (caseId: string): Promise<OpenCaseResult> => {
+    if (workspaceId === null || projectId === null) return "unavailable";
+    const actionWorkspaceId = workspaceId;
+    const actionProjectId = projectId;
+    const currentEditors = liveEditors.current;
+    const existing = currentEditors.find((item) => item.id === caseId);
+    if (existing === undefined && currentEditors.length >= 20) {
+      setShellFeedback("当前项目最多打开 20 个请求，请先关闭一个标签。");
+      return "limit_reached";
+    }
+    const owner = `${liveScope.current}/${session.user.user_id}`;
+    const startPage = livePage.current;
+    const startActive = liveActiveEditorId.current;
+    const startFocusRevision = focusRevisionRef.current;
+    const startNavigationEpoch = navigationEpochRef.current;
+    openIntentRef.current += 1;
+    const intent = openIntentRef.current;
+    try {
+      await apiSend(projectPath(actionWorkspaceId, actionProjectId, `/cases/${caseId}`), "GET", undefined, toCaseDetail);
+    } catch (error) {
+      if (intent === openIntentRef.current && owner === `${liveScope.current}/${session.user.user_id}`) {
+        setShellFeedback(error instanceof Error ? error.message : "用例当前不可读取，请刷新后重试。");
+      }
+      return "unavailable";
+    }
+    if (
+      intent !== openIntentRef.current
+      || owner !== `${liveScope.current}/${session.user.user_id}`
+      || livePage.current !== startPage
+      || liveActiveEditorId.current !== startActive
+      || focusRevisionRef.current !== startFocusRevision
+      || navigationEpochRef.current !== startNavigationEpoch
+    ) return "unavailable";
+    const result = openCase(caseId);
+    if (result === "limit_reached") return result;
+    navigate("workbench");
+    void recordOpened(actionWorkspaceId, actionProjectId, caseId).catch((error: unknown) => {
+      if (owner === `${liveScope.current}/${session.user.user_id}`) {
+        setShellFeedback(error instanceof Error ? `用例已打开，但最近记录更新失败：${error.message}` : "用例已打开，但最近记录更新失败。");
+      }
+    });
+    return result;
+  }, [navigate, openCase, projectId, session.user.user_id, workspaceId]);
 
   /**
    * 离开登记表的最新汇总。
@@ -463,9 +571,10 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   const changeCase = useCallback(
     (caseId: string | null) => {
       // 选中已有用例时不带目录：它的归属由详情决定。只有新建才继承当前目录。
-      openCase(caseId, null);
+      if (caseId === null) openCase(caseId, null);
+      else void openSavedCase(caseId);
     },
-    [openCase],
+    [openCase, openSavedCase],
   );
 
   /**
@@ -737,7 +846,11 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
       // 排除创建表单自己：它的草稿刚被清掉、结果也已经看到，把它算进“未保存内容”会弹出
       // 一个无所指的确认框（真实页面上确实弹了）。
       if (typeof id === "string") requestLeaveEditor(() => {
-        if (liveWorkspace.current === startedIn) setProjectId(id);
+        if (liveWorkspace.current === startedIn) {
+          openIntentRef.current += 1;
+          navigationEpochRef.current += 1;
+          setProjectId(id);
+        }
       }, "project-create");
     } catch (cause) {
       // 失败提示同理：属于旧工作空间的失败不该挂在新工作空间的界面上。
@@ -780,7 +893,11 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
               data-selected-value={workspaceId}
               value={workspaceId}
               options={session.workspaces.map((item) => ({ value: item.id, label: item.name }))}
-              onChange={(value) => requestLeaveEditor(() => setWorkspaceId(value))}
+              onChange={(value) => {
+                openIntentRef.current += 1;
+                navigationEpochRef.current += 1;
+                requestLeaveEditor(() => setWorkspaceId(value));
+              }}
             />
           </span>
           <span className="param">
@@ -794,7 +911,11 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
               options={projectList.length === 0
                 ? [{ value: "", label: "暂无项目" }]
                 : projectList.map((item) => ({ value: item.id, label: item.name }))}
-              onChange={(value) => requestLeaveEditor(() => setProjectId(value || null))}
+              onChange={(value) => {
+                openIntentRef.current += 1;
+                navigationEpochRef.current += 1;
+                requestLeaveEditor(() => setProjectId(value || null));
+              }}
             />
           </span>
           {/*
@@ -939,6 +1060,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
                   activeKey={activeEditorId ?? undefined}
                   onChange={(tabId) => {
                     const target = editors.find((item) => item.tabId === tabId);
+                    focusRevisionRef.current += 1;
                     setActiveEditorId(tabId);
                     setSelectedCaseId(target?.id ?? null);
                   }}
@@ -1005,6 +1127,26 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
               })}
             </div>
           </section>
+
+          {caseLibraryVisited ? (
+            <section
+              ref={setCaseLibrarySectionNode}
+              className="content-page"
+              hidden={page !== "cases"}
+              aria-label="用例库"
+              style={caseLibraryHeight === null ? undefined : { height: `${caseLibraryHeight}px` }}
+            >
+              <CaseLibrary
+                key={`case-library:${scope}:${session.user.user_id}`}
+                workspaceId={workspaceId}
+                projectId={projectId ?? ""}
+                principalId={session.user.user_id}
+                folderRefreshToken={folderRefresh}
+                active={page === "cases"}
+                onOpen={openSavedCase}
+              />
+            </section>
+          ) : null}
 
           <section className="content-page" hidden={page !== "environments"} aria-label="环境配置">
             <header className="page-title-row">

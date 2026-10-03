@@ -178,6 +178,36 @@ body { background: #f5f7fa; }
   overscroll-behavior-inline: contain;
   -webkit-overflow-scrolling: touch;
 }
+
+/* —— 独立用例库 —— */
+.content-page[aria-label="用例库"] {
+  /* 首帧回退；挂载后由App按section真实top写入精确高度，覆盖提示条/头部动态占高。 */
+  height: calc(100vh - var(--app-head-height, 73px) - 48px);
+  padding-bottom: 22px;
+  overflow: hidden;
+}
+.case-library-page { display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; }
+.case-library-page > .ant-alert { margin-bottom: 12px; }
+.case-library-layout { display: grid; grid-template-columns: minmax(220px, 270px) minmax(0, 1fr); gap: 16px; align-items: stretch; flex: 1; min-height: 0; }
+.case-library-tree { display: flex; flex-direction: column; min-height: 0; height: 100%; overflow: hidden; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
+.case-library-tree > .ant-space-compact { margin-bottom: 10px; }
+.case-library-tree > .ant-tree { flex: 1; min-height: 0; overflow: auto; }
+.case-library-main { min-width: 0; min-height: 0; height: 100%; overflow: hidden; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; gap: 12px; }
+.case-library-table-region { min-height: 0; height: 100%; overflow: hidden; }
+.case-library-table-region > .ant-table-wrapper { min-height: 0; height: 100%; overflow: hidden; }
+.case-library-toolbar { display: grid; grid-template-columns: minmax(240px, 1fr) 130px 140px 140px auto; gap: 8px; align-items: center; }
+.case-library-views { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.case-library-views > .ant-select { min-width: 220px; }
+.case-library-name { display: grid; gap: 3px; min-width: 220px; }
+.case-library-name span { color: var(--ink-soft); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-all; }
+.case-library-pagination { display: flex; justify-content: flex-end; align-items: center; gap: 8px; flex-wrap: wrap; }
+.case-library-pagination > span { margin-right: auto; color: var(--ink-soft); font-size: 13px; }
+.case-library-pagination .ant-select { min-width: 112px; }
+
+@media (max-width: 1180px) {
+  .case-library-toolbar { grid-template-columns: minmax(220px, 1fr) repeat(3, 130px); }
+  .case-library-toolbar .ant-checkbox-wrapper { grid-column: 1 / -1; }
+}
 /* —— 用例目录 —— */
 .browser { display: flex; flex-direction: column; gap: 10px; }
 .browser-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }

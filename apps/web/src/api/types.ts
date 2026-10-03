@@ -92,6 +92,87 @@ export interface Folder {
   parent_id: string | null;
   name: string;
   archived_at: string | null;
+  rev: number;
+  availability: "available" | "ancestor_archived" | "invalid_parent_chain";
+}
+
+export type CaseAssetState = "active" | "archived" | "all";
+export type CaseCollection = "all" | "favorites" | "recent";
+export type CaseLibrarySort =
+  | "updated_desc"
+  | "name_asc"
+  | "name_desc"
+  | "method_asc"
+  | "method_desc"
+  | "recent_desc";
+
+export interface CaseLibraryFilters {
+  schema_version: 1;
+  q?: string;
+  method?: string;
+  state: CaseAssetState;
+  folder: "all" | "unfiled" | "exact";
+  folder_id: string | null;
+  include_descendants: boolean;
+  collection: CaseCollection;
+  sort: CaseLibrarySort;
+}
+
+export interface CaseLibraryItem {
+  id: string;
+  name: string;
+  method: string;
+  path: string;
+  folder_id: string | null;
+  folder_path: Array<{ id: string; name: string }> | null;
+  asset_status: "active" | "archived";
+  availability: "available" | "case_archived" | "folder_unavailable";
+  draft_rev: number;
+  updated_at: string;
+  latest_version: number | null;
+  favorite: boolean;
+  last_opened_at: string | null;
+}
+
+export interface CaseLibraryPage {
+  items: CaseLibraryItem[];
+  total: number;
+  next_cursor: string | null;
+}
+
+export interface AssetFolder {
+  id: string;
+  name: string;
+  parent_id: string | null;
+  rev: number;
+  archived_at: string | null;
+  availability: "available" | "archived" | "ancestor_archived" | "invalid_parent_chain";
+  has_children: boolean;
+  archive_operation_id: string | null;
+  archive_root_id: string | null;
+  restore_mode: "batch_root" | "locate_root" | "legacy_single" | "unavailable" | null;
+  ancestor_path: Array<{ id: string; name: string }>;
+}
+
+export interface AssetFolderPage {
+  items: AssetFolder[];
+  total: number;
+  next_cursor: string | null;
+}
+
+export interface CasePreference {
+  case_id: string;
+  favorite: boolean;
+  last_opened_at: string | null;
+}
+
+export interface CaseSavedView {
+  id: string;
+  name: string;
+  filters: CaseLibraryFilters;
+  rev: number;
+  created_at: string;
+  updated_at: string;
 }
 
 interface RequestSpecBase {

@@ -79,7 +79,7 @@ export function CaseHeading({
         options={[
           { value: "", label: UNFILED_LABEL },
           ...(folderUnavailable && folderId !== null ? [{ value: folderId, label: folderPlaceholder }] : []),
-          ...folders.map((item) => ({ value: item.id, label: item.name })),
+          ...folders.filter((item) => item.availability === "available").map((item) => ({ value: item.id, label: item.name })),
         ]}
       />
 

@@ -30,8 +30,8 @@ const FOLDER_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
 /** 当前项目的可选目录；只改目录的编辑也必须在保存时提交（见 save 的三态语义）。 */
 const FOLDERS = [
-  { id: FOLDER_A, parent_id: null, name: "A 模块", archived_at: null },
-  { id: FOLDER_B, parent_id: null, name: "B 模块", archived_at: null },
+  { id: FOLDER_A, parent_id: null, name: "A 模块", archived_at: null, rev: 1, availability: "available" as const },
+  { id: FOLDER_B, parent_id: null, name: "B 模块", archived_at: null, rev: 1, availability: "available" as const },
 ];
 
 vi.mock("../session/useSession", () => ({
