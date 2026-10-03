@@ -42,6 +42,7 @@ from .folder_graph import (
     ancestor_walk,
     begin_consistent_read,
     blocked_folder_ids,
+    case_folder_paths,
     folder_descendants,
     invalid_folder_ids,
 )
@@ -293,10 +294,25 @@ def list_case_library(
 
     rows = session.execute(statement.limit(query.limit + 1)).all()
     page_rows = rows[:query.limit]
+    path_map = case_folder_paths(
+        session,
+        scope,
+        [row.folder_id for row in page_rows if row.folder_id is not None],
+    )
     items = [
         CaseLibraryItemOut(
             id=row.id, name=row.name, method=row.method or "GET", path=row.path,
-            folder_id=row.folder_id, asset_status=row.asset_status, availability=row.availability,
+            folder_id=row.folder_id,
+            folder_path=(
+                []
+                if row.folder_id is None
+                else (
+                    [{"id": item_id, "name": name} for item_id, name in path_map[row.folder_id]]
+                    if path_map.get(row.folder_id) is not None
+                    else None
+                )
+            ),
+            asset_status=row.asset_status, availability=row.availability,
             draft_rev=row.draft_rev, updated_at=row.updated_at,
             latest_version=row.latest_version, favorite=row.favorite,
             last_opened_at=row.last_opened_at,

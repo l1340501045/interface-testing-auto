@@ -126,3 +126,66 @@ def invalid_folder_ids(scope: deps.ProjectScope):
     return select(walk.c.node_id.label("id")).where(walk.c.cycle).distinct().subquery(
         "invalid_folders"
     )
+
+
+def case_folder_paths(
+    session: Session,
+    scope: deps.ProjectScope,
+    folder_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, list[tuple[uuid.UUID, str]] | None]:
+    """一次批量读取当前页目录的根到自身路径；异常链返回 None。"""
+    unique_ids = list(dict.fromkeys(folder_ids))
+    if not unique_ids:
+        return {}
+    if len(unique_ids) > 100:
+        raise ValueError("当前页目录数量超过用例库页大小上限")
+
+    folder = aliased(Folder)
+    walk = (
+        select(
+            folder.id.label("node_id"),
+            folder.id.label("path_id"),
+            folder.name.label("path_name"),
+            folder.parent_id.label("next_parent_id"),
+            literal(0).label("depth"),
+            postgresql.array([folder.id]).label("visited"),
+            literal(False).label("cycle"),
+        )
+        .where(folder.project_id == scope.project_id, folder.id.in_(unique_ids))
+        .cte("case_folder_paths", recursive=True)
+    )
+    parent = aliased(Folder)
+    walk = walk.union_all(
+        select(
+            walk.c.node_id,
+            parent.id,
+            parent.name,
+            parent.parent_id,
+            walk.c.depth + 1,
+            walk.c.visited + postgresql.array([parent.id]),
+            parent.id == any_(walk.c.visited),
+        )
+        .join(parent, parent.id == walk.c.next_parent_id)
+        .where(parent.project_id == scope.project_id, ~walk.c.cycle)
+    )
+    rows = session.execute(
+        select(walk).order_by(walk.c.node_id, walk.c.depth.desc())
+    ).all()
+    grouped: dict[uuid.UUID, list] = {folder_id: [] for folder_id in unique_ids}
+    for row in rows:
+        grouped.setdefault(row.node_id, []).append(row)
+
+    result: dict[uuid.UUID, list[tuple[uuid.UUID, str]] | None] = {}
+    for folder_id in unique_ids:
+        path_rows = grouped.get(folder_id, [])
+        if (
+            not path_rows
+            or any(row.cycle for row in path_rows)
+            or path_rows[0].next_parent_id is not None
+        ):
+            result[folder_id] = None
+            continue
+        result[folder_id] = [
+            (row.path_id, row.path_name) for row in path_rows if not row.cycle
+        ]
+    return result

@@ -12,9 +12,10 @@ from psycopg.types.json import Jsonb
 from sqlalchemy import event
 from sqlalchemy.orm import Session as OrmSession
 
-from app.api.deps import apply_tenant
+from app.api.deps import Principal, ProjectScope, apply_tenant
 from app.db import get_engine, get_session_factory
 from app.models import AssetSelection
+from app.services.folder_graph import case_folder_paths
 from harness import PASSWORD, migrator_connection, purge_user, seed_account
 from harness import project_base as _base
 
@@ -757,3 +758,100 @@ def test_consistent_read_uses_fresh_role_and_does_not_allow_admin_bypass(
     assert changed is True
     assert response.status_code == 403, response.text
     assert response.json()["code"] == "insufficient_role"
+
+
+def test_case_library_projects_current_page_folder_paths_without_tree_prefetch(
+    client: TestClient, account: dict, project: dict
+) -> None:
+    base = _base(account, project)
+    root = client.post(f"{base}/folders", json={"name": "路径根"}).json()
+    child = client.post(
+        f"{base}/folders", json={"name": "未展开子目录", "parent_id": root["id"]}
+    ).json()
+    leaf = client.post(
+        f"{base}/folders", json={"name": "未展开末级", "parent_id": child["id"]}
+    ).json()
+    nested = _create_case(client, base, "未展开路径用例", "/folder-path", folder_id=leaf["id"])
+    unfiled = _create_case(client, base, "未分组路径用例", "/unfiled-path")
+
+    path_query_count = 0
+
+    def count_path_query(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+        nonlocal path_query_count
+        if "case_folder_paths" in statement:
+            path_query_count += 1
+
+    event.listen(get_engine(), "before_cursor_execute", count_path_query)
+    try:
+        response = client.get(f"{base}/case-library", params={"limit": 100})
+    finally:
+        event.remove(get_engine(), "before_cursor_execute", count_path_query)
+    assert response.status_code == 200, response.text
+    items = {item["id"]: item for item in response.json()["items"]}
+    assert items[nested["id"]]["folder_path"] == [
+        {"id": root["id"], "name": "路径根"},
+        {"id": child["id"], "name": "未展开子目录"},
+        {"id": leaf["id"], "name": "未展开末级"},
+    ]
+    assert items[unfiled["id"]]["folder_path"] == []
+    assert path_query_count == 1, "当前页全部去重目录必须由一次批量路径查询完成"
+
+    # 祖先归档后仍返回真实可读路径，不依赖活动目录树是否包含这些节点。
+    assert client.delete(f"{base}/folders/{root['id']}").status_code == 204
+    archived = client.get(
+        f"{base}/case-library", params={"state": "archived", "limit": 100}
+    )
+    archived_item = next(item for item in archived.json()["items"] if item["id"] == nested["id"])
+    assert archived_item["folder_path"] == items[nested["id"]]["folder_path"]
+
+    cycle_a = client.post(f"{base}/folders", json={"name": "异常路径 A"}).json()
+    cycle_b = client.post(
+        f"{base}/folders", json={"name": "异常路径 B", "parent_id": cycle_a["id"]}
+    ).json()
+    cycle_case = _create_case(
+        client, base, "异常路径用例", "/invalid-folder-path", folder_id=cycle_b["id"]
+    )
+    connection = migrator_connection()
+    try:
+        connection.execute(
+            "UPDATE app.folders SET parent_id=%s WHERE id=%s",
+            (cycle_b["id"], cycle_a["id"]),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    invalid = client.get(
+        f"{base}/case-library", params={"state": "archived", "limit": 100}
+    )
+    invalid_item = next(item for item in invalid.json()["items"] if item["id"] == cycle_case["id"])
+    assert invalid_item["folder_path"] is None
+
+    # 同工作空间另一项目的目录 ID 也只能得到 null，不能泄露其名称或路径。
+    other = client.post(
+        f"/api/v1/workspaces/{account['workspace_id']}/projects",
+        json={"key": f"path{uuid.uuid4().hex[:8]}", "name": "路径隔离项目"},
+    ).json()
+    other_base = f"/api/v1/workspaces/{account['workspace_id']}/projects/{other['id']}"
+    foreign = client.post(f"{other_base}/folders", json={"name": "不可泄露目录"}).json()
+    session = get_session_factory()()
+    try:
+        apply_tenant(session, account["workspace_id"], account["user_id"])
+        scope = ProjectScope(
+            workspace_id=account["workspace_id"],
+            project_id=uuid.UUID(project["id"]),
+            role="admin",
+            principal=Principal(
+                user_id=account["user_id"],
+                username=account["username"],
+                display_name=account["username"],
+                is_admin=False,
+                session_id=uuid.uuid4(),
+            ),
+        )
+        projected = case_folder_paths(
+            session, scope, [uuid.UUID(leaf["id"]), uuid.UUID(foreign["id"])]
+        )
+        assert projected[uuid.UUID(foreign["id"])] is None
+        assert "不可泄露目录" not in repr(projected)
+    finally:
+        session.close()

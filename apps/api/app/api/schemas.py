@@ -177,12 +177,18 @@ CaseLibrarySort = Literal[
 HttpMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 
 
+class CaseFolderPathOut(ApiModel):
+    id: uuid.UUID
+    name: str
+
+
 class CaseLibraryItemOut(ApiModel):
     id: uuid.UUID
     name: str
     method: str
     path: str
     folder_id: uuid.UUID | None
+    folder_path: list[CaseFolderPathOut] | None
     asset_status: Literal["active", "archived"]
     availability: Literal["available", "case_archived", "folder_unavailable"]
     draft_rev: int
