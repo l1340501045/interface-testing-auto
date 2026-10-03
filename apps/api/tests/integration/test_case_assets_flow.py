@@ -42,6 +42,19 @@ def _create_case(client: TestClient, base: str, name: str, path: str, **extra) -
     return response.json()
 
 
+def _archive_folder_direct(folder_id: str) -> None:
+    """构造 S1 兼容读取所需的旧无批次归档记录；S2 HTTP DELETE 已停写。"""
+    connection = migrator_connection()
+    try:
+        connection.execute(
+            "UPDATE app.folders SET archived_at=now(), rev=rev+1 WHERE id=%s",
+            (folder_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def test_case_library_uses_effective_state_and_real_bound_cursor(
     client: TestClient, account: dict, project: dict
 ) -> None:
@@ -56,8 +69,7 @@ def test_case_library_uses_effective_state_and_real_bound_cursor(
     for index in range(21):
         _create_case(client, base, f"分页同组 {index:02d}", f"/paged/{index}")
 
-    archived = client.delete(f"{base}/folders/{root['id']}")
-    assert archived.status_code == 204, archived.text
+    _archive_folder_direct(root["id"])
 
     active = client.get(f"{base}/case-library", params={"q": "分页同组", "limit": 20})
     assert active.status_code == 200, active.text
@@ -111,7 +123,7 @@ def test_asset_folders_find_empty_archive_and_archived_child_under_active_parent
     archived_child = client.post(
         f"{base}/folders", json={"name": "空归档子目录", "parent_id": active_parent["id"]}
     ).json()
-    assert client.delete(f"{base}/folders/{archived_child['id']}").status_code == 204
+    _archive_folder_direct(archived_child["id"])
 
     response = client.get(
         f"{base}/asset-folders",
@@ -130,6 +142,12 @@ def test_asset_folders_find_empty_archive_and_archived_child_under_active_parent
     assert item["ancestor_path"] == [
         {"id": active_parent["id"], "name": "活动父目录", "archived": False}
     ]
+    detail = client.get(f"{base}/asset-folders/{archived_child['id']}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json() == item
+    active_detail = client.get(f"{base}/asset-folders/{active_parent['id']}")
+    assert active_detail.status_code == 200
+    assert active_detail.json()["availability"] == "available"
 
     old_shape = client.get(f"{base}/folders")
     assert old_shape.status_code == 200
@@ -313,6 +331,7 @@ def test_recursive_folder_reads_are_bounded_and_old_patch_rejects_cycles(
     rejected = client.patch(
         f"{base}/folders/{folder_a['id']}",
         json={"parent_id": folder_b["id"]},
+        headers={"If-Match": '"1"'},
     )
     assert rejected.status_code == 400, rejected.text
     assert rejected.json()["code"] == "folder_cycle"
@@ -492,7 +511,7 @@ def test_archive_root_uses_explicit_operation_fact_across_member_gap(
         f"{base}/folders", json={"name": "批次成员 C", "parent_id": folder_b["id"]}
     ).json()
     folder_d = client.post(f"{base}/folders", json={"name": "缺根事实 D"}).json()
-    assert client.delete(f"{base}/folders/{folder_b['id']}").status_code == 204
+    _archive_folder_direct(folder_b["id"])
 
     operation_id, missing_root_operation_id = uuid.uuid4(), uuid.uuid4()
     connection = migrator_connection()
@@ -501,8 +520,8 @@ def test_archive_root_uses_explicit_operation_fact_across_member_gap(
             cursor.execute(
                 "INSERT INTO app.asset_operations "
                 "(id, workspace_id, project_id, principal_id, operation_key, action, request_hash, result) "
-                "VALUES (%s,%s,%s,%s,%s,'archive','root-test',%s),"
-                "(%s,%s,%s,%s,%s,'archive','missing-root-test',%s)",
+                    "VALUES (%s,%s,%s,%s,%s,'folder_archive','root-test',%s),"
+                    "(%s,%s,%s,%s,%s,'folder_archive','missing-root-test',%s)",
                 (
                     operation_id, account["workspace_id"], project["id"], account["user_id"],
                     f"root-{uuid.uuid4()}", Jsonb({"root": {"resource_type": "folder", "id": folder_a["id"]}}),
@@ -548,6 +567,10 @@ def test_archive_root_uses_explicit_operation_fact_across_member_gap(
     assert items[folder_b["id"]]["restore_mode"] == "legacy_single"
     assert items[folder_d["id"]]["restore_mode"] == "unavailable"
     assert items[folder_d["id"]]["archive_root_id"] is None
+    for folder_id in (folder_a["id"], folder_c["id"], folder_d["id"]):
+        detail = client.get(f"{base}/asset-folders/{folder_id}")
+        assert detail.status_code == 200, detail.text
+        assert detail.json() == items[folder_id]
 
     # 批次根是共享资产事实，不依赖原操作人的个人偏好；另一 viewer 读取结果相同。
     viewer_connection = migrator_connection()
@@ -615,6 +638,53 @@ def test_asset_selection_none_target_is_sql_null(
         assert row == (True, None)
     finally:
         connection.close()
+
+
+def test_asset_folder_detail_is_shared_but_scope_protected(
+    client: TestClient, account: dict, project: dict
+) -> None:
+    base = _base(account, project)
+    folder = client.post(f"{base}/folders", json={"name": "共享目录详情"}).json()
+    connection = migrator_connection()
+    viewer_name = f"folder-viewer-{uuid.uuid4().hex[:8]}"
+    viewer_id, _ = seed_account(
+        connection, username=viewer_name, password=PASSWORD, workspace_role=None
+    )
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO app.workspace_memberships (workspace_id,user_id,role) VALUES (%s,%s,'viewer')",
+            (account["workspace_id"], viewer_id),
+        )
+    connection.commit()
+    try:
+        from app.main import app
+
+        with TestClient(app) as viewer:
+            login = viewer.post(
+                "/api/v1/auth/login", json={"username": viewer_name, "password": PASSWORD}
+            )
+            assert login.status_code == 200
+            viewer.headers["X-CSRF-Token"] = viewer.cookies["interface_csrf"]
+            shared = viewer.get(f"{base}/asset-folders/{folder['id']}")
+            assert shared.status_code == 200
+            assert shared.json()["name"] == "共享目录详情"
+            connection.execute(
+                "DELETE FROM app.workspace_memberships WHERE workspace_id=%s AND user_id=%s",
+                (account["workspace_id"], viewer_id),
+            )
+            connection.commit()
+            assert viewer.get(f"{base}/asset-folders/{folder['id']}").status_code in {403, 404}
+    finally:
+        purge_user(connection, viewer_id)
+        connection.close()
+
+    other = client.post(
+        f"/api/v1/workspaces/{account['workspace_id']}/projects",
+        json={"key": f"fd{uuid.uuid4().hex[:8]}", "name": "目录隔离项目"},
+    ).json()
+    other_base = f"/api/v1/workspaces/{account['workspace_id']}/projects/{other['id']}"
+    assert client.get(f"{other_base}/asset-folders/{folder['id']}").status_code == 404
+    assert client.get(f"{base}/asset-folders/{uuid.uuid4()}").status_code == 404
 
 
 def _asset_read_url(client: TestClient, account: dict, project: dict, endpoint: str) -> str:
@@ -797,7 +867,7 @@ def test_case_library_projects_current_page_folder_paths_without_tree_prefetch(
     assert path_query_count == 1, "当前页全部去重目录必须由一次批量路径查询完成"
 
     # 祖先归档后仍返回真实可读路径，不依赖活动目录树是否包含这些节点。
-    assert client.delete(f"{base}/folders/{root['id']}").status_code == 204
+    _archive_folder_direct(root["id"])
     archived = client.get(
         f"{base}/case-library", params={"state": "archived", "limit": 100}
     )

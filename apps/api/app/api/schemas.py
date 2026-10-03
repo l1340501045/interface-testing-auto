@@ -230,6 +230,99 @@ class AssetFolderPageOut(ApiModel):
     next_cursor: str | None
 
 
+AssetAction = Literal["case_copy", "move", "archive", "restore", "folder_archive", "folder_restore"]
+
+
+class AssetSelectionItemIn(ApiModel):
+    resource_type: Literal["case"]
+    id: uuid.UUID
+    expected_rev: int = Field(ge=1)
+
+
+class AssetSelectionRootIn(ApiModel):
+    resource_type: Literal["folder"]
+    id: uuid.UUID
+    expected_rev: int = Field(ge=1)
+
+
+class AssetSelectionCreate(ApiModel):
+    schema_version: Literal[1] = 1
+    action: AssetAction
+    mode: Literal["explicit", "folder"]
+    items: list[AssetSelectionItemIn] | None = None
+    root: AssetSelectionRootIn | None = None
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> AssetSelectionCreate:
+        if self.mode == "explicit":
+            if self.action not in {"move", "archive", "restore"} or self.items is None or len(self.items) != 1 or self.root is not None:
+                raise ValueError("explicit 选择仅允许一个用例的 move/archive/restore")
+        elif self.action not in {"folder_archive", "folder_restore"} or self.root is None or self.items is not None:
+            raise ValueError("folder 选择必须提供目录根并使用 folder_archive/folder_restore")
+        return self
+
+
+class AssetSelectionOut(ApiModel):
+    selection_id: uuid.UUID
+    schema_version: Literal[1] = 1
+    action: AssetAction
+    mode: Literal["explicit", "folder"]
+    workspace_id: uuid.UUID
+    project_id: uuid.UUID
+    principal_id: uuid.UUID
+    created_at: datetime
+    expires_at: datetime
+    counts: dict[str, int]
+    root: dict[str, Any] | None
+    preview_items: list[dict[str, Any]]
+    excluded_items: list[dict[str, Any]]
+
+
+class AssetOperationCreate(ApiModel):
+    schema_version: Literal[1] = 1
+    action: AssetAction
+    selection_id: uuid.UUID | None = None
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    source_id: uuid.UUID | None = None
+    expected_rev: int | None = Field(default=None, ge=1)
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    folder_id: uuid.UUID | None = None
+
+    @field_validator("name")
+    @classmethod
+    def strip_copy_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("name 不能为空")
+        return value
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> AssetOperationCreate:
+        if self.action == "case_copy":
+            if self.source_id is None or self.expected_rev is None or self.selection_id is not None or self.parameters:
+                raise ValueError("case_copy 必须提供 source_id/expected_rev，且不使用 selection")
+            if "name" in self.model_fields_set and self.name is None:
+                raise ValueError("name 显式出现时不能为空")
+        elif self.selection_id is None or self.source_id is not None or self.expected_rev is not None or self.name is not None or "folder_id" in self.model_fields_set:
+            raise ValueError("资产确认必须只提供 selection_id 和 parameters")
+        return self
+
+
+class AssetOperationOut(ApiModel):
+    operation_id: uuid.UUID
+    operation_key: str
+    action: AssetAction
+    workspace_id: uuid.UUID
+    project_id: uuid.UUID
+    principal_id: uuid.UUID
+    result_schema_version: Literal[1]
+    created_at: datetime
+    result: dict[str, Any]
+
+
 class CaseFavoriteUpdate(ApiModel):
     favorite: bool
 
@@ -429,12 +522,22 @@ class RunCreate(ApiModel):
     environment_id: uuid.UUID
     case_version_id: uuid.UUID | None = None
     debug_snapshot: DebugSnapshot | None = None
+    source_case_id: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def validate_source(self) -> RunCreate:
+        if "source_case_id" in self.model_fields_set and self.source_case_id is None:
+            raise ValueError("source_case_id 显式出现时不能为空")
+        if self.source_case_id is not None and self.debug_snapshot is None:
+            raise ValueError("source_case_id 只能用于调试快照")
+        return self
 
 
 class RunOut(ApiModel):
     id: uuid.UUID
     target_type: str
     case_version_id: uuid.UUID | None
+    debug_source_case_id: uuid.UUID | None
     environment_id: uuid.UUID
     state: str
     outcome: str | None
@@ -516,6 +619,8 @@ PreflightAction = Literal[
     "authorize",
     "contact_admin",
     "configure_environment",
+    "restore_case",
+    "organize_case",
 ]
 
 PreflightAuthState = Literal["none", "ready", "needs_authorization", "unavailable", "ambiguous"]
@@ -524,6 +629,13 @@ PreflightAuthState = Literal["none", "ready", "needs_authorization", "unavailabl
 class DebugPreflightRequest(ApiModel):
     environment_id: uuid.UUID
     debug_snapshot: DebugSnapshot
+    source_case_id: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def validate_source(self) -> DebugPreflightRequest:
+        if "source_case_id" in self.model_fields_set and self.source_case_id is None:
+            raise ValueError("source_case_id 显式出现时不能为空")
+        return self
 
 
 class PreflightIssueOut(ApiModel):

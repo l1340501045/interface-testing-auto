@@ -9,10 +9,16 @@ from sqlalchemy.orm import Session
 
 from ...config import Settings
 from ...db import get_db
-from ...services import case_assets
+from ...services import asset_lifecycle, case_assets
 from .. import deps
+from ..errors import ApiError
 from ..schemas import (
+    AssetFolderOut,
     AssetFolderPageOut,
+    AssetOperationCreate,
+    AssetOperationOut,
+    AssetSelectionCreate,
+    AssetSelectionOut,
     CaseFavoriteUpdate,
     CaseLibraryPageOut,
     CasePreferenceOut,
@@ -23,6 +29,69 @@ from ..schemas import (
 
 router = APIRouter(tags=["用例资产"])
 _VIEW_SCOPE = Depends(deps.view_scope)
+_EDIT_SCOPE = Depends(deps.edit_scope)
+
+
+def _asset_error(error: asset_lifecycle.AssetLifecycleError) -> ApiError:
+    return ApiError(error.status_code, error.code, error.message, error.details)
+
+
+@router.post(
+    "/workspaces/{workspace_id}/projects/{project_id}/asset-selections",
+    response_model=AssetSelectionOut,
+    status_code=201,
+)
+def post_asset_selection(
+    payload: AssetSelectionCreate,
+    scope: deps.ProjectScope = _EDIT_SCOPE,
+    session: Session = Depends(get_db),
+) -> AssetSelectionOut:
+    try:
+        return asset_lifecycle.create_selection(session, scope, payload)
+    except asset_lifecycle.AssetLifecycleError as error:
+        raise _asset_error(error) from error
+
+
+@router.get(
+    "/workspaces/{workspace_id}/projects/{project_id}/asset-operations/by-key/{operation_key}",
+    response_model=AssetOperationOut,
+)
+def get_asset_operation(
+    operation_key: str,
+    scope: deps.ProjectScope = _VIEW_SCOPE,
+    session: Session = Depends(get_db),
+) -> AssetOperationOut:
+    try:
+        return asset_lifecycle.get_operation_by_key(session, scope, operation_key)
+    except asset_lifecycle.AssetLifecycleError as error:
+        raise _asset_error(error) from error
+
+
+@router.post(
+    "/workspaces/{workspace_id}/projects/{project_id}/asset-operations",
+    response_model=AssetOperationOut,
+)
+def post_asset_operation(
+    payload: AssetOperationCreate,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    request_contract: str | None = Header(default=None, alias="X-Request-Contract"),
+    scope: deps.ProjectScope = _EDIT_SCOPE,
+    session: Session = Depends(get_db),
+) -> AssetOperationOut:
+    if idempotency_key is None:
+        raise ApiError(428, "idempotency_key_required", "缺少 Idempotency-Key")
+    try:
+        result, replayed, created = asset_lifecycle.execute_operation(
+            session, scope, payload, idempotency_key, request_contract
+        )
+    except asset_lifecycle.AssetLifecycleError as error:
+        raise _asset_error(error) from error
+    if replayed:
+        response.headers["Idempotency-Replayed"] = "true"
+    if created:
+        response.status_code = 201
+    return result
 
 
 @router.get(
@@ -78,6 +147,18 @@ def get_asset_folders(
             q=q, limit=limit, cursor=cursor,
         ),
     )
+
+
+@router.get(
+    "/workspaces/{workspace_id}/projects/{project_id}/asset-folders/{folder_id}",
+    response_model=AssetFolderOut,
+)
+def get_asset_folder(
+    folder_id: uuid.UUID,
+    scope: deps.ProjectScope = _VIEW_SCOPE,
+    session: Session = Depends(get_db),
+) -> AssetFolderOut:
+    return case_assets.get_asset_folder(session, scope, folder_id)
 
 
 @router.put(

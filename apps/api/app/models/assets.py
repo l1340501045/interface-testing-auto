@@ -29,6 +29,10 @@ class AssetOperation(UUIDPrimaryKeyMixin, Base):
             "workspace_id", "project_id", "principal_id", "operation_key",
             name="uq_asset_operations_principal_key",
         ),
+        CheckConstraint(
+            "action IN ('case_copy','move','archive','restore','folder_archive','folder_restore')",
+            name="action",
+        ),
         project_fk("fk_asset_operations_project"),
         {"comment": "资产写操作的持久幂等回执与最小结果；不保存请求正文或凭证"},
     )
@@ -88,6 +92,10 @@ class AssetSelection(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "asset_selections"
     __table_args__ = (
         UniqueConstraint("workspace_id", "project_id", "id", name="uq_asset_selections_ws_project_id"),
+        CheckConstraint(
+            "action IN ('case_copy','move','archive','restore','folder_archive','folder_restore')",
+            name="action",
+        ),
         project_fk("fk_asset_selections_project"),
         {"comment": "资产批量操作前的短期冻结选择与预览范围"},
     )

@@ -26,11 +26,12 @@ from ...services.debug_preflight import preflight
 from ...services.run_coordinator import (
     RunRejected,
     RunRequest,
+    _require_case_available,
     create_run,
     digest_for_debug_snapshot,
 )
 from .. import deps
-from ..errors import bad_request, conflict, forbidden, not_found
+from ..errors import ApiError, bad_request, conflict, forbidden, not_found
 from ..request_contract import has_row_locator, is_v2, require_v2_capability
 from ..schemas import (
     AssertionResultOut,
@@ -60,6 +61,7 @@ def _run_out(run: Run) -> RunOut:
         id=run.id,
         target_type=run.target_type,
         case_version_id=run.case_version_id,
+        debug_source_case_id=run.debug_source_case_id,
         environment_id=run.environment_id,
         state=run.state,
         outcome=run.outcome,
@@ -166,23 +168,23 @@ def start_run(
         run = create_run(
             session,
             settings,
-            workspace_id=scope.workspace_id,
-            project_id=scope.project_id,
-            role=scope.role,
-            principal_id=scope.principal.user_id,
+            scope=scope,
             payload=RunRequest(
                 environment_id=payload.environment_id,
                 case_version_id=payload.case_version_id,
                 debug_snapshot=payload.debug_snapshot.model_dump() if payload.debug_snapshot else None,
                 idempotency_key=idempotency_key,
+                source_case_id=payload.source_case_id,
             ),
         )
     except RunRejected as error:
         if error.code in ("production_blocked", "pool_not_granted"):
             raise forbidden(error.code, error.message) from error
-        if error.code in ("environment_missing", "case_version_missing"):
+        if error.code in ("environment_missing", "case_version_missing", "case_missing"):
             # 越权与不存在都按“不可见”处理，不泄露其他项目资源是否存在。
             raise not_found("环境或用例版本不存在") from error
+        if error.code == "idempotency_result_unavailable":
+            raise ApiError(409, error.code, error.message) from error
         raise bad_request(error.code, error.message) from error
     response.headers["Location"] = (
         f"/api/v1/workspaces/{scope.workspace_id}/projects/{scope.project_id}/runs/{run.id}"
@@ -235,6 +237,18 @@ def debug_preflight(
     require_v2_capability(
         request_contract, needed=is_v2(payload.debug_snapshot.request)
     )
+    if payload.source_case_id is not None:
+        try:
+            _require_case_available(session, scope, payload.source_case_id)
+        except RunRejected as error:
+            action = "restore_case" if error.code == "case_archived" else "organize_case"
+            return DebugPreflightOut(
+                ready=False,
+                issues=[PreflightIssueOut(code=error.code, message=error.message, action=action)],
+                can_authorize=False,
+                auth=PreflightAuthOut(required=False, state="none", profile_id=None),
+                context=None,
+            )
     result = preflight(
         session,
         settings,

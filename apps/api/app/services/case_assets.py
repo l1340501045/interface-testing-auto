@@ -30,14 +30,13 @@ from ..api.schemas import (
 )
 from ..config import Settings
 from ..models import (
-    AssetArchiveMember,
-    AssetOperation,
     Case,
     CasePreference,
     CaseSavedView,
     CaseVersion,
     Folder,
 )
+from .archive_source import resolve_archive_sources
 from .folder_graph import (
     ancestor_walk,
     begin_consistent_read,
@@ -351,6 +350,77 @@ def _folder_filter_payload(query: AssetFolderQuery) -> dict:
     }
 
 
+def _asset_folder_statement(scope: deps.ProjectScope):
+    blocked = blocked_folder_ids(scope)
+    invalid = invalid_folder_ids(scope)
+    blocked_exists = Folder.id.in_(select(blocked.c.id))
+    invalid_exists = Folder.id.in_(select(invalid.c.id))
+    child = aliased(Folder)
+    has_children = exists(
+        select(child.id).where(
+            child.workspace_id == scope.workspace_id,
+            child.project_id == scope.project_id,
+            child.parent_id == Folder.id,
+        )
+    ).label("has_children")
+    availability = sql_case(
+        (invalid_exists, literal("invalid_parent_chain")),
+        (Folder.archived_at.is_not(None), literal("archived")),
+        (blocked_exists, literal("ancestor_archived")),
+        else_=literal("available"),
+    ).label("availability")
+    return select(
+        Folder.id, Folder.name, Folder.normalized_name, Folder.parent_id, Folder.rev,
+        Folder.archived_at, availability, has_children, Folder.archive_operation_id,
+    ).where(
+        Folder.workspace_id == scope.workspace_id,
+        Folder.project_id == scope.project_id,
+    )
+
+
+def _asset_folder_items(
+    session: Session, scope: deps.ProjectScope, rows: list
+) -> list[AssetFolderOut]:
+    paths, invalid_path_ids = _ancestor_paths(session, scope, [row.id for row in rows])
+    archive_roots = _archive_roots(
+        session, scope, [row.archive_operation_id for row in rows if row.archive_operation_id]
+    )
+    items: list[AssetFolderOut] = []
+    for row in rows:
+        archive_root_id = archive_roots.get((row.archive_operation_id, row.id)) if row.archive_operation_id else None
+        restore_mode = None
+        if row.archived_at is not None:
+            if row.archive_operation_id is None:
+                restore_mode = "legacy_single"
+            elif archive_root_id is None:
+                restore_mode = "unavailable"
+            elif archive_root_id == row.id:
+                restore_mode = "batch_root"
+            else:
+                restore_mode = "locate_root"
+        items.append(AssetFolderOut(
+            id=row.id, name=row.name, parent_id=row.parent_id, rev=row.rev,
+            archived_at=row.archived_at,
+            availability=("invalid_parent_chain" if row.id in invalid_path_ids else row.availability),
+            has_children=row.has_children, archive_operation_id=row.archive_operation_id,
+            archive_root_id=archive_root_id, restore_mode=restore_mode,
+            ancestor_path=paths.get(row.id, []),
+        ))
+    return items
+
+
+def get_asset_folder(
+    session: Session, scope: deps.ProjectScope, folder_id: uuid.UUID
+) -> AssetFolderOut:
+    scope = begin_consistent_read(session, scope)
+    row = session.execute(
+        _asset_folder_statement(scope).where(Folder.id == folder_id)
+    ).one_or_none()
+    if row is None:
+        raise not_found("目录不存在或无权访问")
+    return _asset_folder_items(session, scope, [row])[0]
+
+
 def list_asset_folders(
     session: Session,
     settings: Settings,
@@ -366,29 +436,16 @@ def list_asset_folders(
     scope = begin_consistent_read(session, scope)
     if query.parent_id is not None:
         parent_exists = session.scalar(
-            select(Folder.id).where(Folder.project_id == scope.project_id, Folder.id == query.parent_id)
+            select(Folder.id).where(
+                Folder.workspace_id == scope.workspace_id,
+                Folder.project_id == scope.project_id,
+                Folder.id == query.parent_id,
+            )
         )
         if parent_exists is None:
             raise not_found("目录不存在或无权访问")
 
-    blocked = blocked_folder_ids(scope)
-    invalid = invalid_folder_ids(scope)
-    blocked_exists = Folder.id.in_(select(blocked.c.id))
-    invalid_exists = Folder.id.in_(select(invalid.c.id))
-    child = aliased(Folder)
-    has_children = exists(
-        select(child.id).where(child.project_id == scope.project_id, child.parent_id == Folder.id)
-    ).label("has_children")
-    availability = sql_case(
-        (invalid_exists, literal("invalid_parent_chain")),
-        (Folder.archived_at.is_not(None), literal("archived")),
-        (blocked_exists, literal("ancestor_archived")),
-        else_=literal("available"),
-    ).label("availability")
-    statement = select(
-        Folder.id, Folder.name, Folder.normalized_name, Folder.parent_id, Folder.rev,
-        Folder.archived_at, availability, has_children, Folder.archive_operation_id,
-    ).where(Folder.project_id == scope.project_id)
+    statement = _asset_folder_statement(scope)
     if query.parent_mode == "root":
         statement = statement.where(Folder.parent_id.is_(None))
     elif query.parent_mode == "exact":
@@ -418,33 +475,7 @@ def list_asset_folders(
         )
     rows = session.execute(statement.order_by(Folder.normalized_name.asc(), Folder.id.asc()).limit(query.limit + 1)).all()
     page_rows = rows[:query.limit]
-    paths, invalid_path_ids = _ancestor_paths(session, scope, [row.id for row in page_rows])
-    archive_roots = _archive_roots(
-        session, scope, [row.archive_operation_id for row in page_rows if row.archive_operation_id]
-    )
-    items: list[AssetFolderOut] = []
-    for row in page_rows:
-        archive_root_id = archive_roots.get((row.archive_operation_id, row.id)) if row.archive_operation_id else None
-        restore_mode = None
-        if row.archived_at is not None:
-            if row.archive_operation_id is None:
-                restore_mode = "legacy_single"
-            elif archive_root_id is None:
-                restore_mode = "unavailable"
-            elif archive_root_id == row.id:
-                restore_mode = "batch_root"
-            else:
-                restore_mode = "locate_root"
-        items.append(
-            AssetFolderOut(
-                id=row.id, name=row.name, parent_id=row.parent_id, rev=row.rev,
-                archived_at=row.archived_at,
-                availability=("invalid_parent_chain" if row.id in invalid_path_ids else row.availability),
-                has_children=row.has_children, archive_operation_id=row.archive_operation_id,
-                archive_root_id=archive_root_id, restore_mode=restore_mode,
-                ancestor_path=paths.get(row.id, []),
-            )
-        )
+    items = _asset_folder_items(session, scope, page_rows)
     next_cursor = None
     if len(rows) > query.limit and page_rows:
         last = page_rows[-1]
@@ -487,55 +518,12 @@ def _archive_roots(
     scope: deps.ProjectScope,
     operation_ids: list[uuid.UUID],
 ) -> dict[tuple[uuid.UUID, uuid.UUID], uuid.UUID]:
-    if not operation_ids:
-        return {}
-    operation_rows = session.execute(
-        select(
-            AssetOperation.id,
-            AssetOperation.result_schema_version,
-            AssetOperation.result,
-        ).where(
-            AssetOperation.workspace_id == scope.workspace_id,
-            AssetOperation.project_id == scope.project_id,
-            AssetOperation.id.in_(set(operation_ids)),
-        )
-    ).all()
-    explicit_roots: dict[uuid.UUID, uuid.UUID] = {}
-    for operation in operation_rows:
-        if operation.result_schema_version != 1:
-            continue
-        raw_root = operation.result.get("root") if isinstance(operation.result, dict) else None
-        raw_id = raw_root.get("id") if isinstance(raw_root, dict) else None
-        resource_type = raw_root.get("resource_type") if isinstance(raw_root, dict) else None
-        if resource_type != "folder" or not isinstance(raw_id, str):
-            continue
-        try:
-            explicit_roots[operation.id] = uuid.UUID(raw_id)
-        except ValueError:
-            continue
-
-    rows = session.execute(
-        select(
-            AssetArchiveMember.operation_id,
-            AssetArchiveMember.folder_id,
-            AssetArchiveMember.original_parent_id,
-        ).where(
-            AssetArchiveMember.workspace_id == scope.workspace_id,
-            AssetArchiveMember.project_id == scope.project_id,
-            AssetArchiveMember.operation_id.in_(set(operation_ids)),
-            AssetArchiveMember.folder_id.is_not(None),
-        )
-    ).all()
-    by_operation: dict[uuid.UUID, set[uuid.UUID]] = {}
-    for row in rows:
-        by_operation.setdefault(row.operation_id, set()).add(row.folder_id)
     result: dict[tuple[uuid.UUID, uuid.UUID], uuid.UUID] = {}
-    for operation_id, members in by_operation.items():
-        root_id = explicit_roots.get(operation_id)
-        if root_id is None or root_id not in members:
-            continue
-        for folder_id in members:
-            result[(operation_id, folder_id)] = root_id
+    for operation_id, source in resolve_archive_sources(
+        session, scope, operation_ids
+    ).items():
+        for folder_id in source.folder_ids:
+            result[(operation_id, folder_id)] = source.root_id
     return result
 
 

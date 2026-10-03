@@ -27,11 +27,16 @@ class Run(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UniqueConstraint("workspace_id", "project_id", "id", name="uq_runs_ws_project_id"),
         project_fk("fk_runs_project"),
         project_object_fk(["case_version_id"], "case_versions", "fk_runs_case_version", ondelete="RESTRICT"),
+        project_object_fk(["debug_source_case_id"], "cases", "fk_runs_debug_source_case", ondelete="RESTRICT"),
         project_object_fk(["environment_id"], "environments", "fk_runs_environment", ondelete="RESTRICT"),
         workspace_object_fk(["pool_id"], "runner_pools", "fk_runs_pool", ondelete="SET NULL"),
         CheckConstraint(
             "target_type = 'case_version' OR target_type = 'debug_snapshot'",
             name="target_type",
+        ),
+        CheckConstraint(
+            "debug_source_case_id IS NULL OR target_type = 'debug_snapshot'",
+            name="debug_source_target",
         ),
         CheckConstraint(
             "(target_type = 'case_version' AND case_version_id IS NOT NULL AND debug_snapshot IS NULL)"
@@ -48,6 +53,10 @@ class Run(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UUID(as_uuid=True), nullable=True, comment="执行的已发布用例版本；仅 target_type=case_version 时非空"
     )
     debug_snapshot: Mapped[dict | None] = mapped_column(NULLABLE_JSONB, nullable=True, comment="临时不可变调试快照；仅 target_type=debug_snapshot 时非空")
+    debug_source_case_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True,
+        comment="已保存用例临时调试的来源；独立调试、固定版本及历史运行为空",
+    )
     environment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, comment="目标环境")
     trigger: Mapped[str] = mapped_column(
         String(20), nullable=False, default="manual", server_default="manual", comment="触发方式：manual"
