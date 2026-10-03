@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from .api.errors import install_error_handlers
-from .api.routes import auth, cases, credentials, projects, runs
+from .api.routes import assets, auth, cases, credentials, projects, runs
 
 app = FastAPI(title="接口自动化测试与巡检平台", docs_url="/api/docs", openapi_url="/api/openapi.json")
 logger = logging.getLogger(__name__)
@@ -24,6 +24,7 @@ app.include_router(projects.router, prefix="/api/v1")
 app.include_router(credentials.router, prefix="/api/v1")
 app.include_router(cases.router, prefix="/api/v1")
 app.include_router(runs.router, prefix="/api/v1")
+app.include_router(assets.router, prefix="/api/v1")
 
 
 @app.get("/health")

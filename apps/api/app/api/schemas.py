@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ApiModel(BaseModel):
@@ -122,6 +122,8 @@ class FolderOut(ApiModel):
     parent_id: uuid.UUID | None
     name: str
     archived_at: datetime | None
+    rev: int
+    availability: Literal["available", "archived", "ancestor_archived", "invalid_parent_chain"]
 
 
 class FolderCreate(ApiModel):
@@ -161,6 +163,140 @@ class CaseSummaryOut(ApiModel):
     status: str
     rev: int
     latest_version: int | None
+
+
+# —— 用例资产查询与个人习惯 ——
+
+
+CaseLibraryState = Literal["active", "archived", "all"]
+CaseLibraryFolder = Literal["all", "unfiled", "exact"]
+CaseLibraryCollection = Literal["all", "favorites", "recent"]
+CaseLibrarySort = Literal[
+    "updated_desc", "name_asc", "name_desc", "method_asc", "method_desc", "recent_desc"
+]
+HttpMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+
+
+class CaseLibraryItemOut(ApiModel):
+    id: uuid.UUID
+    name: str
+    method: str
+    path: str
+    folder_id: uuid.UUID | None
+    asset_status: Literal["active", "archived"]
+    availability: Literal["available", "case_archived", "folder_unavailable"]
+    draft_rev: int
+    updated_at: datetime
+    latest_version: int | None
+    favorite: bool
+    last_opened_at: datetime | None
+
+
+class CaseLibraryPageOut(ApiModel):
+    items: list[CaseLibraryItemOut]
+    total: int
+    next_cursor: str | None
+
+
+class FolderAncestorOut(ApiModel):
+    id: uuid.UUID
+    name: str
+    archived: bool
+
+
+class AssetFolderOut(ApiModel):
+    id: uuid.UUID
+    name: str
+    parent_id: uuid.UUID | None
+    rev: int
+    archived_at: datetime | None
+    availability: Literal["available", "archived", "ancestor_archived", "invalid_parent_chain"]
+    has_children: bool
+    archive_operation_id: uuid.UUID | None
+    archive_root_id: uuid.UUID | None
+    restore_mode: Literal["batch_root", "locate_root", "legacy_single", "unavailable"] | None
+    ancestor_path: list[FolderAncestorOut]
+
+
+class AssetFolderPageOut(ApiModel):
+    items: list[AssetFolderOut]
+    total: int
+    next_cursor: str | None
+
+
+class CaseFavoriteUpdate(ApiModel):
+    favorite: bool
+
+
+class CasePreferenceOut(ApiModel):
+    case_id: uuid.UUID
+    favorite: bool
+    last_opened_at: datetime | None
+
+
+class CaseViewFilters(ApiModel):
+    schema_version: Literal[1] = 1
+    q: str | None = Field(default=None, max_length=200)
+    method: HttpMethod | None = None
+    state: CaseLibraryState = "active"
+    folder: CaseLibraryFolder = "all"
+    folder_id: uuid.UUID | None = None
+    include_descendants: bool = False
+    collection: CaseLibraryCollection = "all"
+    sort: CaseLibrarySort = "updated_desc"
+
+    @model_validator(mode="after")
+    def validate_combinations(self) -> CaseViewFilters:
+        if self.folder == "exact" and self.folder_id is None:
+            raise ValueError("folder=exact 时必须提供 folder_id")
+        if self.folder != "exact" and (self.folder_id is not None or self.include_descendants):
+            raise ValueError("folder_id/include_descendants 只允许用于 folder=exact")
+        if self.sort == "recent_desc" and self.collection != "recent":
+            raise ValueError("recent_desc 只允许用于最近打开集合")
+        return self
+
+
+class CaseSavedViewCreate(ApiModel):
+    name: str = Field(min_length=1, max_length=100)
+    filters: CaseViewFilters
+
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("视图名称不能为空")
+        return value
+
+
+class CaseSavedViewUpdate(ApiModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    filters: CaseViewFilters | None = None
+
+    @field_validator("name")
+    @classmethod
+    def strip_optional_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("视图名称不能为空")
+        return value
+
+    @model_validator(mode="after")
+    def require_change(self) -> CaseSavedViewUpdate:
+        if self.name is None and self.filters is None:
+            raise ValueError("至少提供一个要更新的字段")
+        return self
+
+
+class CaseSavedViewOut(ApiModel):
+    id: uuid.UUID
+    name: str
+    filters: CaseViewFilters
+    rev: int
+    created_at: datetime
+    updated_at: datetime
 
 
 class CaseCreate(ApiModel):

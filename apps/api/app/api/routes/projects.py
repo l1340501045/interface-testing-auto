@@ -26,6 +26,12 @@ from ...models import (
     RunnerPoolProjectGrant,
     WorkspaceMembership,
 )
+from ...services.folder_graph import (
+    begin_consistent_read,
+    blocked_folder_ids,
+    folder_descendants,
+    invalid_folder_ids,
+)
 from ...services.permissions import require
 from .. import deps
 from ..errors import bad_request, conflict, not_found
@@ -551,8 +557,15 @@ def put_variables(
 # —— 目录 ——
 
 
-def _folder_out(item: Folder) -> FolderOut:
-    return FolderOut(id=item.id, parent_id=item.parent_id, name=item.name, archived_at=item.archived_at)
+def _folder_out(item: Folder, availability: str | None = None) -> FolderOut:
+    return FolderOut(
+        id=item.id,
+        parent_id=item.parent_id,
+        name=item.name,
+        archived_at=item.archived_at,
+        rev=item.rev,
+        availability=availability or ("archived" if item.archived_at is not None else "available"),
+    )
 
 
 def _normalize(value: str) -> str:
@@ -565,12 +578,25 @@ def _normalize(value: str) -> str:
 def list_folders(
     scope: deps.ProjectScope = _VIEW_SCOPE, session: Session = Depends(get_db)
 ) -> list[FolderOut]:
-    items = session.scalars(
+    scope = begin_consistent_read(session, scope)
+    items = list(session.scalars(
         select(Folder)
         .where(Folder.project_id == scope.project_id, Folder.archived_at.is_(None))
         .order_by(Folder.name)
-    )
-    return [_folder_out(item) for item in items]
+    ))
+    blocked = blocked_folder_ids(scope)
+    invalid = invalid_folder_ids(scope)
+    blocked_ids = set(session.scalars(select(blocked.c.id)))
+    invalid_ids = set(session.scalars(select(invalid.c.id)))
+    return [
+        _folder_out(
+            item,
+            "invalid_parent_chain"
+            if item.id in invalid_ids
+            else ("ancestor_archived" if item.id in blocked_ids else "available"),
+        )
+        for item in items
+    ]
 
 
 @router.post(
@@ -626,7 +652,11 @@ def update_folder(
         if payload.parent_id == folder_id:
             raise bad_request("folder_cycle", "目录不能作为自己的父目录")
         _get_folder(session, scope, payload.parent_id)
+        descendants = folder_descendants(scope, folder_id)
+        if session.scalar(select(descendants.c.id).where(descendants.c.id == payload.parent_id)):
+            raise bad_request("folder_cycle", "目录不能移动到自己的后代目录中。")
         folder.parent_id = payload.parent_id
+    folder.rev += 1
     deps.commit(session)
     return _folder_out(folder)
 
@@ -641,6 +671,7 @@ def archive_folder(
 ) -> Response:
     folder = _get_folder(session, scope, folder_id)
     folder.archived_at = datetime.now(UTC)
+    folder.rev += 1
     deps.commit(session)
     return Response(status_code=204)
 
