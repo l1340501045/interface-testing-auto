@@ -15,6 +15,7 @@ import { AdminPanel } from "./admin/AdminPanel";
 import { CaseBrowser } from "./cases/CaseBrowser";
 import { CaseEditor } from "./cases/CaseEditor";
 import { CaseLibrary, type OpenCaseResult } from "./cases/CaseLibrary";
+import type { AcquireAssetOperation, AssetEditorController } from "./cases/assetController";
 import { recordOpened } from "./cases/useCaseLibrary";
 import { useFolders } from "./cases/useCases";
 import { Empty, ErrorText, Hint, Loading } from "./components/Feedback";
@@ -163,6 +164,8 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   liveEditors.current = editors;
   liveActiveEditorId.current = activeEditorId;
   const closeControllers = useRef(new Map<string, { save: () => Promise<boolean>; state: () => LeaveState }>());
+  const assetControllers = useRef(new Map<string, AssetEditorController>());
+  const assetOccupancies = useRef(new Map<string, string>());
   const [closeDialog, setCloseDialog] = useState<{ tabIds: string[]; attemptId: number; saving: boolean } | null>(null);
   const closeAttemptRef = useRef(0);
   const closeSavingAttemptRef = useRef<number | null>(null);
@@ -195,6 +198,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   const [newProjectName, setNewProjectName] = useState("");
   const [projectError, setProjectError] = useState<string | null>(null);
   const [shellFeedback, setShellFeedback] = useState<string | null>(null);
+  const [assetLibraryFocus, setAssetLibraryFocus] = useState<{ token: number; workspaceId: string; projectId: string; principalId: string; caseId: string; name: string; method: string; path: string; mode: "restore" | "organize" } | null>(null);
   /** 已经有项目时新建表单默认收起，避免把选择区挤走；空态则一直展开。 */
   const [projectCreateOpen, setProjectCreateOpen] = useState(false);
   /**
@@ -218,6 +222,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   const scope = `${workspaceId ?? ""}/${projectId ?? ""}`;
   const liveScope = useRef(scope);
   liveScope.current = scope;
+  useEffect(() => setAssetLibraryFocus(null), [scope]);
   const openIntentRef = useRef(0);
   const navigationEpochRef = useRef(0);
 
@@ -417,6 +422,10 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
       setSelectedCaseId(existing.id);
       return "focused";
     }
+    if (caseId !== null && assetOccupancies.current.has(caseId)) {
+      setShellFeedback("这条用例正在确认资产操作，结果明确前不能打开新的编辑标签。");
+      return "busy";
+    }
     if (currentEditors.length >= 20) {
       setShellFeedback("当前项目最多打开 20 个请求，请先关闭一个标签。");
       return "limit_reached";
@@ -446,6 +455,10 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
     const actionProjectId = projectId;
     const currentEditors = liveEditors.current;
     const existing = currentEditors.find((item) => item.id === caseId);
+    if (existing === undefined && assetOccupancies.current.has(caseId)) {
+      setShellFeedback("这条用例正在确认资产操作，结果明确前不能打开新的编辑标签。");
+      return "busy";
+    }
     if (existing === undefined && currentEditors.length >= 20) {
       setShellFeedback("当前项目最多打开 20 个请求，请先关闭一个标签。");
       return "limit_reached";
@@ -472,6 +485,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
       || liveActiveEditorId.current !== startActive
       || focusRevisionRef.current !== startFocusRevision
       || navigationEpochRef.current !== startNavigationEpoch
+      || (existing === undefined && assetOccupancies.current.has(caseId))
     ) return "unavailable";
     const result = openCase(caseId);
     if (result === "limit_reached") return result;
@@ -589,6 +603,49 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
     },
     [openCase],
   );
+
+  const acquireAssetOperation = useCallback<AcquireAssetOperation>((targets, token) => {
+    const locate = (tabId: string, caseId: string) => () => { focusRevisionRef.current += 1; setActiveEditorId(tabId); setSelectedCaseId(caseId); navigate("workbench"); };
+    const unique = new Map(targets.map((target) => [target.caseId, target]));
+    if (unique.size !== targets.length) return { message: "资产预览包含重复用例，请重新生成预览。" };
+    for (const target of targets) {
+      const occupied = assetOccupancies.current.get(target.caseId);
+      if (occupied !== undefined && occupied !== token) return { message: "目标用例正在进行另一项资产操作，请等待其结果明确。" };
+    }
+    const opened = new Map<string, { controller: AssetEditorController; inputRevision: number; sourceRev: number }>();
+    const fail = (message: string, tabId?: string, caseId?: string) => { for (const item of opened.values()) item.controller.release(token); return { message, locate: tabId && caseId ? locate(tabId, caseId) : undefined }; };
+    for (const target of targets) {
+      const editorTarget = liveEditors.current.find((item) => item.id === target.caseId);
+      if (editorTarget === undefined) continue;
+      const controller = assetControllers.current.get(editorTarget.tabId);
+      const snapshot = controller?.snapshot() ?? null;
+      if (controller === undefined || snapshot === null) return fail(`用例“${editorTarget.name}”仍在载入，请等待内容就绪。`, editorTarget.tabId, target.caseId);
+      const child = liveLeaveState.current.descendants(`case-tab:${editorTarget.tabId}`);
+      if (snapshot.rev !== target.sourceRev) return fail(`用例“${editorTarget.name}”的修订已变化，请重新生成预览。`, editorTarget.tabId, target.caseId);
+      if (child.dirty || child.busy) return fail(`用例“${editorTarget.name}”还有尚未应用的子表单或进行中的操作。`, editorTarget.tabId, target.caseId);
+      const locked = controller.lock(token, target.sourceRev);
+      if (locked === null) {
+        return fail(`用例“${editorTarget.name}”有未保存修改、正在写入或尚未就绪。`, editorTarget.tabId, target.caseId);
+      }
+      opened.set(target.caseId, { controller, inputRevision: locked.inputRevision, sourceRev: target.sourceRev });
+    }
+    for (const target of targets) assetOccupancies.current.set(target.caseId, token);
+    return {
+      accept: (item) => {
+        const target = unique.get(item.id);
+        if (target === undefined || item.resource_type !== "case" || item.asset === null) return "ignored";
+        const safe = item.outcome === "succeeded" ? item.asset.rev > target.sourceRev : item.outcome === "no_change" && item.asset.rev === target.sourceRev;
+        if (!safe) return item.outcome === "conflict" || item.outcome === "not_found_or_inaccessible" || item.outcome === "invalid_target" ? "stale" : "ignored";
+        const openedTarget = opened.get(item.id);
+        if (openedTarget === undefined) return "accepted";
+        return openedTarget.controller.accept(token, openedTarget.sourceRev, openedTarget.inputRevision, item.asset) ? "accepted" : "stale";
+      },
+      release: () => {
+        for (const target of targets) if (assetOccupancies.current.get(target.caseId) === token) assetOccupancies.current.delete(target.caseId);
+        for (const item of opened.values()) item.controller.release(token);
+      },
+    };
+  }, [navigate]);
 
   const removeClosedTargets = useCallback((tabIds: readonly string[]) => {
     const latestEditors = liveEditors.current;
@@ -1043,6 +1100,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
                 foldersError={folders.error ? folders.error.message : null}
                 onFoldersChanged={onFoldersChanged}
                 refreshToken={caseRefresh}
+                onManageAssets={() => navigate("cases")}
               />
             </div>
 
@@ -1110,6 +1168,10 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
                       currentUserId={session.user.user_id}
                       onOpenAdmin={() => openAdminPanel(item.tabId)}
                       onOpenEnvironment={() => openEnvironmentPanel(item.tabId, item.environmentId)}
+                      onOpenAssetLibrary={(mode, target) => {
+                        setAssetLibraryFocus((current) => ({ token: (current?.token ?? 0) + 1, workspaceId, projectId: projectId ?? "", principalId: session.user.user_id, caseId: target.id, name: target.name, method: target.method, path: target.path, mode }));
+                        navigate("cases");
+                      }}
                       configEpoch={configEpoch}
                       getConfigEpoch={getConfigEpoch}
                       separateHistory
@@ -1120,6 +1182,10 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
                       onRegisterCloseSave={(action) => {
                         if (action === null) closeControllers.current.delete(item.tabId);
                         else closeControllers.current.set(item.tabId, action);
+                      }}
+                      onRegisterAssetController={(controller) => {
+                        if (controller === null) assetControllers.current.delete(item.tabId);
+                        else assetControllers.current.set(item.tabId, controller);
                       }}
                     />
                   </div>
@@ -1144,6 +1210,13 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
                 folderRefreshToken={folderRefresh}
                 active={page === "cases"}
                 onOpen={openSavedCase}
+                canEdit={canEdit(currentProject?.role ?? null)}
+                onAcquireAssetOperation={acquireAssetOperation}
+                assetFocus={assetLibraryFocus}
+                onAssetsChanged={() => {
+                  setFolderRefresh((current) => current + 1);
+                  setCaseRefresh((current) => current + 1);
+                }}
               />
             </section>
           ) : null}

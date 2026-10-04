@@ -19,6 +19,8 @@ const calls = vi.hoisted(() => ({
   childFailure: null as Error | null,
   folderName: "订单目录",
   libraryFolderName: "订单目录",
+  operationRejected: false,
+  sourceGate: null as Promise<void> | null,
 }));
 
 vi.mock("../api/client", async (importOriginal) => {
@@ -81,8 +83,15 @@ vi.mock("../api/client", async (importOriginal) => {
       calls.get.push(path);
       return parse(raw(path));
     }),
-    apiSend: vi.fn(async (path: string, method: string, body: unknown, parse: (value: unknown) => unknown) => {
+    apiSend: vi.fn(async (path: string, method: string, body: unknown, parse: (value: unknown) => unknown, options?: { headers?: Record<string, string> }) => {
       calls.send.push({ path, method, body });
+      if (path.endsWith("/asset-selections") && method === "POST") { const request=body as {action:string;items:Array<{id:string;expected_rev:number}>}; return parse({ selection_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", schema_version: 1, action: request.action, mode: "explicit", workspace_id: "w", project_id: "p", principal_id: "u", created_at: "2026-10-04T00:00:00Z", expires_at: "2026-10-04T00:10:00Z", counts: { selected: 1, eligible: 1, excluded: 0, cases: 1, folders: 0 }, root: null, preview_items: [{ resource_type: "case", id: request.items[0].id, rev: request.items[0].expected_rev, state: "active", name: "查询订单", parent_id: null, folder_id: "11111111-1111-4111-8111-111111111111", outcome: "eligible", code: null }], excluded_items: [] }); }
+      if (path.endsWith("/cases/22222222-2222-4222-8222-222222222222") && method === "GET") { if (calls.sourceGate) await calls.sourceGate; return parse({ id:"22222222-2222-4222-8222-222222222222",folder_id:"11111111-1111-4111-8111-111111111111",name:"查询订单",request:{method:"GET",path:"/orders",query_params:[],headers:[],body_type:"none",body:""},assertions:[],rev:3,status:"draft",latest_version:null,updated_at:"2026-10-04T00:00:00Z",snapshot_hash:"h3" }); }
+      if (path.endsWith("/asset-operations") && method === "POST") {
+        const request = body as { action: string };
+        if (request.action === "case_copy") return parse({ operation_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", operation_key: options?.headers?.["Idempotency-Key"], action: "case_copy", workspace_id: "w", project_id: "p", principal_id: "u", result_schema_version: 1, created_at: "2026-10-04T00:00:01Z", result: calls.operationRejected ? { result_kind: "rejected", selection_id: null, code: "name_conflict", message: "副本名称冲突", no_asset_changes: true, conflicts: [] } : { result_kind: "completed", selection_id: null, root: null, counts: { input: 1, succeeded: 1, no_change: 0, conflict: 0, failed: 0 }, items: [{ resource_type: "case", id: "77777777-7777-4777-8777-777777777777", outcome: "succeeded", code: null, message: "已复制", new_rev: 1, asset: { id: "77777777-7777-4777-8777-777777777777", resource_type: "case", name: "查询订单 副本", rev: 1, state: "active", folder_id: null, parent_id: null, archived_at: null } }], members: [] } });
+        return parse({ operation_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", operation_key: options?.headers?.["Idempotency-Key"], action: "archive", workspace_id: "w", project_id: "p", principal_id: "u", result_schema_version: 1, created_at: "2026-10-04T00:00:01Z", result: { result_kind: "completed", selection_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", root: null, counts: { input: 1, succeeded: 1, no_change: 0, conflict: 0, failed: 0 }, items: [{ resource_type: "case", id: "22222222-2222-4222-8222-222222222222", outcome: "succeeded", code: null, message: "已归档", new_rev: 3, asset: { id: "22222222-2222-4222-8222-222222222222", resource_type: "case", name: "查询订单", rev: 3, state: "archived", folder_id: "11111111-1111-4111-8111-111111111111", parent_id: null, archived_at: "2026-10-04T00:00:01Z" } }], members: [] } });
+      }
       if (path.includes("/favorite")) return parse({ case_id: "22222222-2222-4222-8222-222222222222", favorite: true, last_opened_at: null });
       if (path.endsWith("/case-views") && method === "POST") {
         if (calls.viewGate !== null) await calls.viewGate;
@@ -115,9 +124,98 @@ beforeEach(() => {
   calls.childFailure = null;
   calls.folderName = "订单目录";
   calls.libraryFolderName = "订单目录";
+  calls.operationRejected = false;
+  calls.sourceGate = null;
 });
 
 describe("独立用例库", () => {
+  it("处理阻断后明确新预览按ID读取最新rev并保留目标输入", async () => {
+    render(<AppProviders><LeaveGuardProvider><CaseLibrary workspaceId="w" projectId="p" principalId="u" canEdit active onAcquireAssetOperation={() => ({ message: "修订已变化" })} onOpen={async () => "opened"} /></LeaveGuardProvider></AppProviders>);
+    const row = (await screen.findByText("查询订单")).closest("tr") as HTMLElement;
+    fireEvent.click(within(row).getByText("移动"));
+    fireEvent.click(await screen.findByRole("button", { name: "生成预览" }));
+    expect(await screen.findByText(/将处理 1 项/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "确认执行" }));
+    expect(await screen.findByText("修订已变化")).toBeTruthy();
+    let releaseSource!: () => void;
+    calls.sourceGate = new Promise<void>((resolve) => { releaseSource = resolve; });
+    fireEvent.click(screen.getByRole("button", { name: "修改参数并读取最新来源" }));
+    await waitFor(() => expect(calls.send.some((call) => call.method === "GET" && call.path.endsWith("/cases/22222222-2222-4222-8222-222222222222"))).toBe(true));
+    const confirmWhileReading = screen.getByText("确认执行").closest("button") as HTMLButtonElement;
+    expect(confirmWhileReading.disabled).toBe(true);
+    fireEvent.click(confirmWhileReading);
+    expect(calls.send.filter((call) => call.path.endsWith("/asset-operations"))).toHaveLength(0);
+    releaseSource();
+    fireEvent.click(await screen.findByRole("button", { name: "生成预览" }));
+    await waitFor(() => {
+      const previews = calls.send.filter((call) => call.path.endsWith("/asset-selections"));
+      expect(previews.at(-1)?.body).toMatchObject({ items: [{ id: "22222222-2222-4222-8222-222222222222", expected_rev: 3 }], parameters: { target_folder_id: null } });
+    });
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+  });
+  it("持久rejected保留Modal输入并允许建立新意图", async () => {
+    calls.operationRejected = true;
+    render(<AppProviders><LeaveGuardProvider><CaseLibrary workspaceId="w" projectId="p" principalId="u" canEdit active onOpen={async () => "opened"} /></LeaveGuardProvider></AppProviders>);
+    const row = (await screen.findByText("查询订单")).closest("tr") as HTMLElement;
+    fireEvent.click(within(row).getByText("复制"));
+    const name = await screen.findByDisplayValue("查询订单 副本");
+    fireEvent.change(name, { target: { value: "自定义副本" } });
+    fireEvent.click(screen.getByRole("button", { name: "确认执行" }));
+    expect(await screen.findByText("副本名称冲突")).toBeTruthy();
+    expect(screen.getByDisplayValue("自定义副本")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "修正并重试" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+  });
+  it("复制完成只保留显式打开入口，不在后台抢焦点", async () => {
+    const onOpen = vi.fn(async () => "opened" as const);
+    render(<AppProviders><LeaveGuardProvider><CaseLibrary workspaceId="w" projectId="p" principalId="u" canEdit active onOpen={onOpen} /></LeaveGuardProvider></AppProviders>);
+    const row = (await screen.findByText("查询订单")).closest("tr") as HTMLElement;
+    fireEvent.click(within(row).getByText("复制"));
+    fireEvent.click(await screen.findByRole("button", { name: "确认执行" }));
+    expect(await screen.findByText("查询订单 副本")).toBeTruthy();
+    expect(onOpen).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "完成" }));
+    fireEvent.click(await screen.findByRole("button", { name: "打开副本" }));
+    await waitFor(() => expect(onOpen).toHaveBeenCalledWith("77777777-7777-4777-8777-777777777777"));
+  });
+  it("运行纠错按caseId标记原对象，同名搜索不冒充精确目标", async () => {
+    const focus = { token: 1, workspaceId: "w", projectId: "p", principalId: "u", caseId: "33333333-3333-4333-8333-333333333333", name: "查询订单", method: "POST", path: "/legacy", mode: "restore" as const };
+    const { rerender } = render(<AppProviders><LeaveGuardProvider><CaseLibrary workspaceId="w" projectId="p" principalId="u" active assetFocus={focus} onOpen={async () => "opened"} /></LeaveGuardProvider></AppProviders>);
+    const targetRow = (await screen.findByText("旧目录用例")).closest("tr");
+    expect(targetRow).not.toBeNull();
+    expect(within(targetRow as HTMLElement).getByText("待处理目标")).toBeTruthy();
+    expect(screen.getByText(/目标：POST \/legacy/)).toBeTruthy();
+    expect(screen.queryByText(/33333333-3333-4333-8333-333333333333/)).toBeNull();
+    fireEvent.change(screen.getByLabelText("搜索用例名称或请求路径"), { target: { value: "后来筛选" } });
+    rerender(<AppProviders><LeaveGuardProvider><CaseLibrary workspaceId="w" projectId="p" principalId="u" active={false} assetFocus={focus} onOpen={async () => "opened"} /></LeaveGuardProvider></AppProviders>);
+    rerender(<AppProviders><LeaveGuardProvider><CaseLibrary workspaceId="w" projectId="p" principalId="u" active assetFocus={focus} onOpen={async () => "opened"} /></LeaveGuardProvider></AppProviders>);
+    expect(screen.getByLabelText("搜索用例名称或请求路径")).toHaveProperty("value", "后来筛选");
+  });
+  it("Tree内目录动作聚焦后可用Space和Enter激活", async () => {
+    const user = userEvent.setup();
+    render(<AppProviders><LeaveGuardProvider><CaseLibrary workspaceId="w" projectId="p" principalId="u" canEdit active onOpen={async () => "opened"} /></LeaveGuardProvider></AppProviders>);
+    const archive = await screen.findByRole("button", { name: "归档目录 订单目录" });
+    archive.focus();
+    await user.keyboard(" ");
+    expect(await screen.findByText("归档目录树")).toBeTruthy();
+    fireEvent.click(screen.getByText("取消"));
+    archive.focus();
+    await user.keyboard("{Enter}");
+    expect(await screen.findByText("归档目录树")).toBeTruthy();
+  });
+  it("单用例归档必须先预览，再以selection确认同一动作", async () => {
+    render(<AppProviders><LeaveGuardProvider><CaseLibrary workspaceId="w" projectId="p" principalId="u" canEdit active onOpen={async () => "opened"} /></LeaveGuardProvider></AppProviders>);
+    const caseName = await screen.findByText("查询订单");
+    const row = caseName.closest("tr");
+    expect(row).not.toBeNull();
+    fireEvent.click(within(row as HTMLElement).getByText("归档"));
+    fireEvent.click(await screen.findByText("生成预览"));
+    expect(await screen.findByText(/将处理 1 项/)).toBeTruthy();
+    expect(calls.send.filter((call) => call.path.endsWith("/asset-operations"))).toHaveLength(0);
+    fireEvent.click(screen.getByText("确认执行"));
+    await waitFor(() => expect(calls.send.filter((call) => call.path.endsWith("/asset-operations"))).toHaveLength(1));
+    expect(calls.send.find((call) => call.path.endsWith("/asset-operations"))?.body).toMatchObject({ action: "archive", selection_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", parameters: {} });
+  });
   it("使用服务端查询、目录含后代筛选、个人收藏，并阻止归档对象打开", async () => {
     const onOpen = vi.fn(async () => "opened" as const);
     render(

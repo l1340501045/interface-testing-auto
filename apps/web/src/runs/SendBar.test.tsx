@@ -50,6 +50,8 @@ function blockedPreflight(code: string, action: DebugPreflight["issues"][number]
 function renderSendBar(preflight: DebugPreflight | null, request: RawRequest = REQUEST) {
   const onOpenAdmin = vi.fn();
   const onOpenEnvironment = vi.fn();
+  const onRestoreCase = vi.fn();
+  const onOrganizeCase = vi.fn();
   render(
     <SendBar
       request={request}
@@ -70,13 +72,15 @@ function renderSendBar(preflight: DebugPreflight | null, request: RawRequest = R
       preflighting={false}
       onOpenAdmin={onOpenAdmin}
       onOpenEnvironment={onOpenEnvironment}
+      onRestoreCase={onRestoreCase}
+      onOrganizeCase={onOrganizeCase}
       canAuthorize={false}
       onSubmitAuthorization={vi.fn()}
       onCancelAuthorization={vi.fn()}
       authorization={null}
     />,
   );
-  return { onOpenAdmin, onOpenEnvironment };
+  return { onOpenAdmin, onOpenEnvironment, onRestoreCase, onOrganizeCase };
 }
 
 describe("环境地址无效时的发送栏", () => {
@@ -107,6 +111,18 @@ describe("环境地址无效时的发送栏", () => {
     expect(screen.queryByRole("button", { name: "修改请求内容" })).toBeNull();
     // 地址本身没被判为不合法，预览照常显示。
     expect(screen.getByText(/实际目标：target-service:8080\/orders/)).toBeTruthy();
+  });
+
+  it("归档和目录异常预检给出真实用例库纠错入口", () => {
+    const restore = renderSendBar(blockedPreflight("case_archived", "restore_case"));
+    fireEvent.click(screen.getByRole("button", { name: "前往用例库恢复" }));
+    expect(restore.onRestoreCase).toHaveBeenCalledTimes(1);
+  });
+
+  it("目录异常预检进入整理范围", () => {
+    const organize = renderSendBar(blockedPreflight("folder_unavailable", "organize_case"));
+    fireEvent.click(screen.getByRole("button", { name: "前往用例库整理" }));
+    expect(organize.onOrganizeCase).toHaveBeenCalledTimes(1);
   });
 
   it("仅停用 Query 含变量时不显示地址变量提示", () => {

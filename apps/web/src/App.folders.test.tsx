@@ -27,7 +27,7 @@ const NEW_CASE_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 vi.mock("./session/useSession", () => ({
   useSession: () => ({
     session: {
-      user: { id: "u-1", username: "tester", display_name: "测试员", is_admin: true },
+      user: { id: "u-1", user_id: "u-1", username: "tester", display_name: "测试员", is_admin: true },
       workspaces: [{ id: WORKSPACE_ID, name: "默认工作空间", role: "admin" }],
     },
     loading: false,
@@ -180,6 +180,14 @@ function route(path: string, method: string, body?: Record<string, unknown>): un
       next_cursor: null,
     };
   }
+  if (method === "POST" && clean.endsWith("/asset-selections")) {
+    const payload = body ?? {};
+    const root = payload.root as { id: string; expected_rev: number };
+    const folder = folders.find((item) => item.id === root.id);
+    if (folder === undefined) throw new Error("目录不存在");
+    const members = cases.filter((item) => item.folder_id === root.id);
+    return { selection_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", schema_version: 1, action: payload.action, mode: "folder", workspace_id: WORKSPACE_ID, project_id: PROJECT_ID, principal_id: "u-1", created_at: "2026-10-04T00:00:00Z", expires_at: "2026-10-04T00:10:00Z", counts: { selected: 1 + members.length, eligible: 1 + members.length, excluded: 0, cases: members.length, folders: 1 }, root: { resource_type: "folder", id: root.id, expected_rev: root.expected_rev }, preview_items: [{ resource_type: "folder", id: folder.id, rev: folder.rev, state: "active", name: folder.name, parent_id: folder.parent_id, folder_id: null, outcome: "eligible", code: null }, ...members.map((item) => ({ resource_type: "case", id: item.id, rev: item.rev, state: "active", name: item.name, parent_id: null, folder_id: item.folder_id, outcome: "eligible", code: null }))], excluded_items: [] };
+  }
   if (method === "GET" && clean.endsWith("/folders")) {
     return folders.filter((item) => item.archived_at === null);
   }
@@ -274,9 +282,19 @@ function installSendMocks() {
     path: string,
     method: string,
     body?: Record<string, unknown>,
+    _parse?: unknown,
+    options?: { headers?: Record<string, string> },
   ) => {
     if (/\/case-preferences\/[0-9a-f-]{36}\/opened$/.test(basePath(path))) personalWrites.push({ method, path, body });
     else if (method !== "GET") writes.push({ method, path, body: body ?? {} });
+    if (basePath(path).endsWith("/asset-operations") && method === "POST") {
+      const folder = folders.find((item) => item.id === FOLDER_A);
+      if (folder === undefined) throw new Error("目录不存在");
+      folder.archived_at = "2026-10-04T00:00:01Z"; folder.rev += 1;
+      const affected = cases.filter((item) => item.folder_id === FOLDER_A);
+      for (const item of affected) item.rev += 1;
+      return { operation_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", operation_key: options?.headers?.["Idempotency-Key"], action: "folder_archive", workspace_id: WORKSPACE_ID, project_id: PROJECT_ID, principal_id: "u-1", result_schema_version: 1, created_at: "2026-10-04T00:00:01Z", result: { result_kind: "completed", selection_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", root: { resource_type: "folder", id: FOLDER_A }, counts: { input: 1 + affected.length, succeeded: 1 + affected.length, no_change: 0, conflict: 0, failed: 0 }, items: [{ resource_type: "folder", id: FOLDER_A, outcome: "succeeded", code: null, message: "已归档", new_rev: folder.rev, asset: { id: FOLDER_A, resource_type: "folder", name: folder.name, rev: folder.rev, state: "archived", folder_id: null, parent_id: null, archived_at: folder.archived_at } }, ...affected.map((item) => ({ resource_type: "case", id: item.id, outcome: "succeeded", code: null, message: "已归档", new_rev: item.rev, asset: { id: item.id, resource_type: "case", name: item.name, rev: item.rev, state: "archived", folder_id: item.folder_id, parent_id: null, archived_at: null } }))], members: [{ resource_type: "folder", id: FOLDER_A, before_rev: folder.rev - 1, after_rev: folder.rev, original_parent_id: null, before_state: "active" }, ...affected.map((item) => ({ resource_type: "case", id: item.id, before_rev: item.rev - 1, after_rev: item.rev, original_parent_id: item.folder_id, before_state: "active" }))] } };
+    }
     return route(path, method, body);
   }) as never);
   apiSendWithMetaMock.mockImplementation((async (
@@ -296,6 +314,17 @@ async function renderShell(): Promise<HTMLElement> {
   // 选中项目后还有一次“重置下游选择”的副作用，等它落定再操作控件。
   await act(async () => {});
   return screen.getByLabelText("用例目录");
+}
+
+async function archiveFolderThroughLibrary(browser: HTMLElement, name: string): Promise<void> {
+  fireEvent.click(within(browser).getByRole("button", { name: `管理目录 ${name}` }));
+  const library = await screen.findByRole("region", { name: "用例库" });
+  fireEvent.click(await within(library).findByRole("button", { name: `归档目录 ${name}` }));
+  fireEvent.click(await screen.findByRole("button", { name: "生成预览" }));
+  expect(await screen.findByText(/将处理 \d+ 项/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "确认执行" }));
+  await waitFor(() => expect(folders.find((item) => item.name === name)?.archived_at).not.toBeNull());
+  fireEvent.click(await screen.findByRole("button", { name: "完成" }));
 }
 
 function browserList(browser: HTMLElement): string[] {
@@ -448,7 +477,7 @@ describe("用例目录承载用例的闭环", () => {
     expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/orders/42");
   });
 
-  it("目录被归档：明确显示失效，且只改名称的保存不会把它悄悄移出原目录", async () => {
+  it("目录树归档后已打开用例就地接纳归档元数据，并禁止继续编辑或保存", async () => {
     cases = [
       {
         id: NEW_CASE_ID,
@@ -480,59 +509,23 @@ describe("用例目录承载用例的闭环", () => {
       return current;
     });
 
-    // 在目录树里归档 A：编辑器拿到的是同一份目录清单，必须立刻反映出来。
-    const archive = browser.querySelector('[aria-label="归档目录 A 模块"]');
-    if (!(archive instanceof HTMLButtonElement)) throw new Error("归档 A 模块入口未挂载");
-    fireEvent.click(archive);
+    // 工作台只保留统一管理入口；目录归档必须在用例库先预览，再确认整棵目录树。
+    await archiveFolderThroughLibrary(browser, "A 模块");
+    expect(apiDelete).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "接口工作台" }));
 
-    // A 不见与 B 还在必须**同时**成立，所以放在同一个等待条件里。
-    //
-    // 拆成“先等 A 不见、再同步断言 B 还在”会引入一个瞬时态：目录清单重取还没回来时，
-    // 选择器里只剩失效占位，「A 模块」确实已经不见了，但「B 模块」也还没到——第一段
-    // 因此通过，第二段随负载随机失败。这里的结论本来就是一个收敛条件（清单刷新过），
-    // 不是某一帧的快照。
-    const combobox = folderSelect.querySelector('[role="combobox"]');
-    if (!(combobox instanceof HTMLInputElement)) throw new Error("所属目录选择器未挂载");
-    fireEvent.mouseDown(combobox);
-    const listId = combobox.getAttribute("aria-controls");
-    if (listId === null) throw new Error("所属目录选择器没有关联选项列表");
-    await waitFor(() => {
-      const popup = document.getElementById(listId)?.closest<HTMLElement>(".ant-select-dropdown");
-      const labels = popup === null || popup === undefined
-        ? []
-        : Array.from(popup.querySelectorAll<HTMLElement>(".ant-select-item-option-content"), (item) => item.textContent?.trim() ?? "");
-      expect({ hasA: labels.includes("A 模块"), hasB: labels.includes("B 模块") }).toEqual({ hasA: false, hasB: true });
-    });
-    fireEvent.keyDown(combobox, { key: "Escape" });
-    // 关键：失效状态必须如实显示，不能被显示成「未分组」——那等于在界面上宣布一个
-    // 用户没做过的改动，用户一保存就真的被移出原目录。
-    expect({ value: folderSelect.dataset.selectedValue, expired: folderSelect.textContent?.includes("已失效") }).toEqual({ value: FOLDER_A, expired: true });
-    expect(editor.textContent?.includes("不动目录直接保存不会改变它的归属")).toBe(true);
-
-    // 用户只改了名称：请求里不该出现 folder_id，归属必须原样保留。
-    const nameInput = editor.querySelector(".case-name-input");
-    if (!(nameInput instanceof HTMLInputElement)) throw new Error("用例名称输入框未挂载");
-    fireEvent.change(nameInput, { target: { value: "归档后改名" } });
-    const save = Array.from(editor.querySelectorAll("button")).find((button) => button.textContent?.trim() === "保存草稿");
-    if (!(save instanceof HTMLButtonElement)) throw new Error("保存草稿入口未挂载");
-    fireEvent.click(save);
-    await waitFor(() =>
-      expect(writes.filter((item) => item.method === "PATCH")).toHaveLength(1),
-    );
-    const patch = writes.filter((item) => item.method === "PATCH")[0]!;
-    expect({ name: patch.body.name, sentFolder: "folder_id" in patch.body }).toEqual({ name: "归档后改名", sentFolder: false });
-    // 服务端替身按同样的三态语义处理，所以这里同时证明用例仍挂在原目录上。
-    expect({ name: cases[0]?.name, folderId: cases[0]?.folder_id }).toEqual({ name: "归档后改名", folderId: FOLDER_A });
-    // 再打开一次仍是失效目录，而不是未分组。
     await waitFor(() => {
       const currentEditor = document.querySelector<HTMLElement>(".workspace-editor:not([hidden])");
       const currentSelect = currentEditor?.querySelector<HTMLElement>(".case-folder-select[data-selected-value]") ?? null;
       expect({
         connected: currentSelect?.isConnected ?? false,
         value: currentSelect?.dataset.selectedValue ?? null,
-        expired: currentSelect?.textContent?.includes("已失效") ?? false,
-      }).toEqual({ connected: true, value: FOLDER_A, expired: true });
+        archivedGate: currentEditor?.textContent?.includes("这条用例已归档") ?? false,
+      }).toEqual({ connected: true, value: FOLDER_A, archivedGate: true });
     });
+    const nameInput = editor.querySelector(".case-name-input") as HTMLInputElement;
+    const save = Array.from(editor.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.trim() === "保存草稿");
+    expect({ nameReadOnly: nameInput.disabled || nameInput.readOnly, saveDisabled: save?.disabled ?? true, patches: writes.filter((item) => item.method === "PATCH").length }).toEqual({ nameReadOnly: true, saveDisabled: true, patches: 0 });
   });
 
   it("所属目录按名称选择，选项只含当前项目的未归档目录，没有填 UUID 的入口", async () => {
@@ -560,12 +553,12 @@ describe("用例目录承载用例的闭环", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "接口工作台" }));
     const browser = screen.getByLabelText("用例目录");
-    fireEvent.click(within(browser).getByRole("button", { name: "归档目录 A 模块" }));
-    await waitFor(() => expect(folders.find((item) => item.id === FOLDER_A)?.archived_at).not.toBeNull());
+    await archiveFolderThroughLibrary(browser, "A 模块");
 
-    fireEvent.click(screen.getByRole("button", { name: "用例库" }));
-    expect(await within(library).findByText("A 模块（已归档）")).toBeTruthy();
+    // 操作完成后仍停留在用例库；目录桶与用例列表必须已刷新。
+    expect(await within(library).findByText("A 模块（旧记录，仅恢复此目录）")).toBeTruthy();
     expect(within(library).queryByText("A 模块", { selector: ".ant-tree-title" })).toBeNull();
     expect(apiGetMock.mock.calls.filter(([path]) => String(path).includes("/case-library?")).length).toBeGreaterThan(libraryReadsBefore);
   });
+
 });

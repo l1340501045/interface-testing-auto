@@ -34,6 +34,7 @@ import { ResponsePanel } from "../runs/ResponsePanel";
 import { AuthTab, SendBar, type SendStage } from "../runs/SendBar";
 import { isTerminal } from "../runs/useRuns";
 import { submissionKey, useDebugRun, type DebugSubmission } from "../runs/useDebugRun";
+import type { AssetEditorController } from "./assetController";
 import { AssertionTab } from "./AssertionTab";
 import { AssertionColumn } from "./AssertionColumn";
 import { removeAssertion, upsertAssertion } from "./assertionGroups";
@@ -128,6 +129,7 @@ export function CaseEditor({
   currentUserId = null,
   onOpenAdmin,
   onOpenEnvironment,
+  onOpenAssetLibrary,
   configEpoch = 0,
   getConfigEpoch,
   separateHistory = false,
@@ -136,6 +138,7 @@ export function CaseEditor({
   onTabMeta,
   domIdPrefix,
   onRegisterCloseSave,
+  onRegisterAssetController,
 }: {
   workspaceId: string;
   projectId: string;
@@ -185,6 +188,7 @@ export function CaseEditor({
    * 要送到环境编辑，凭证类问题要送到凭证列表。不传时退回 `onOpenAdmin`，老调用点不受影响。
    */
   onOpenEnvironment?: () => void;
+  onOpenAssetLibrary?: (mode: "restore" | "organize", target: { id: string; name: string; method: string; path: string }) => void;
   /**
    * 配置世代：环境、项目变量或身份配置成功变更时由外壳递增。
    *
@@ -208,6 +212,7 @@ export function CaseEditor({
   onTabMeta?: (meta: { name: string; method: string; dirty: boolean; busy: boolean }) => void;
   domIdPrefix?: string;
   onRegisterCloseSave?: (controller: { save: () => Promise<boolean>; state: () => LeaveState } | null) => void;
+  onRegisterAssetController?: (controller: AssetEditorController | null) => void;
 }) {
   // 新建的用例在保存后才有 id。这里自己记住它，避免“创建成功但再保存又建一条”。
   const [currentId, setCurrentId] = useState<string | null>(caseSummaryId);
@@ -264,6 +269,10 @@ export function CaseEditor({
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [assetLocked, setAssetLocked] = useState(false);
+  const [assetArchived, setAssetArchived] = useState(false);
+  const assetTokenRef = useRef<string | null>(null);
+  const assetInputRevisionRef = useRef<number | null>(null);
   const [versions, setVersions] = useState<CaseVersion[]>([]);
   /**
    * 版本列表的读取世代。
@@ -339,9 +348,14 @@ export function CaseEditor({
    * 却全部失效的界面，而真正该收起入口的是服务端已经判定为查看者的那一种。未知角色
    * 不在这里收紧：权限判据在服务端，前端只能如实呈现它拿到的角色。
    */
-  const readOnly = projectRole !== null && projectRole !== undefined && !canEditRole(projectRole);
+  const roleReadOnly = projectRole !== null && projectRole !== undefined && !canEditRole(projectRole);
+  const readOnly = roleReadOnly || assetLocked || assetArchived;
   const readOnlyReason = readOnly
-    ? "当前项目角色是查看者：可以查看请求、断言与历史报告，但不能新建、保存、授权或发送。"
+    ? assetLocked
+      ? "正在确认这条用例的资产操作，完成前不能编辑、保存、发布或发起新运行。"
+      : assetArchived
+        ? "这条用例已归档；恢复后才能编辑、保存、发布或发起新运行。"
+        : "当前项目角色是查看者：可以查看请求、断言与历史报告，但不能新建、保存、授权或发送。"
     : null;
 
   useEffect(() => {
@@ -369,6 +383,8 @@ export function CaseEditor({
   const executionGateRef = useRef<"debug" | "version" | null>(null);
   const onTabMetaRef = useRef(onTabMeta);
   onTabMetaRef.current = onTabMeta;
+  const onRegisterAssetControllerRef = useRef(onRegisterAssetController);
+  onRegisterAssetControllerRef.current = onRegisterAssetController;
   const principalRef = useRef(currentUserId);
   const environmentRef = useRef(selectedEnvironmentId);
   principalRef.current = currentUserId;
@@ -714,8 +730,38 @@ export function CaseEditor({
     currentSnapshotKey,
     onDebugRunAccepted,
     getConfigEpoch,
+    currentId ?? undefined,
   );
   const debugAcceptancePending = debug.phase !== "idle" && debug.phase !== "running";
+  const assetControllerStateRef = useRef({ currentId, draftRev, dirty, busy, debugAcceptancePending, versionOperationActive, effectiveDetail, detailKey });
+  assetControllerStateRef.current = { currentId, draftRev, dirty, busy, debugAcceptancePending, versionOperationActive, effectiveDetail, detailKey };
+  useEffect(() => {
+    if (onRegisterAssetControllerRef.current === undefined) return;
+    const controller: AssetEditorController = {
+      snapshot: () => { const state = assetControllerStateRef.current; return state.currentId === null || state.draftRev === null ? null : { caseId: state.currentId, rev: state.draftRev, inputRevision: editRevisionRef.current, folderId: folderIdRef.current, dirty: state.dirty, busy: state.busy || state.debugAcceptancePending || state.versionOperationActive || assetTokenRef.current !== null }; },
+      lock: (token, expectedRev) => {
+        const state = assetControllerStateRef.current;
+        if (state.currentId === null || state.draftRev === null || state.draftRev !== expectedRev || state.dirty || state.busy || state.debugAcceptancePending || state.versionOperationActive || assetTokenRef.current !== null) return null;
+        assetTokenRef.current = token;
+        assetInputRevisionRef.current = editRevisionRef.current;
+        setAssetLocked(true);
+        return { caseId: state.currentId, rev: state.draftRev, inputRevision: editRevisionRef.current, folderId: folderIdRef.current, dirty: false, busy: false };
+      },
+      accept: (token, sourceRev, inputRevision, metadata) => {
+        const state = assetControllerStateRef.current;
+        if (assetTokenRef.current !== token || sourceRev !== state.draftRev || inputRevision !== assetInputRevisionRef.current || assetInputRevisionRef.current !== editRevisionRef.current || state.currentId === null || metadata.id !== state.currentId || metadata.resource_type !== "case" || state.effectiveDetail === null) return false;
+        const nextDetail = { ...state.effectiveDetail, name: metadata.name, folder_id: metadata.folder_id, rev: metadata.rev, status: metadata.state === "archived" ? "archived" : "draft" };
+        setName(metadata.name); setFolderId(metadata.folder_id); setDraftRev(metadata.rev); setEtag(`"${metadata.rev}"`);
+        setAppliedStamp({ key: state.detailKey ?? "", rev: metadata.rev }); setLocalDetail({ key: state.detailKey ?? "", detail: nextDetail });
+        const nextBaseline = { name: metadata.name, request: requestRef.current, assertions: JSON.stringify(assertionsRef.current), folderId: metadata.folder_id };
+        baselineSyncRef.current = nextBaseline; setBaseline(nextBaseline); setAssetArchived(metadata.state === "archived");
+        return true;
+      },
+      release: (token) => { if (assetTokenRef.current === token) { assetTokenRef.current = null; assetInputRevisionRef.current = null; setAssetLocked(false); } },
+    };
+    onRegisterAssetControllerRef.current(controller);
+    return () => onRegisterAssetControllerRef.current?.(null);
+  }, []);
   const closeOperationPendingRef = useRef(false);
   closeOperationPendingRef.current = debugAcceptancePending || versionOperationActive;
 
@@ -757,6 +803,10 @@ export function CaseEditor({
    */
   async function sendDebug() {
     setSendError(null);
+    if (assetTokenRef.current !== null) {
+      setSendError("正在确认这条用例的资产操作，请等待结果明确后再发送。");
+      return;
+    }
     if (versionOperationActive || executionGateRef.current !== null) {
       setSendError("同一标签已有版本运行正在确认，请先处理完成。");
       return;
@@ -1099,7 +1149,7 @@ export function CaseEditor({
   function save(): Promise<CaseDetail | null> {
     const inFlight = saveInFlightRef.current;
     if (inFlight !== null) return inFlight;
-    if (editorWriteGateRef.current) return Promise.resolve(null);
+    if (editorWriteGateRef.current || assetTokenRef.current !== null) return Promise.resolve(null);
     editorWriteGateRef.current = true;
     const operation = performSave().finally(() => {
       if (saveInFlightRef.current === operation) saveInFlightRef.current = null;
@@ -1236,7 +1286,7 @@ export function CaseEditor({
   }
 
   function saveThenPublish(): Promise<CaseVersion | null> {
-    if (editorWriteGateRef.current) return Promise.resolve(null);
+    if (editorWriteGateRef.current || assetTokenRef.current !== null) return Promise.resolve(null);
     editorWriteGateRef.current = true;
     return performSaveThenPublish().finally(() => {
       editorWriteGateRef.current = false;
@@ -1250,6 +1300,7 @@ export function CaseEditor({
    * 提示更直接。**不发送任何被测请求**，也不在失败时改动草稿（INV-06）。
    */
   async function importCurl(text: string): Promise<{ error: string | null; warnings: string[] }> {
+    if (assetTokenRef.current !== null) return { error: "资产操作确认期间不能应用导入内容。", warnings: [] };
     if (!text.trim()) {
       return { error: "请先粘贴 cURL 命令文本。", warnings: [] };
     }
@@ -1317,16 +1368,19 @@ export function CaseEditor({
   }
 
   function patchRequest(patch: Partial<RawRequest>) {
+    if (assetTokenRef.current !== null) return;
     editRevisionRef.current += 1;
     setRequest((current) => ({ ...current, ...patch }));
   }
 
   function changeAssertions(next: CaseAssertion[] | ((current: CaseAssertion[]) => CaseAssertion[])) {
+    if (assetTokenRef.current !== null) return;
     editRevisionRef.current += 1;
     setAssertions(next);
   }
 
   async function changeRows(field: "query_params" | "headers", rows: RawKeyValue[]): Promise<boolean> {
+    if (assetTokenRef.current !== null) return false;
     const startedOwner = confirmOwnerRef.current;
     if (!activeRef.current) return false;
     let currentRequest = requestRef.current;
@@ -1375,6 +1429,7 @@ export function CaseEditor({
   }
 
   function changeRowAssertions(next: CaseAssertion[] | ((current: CaseAssertion[]) => CaseAssertion[])) {
+    if (assetTokenRef.current !== null) return;
     if (request.schema_version === 2) {
       changeAssertions(next);
       return;
@@ -1429,9 +1484,9 @@ export function CaseEditor({
       <CaseHeading
         idPrefix={domIdPrefix ? `${domIdPrefix}-case` : "case"}
         name={name}
-        onNameChange={setName}
+        onNameChange={(value) => { if (readOnly || assetTokenRef.current !== null) return; editRevisionRef.current += 1; setName(value); }}
         folderId={folderId}
-        onFolderChange={setFolderId}
+        onFolderChange={(value) => { if (readOnly || assetTokenRef.current !== null) return; editRevisionRef.current += 1; setFolderId(value); }}
         folders={folders}
         folderUnavailable={folderUnavailable}
         folderPlaceholder={
@@ -1485,6 +1540,8 @@ export function CaseEditor({
               preflighting={debug.preflighting}
               onOpenAdmin={() => onOpenAdmin?.()}
               onOpenEnvironment={onOpenEnvironment ? () => onOpenEnvironment() : undefined}
+              onRestoreCase={currentId ? () => onOpenAssetLibrary?.("restore", { id: currentId, name, method: request.method, path: request.path }) : undefined}
+              onOrganizeCase={currentId ? () => onOpenAssetLibrary?.("organize", { id: currentId, name, method: request.method, path: request.path }) : undefined}
               canAuthorize={debug.preflight?.can_authorize ?? false}
               onSubmitAuthorization={() => void confirmAuthorization()}
               onCancelAuthorization={cancelAuthorization}
@@ -1694,7 +1751,7 @@ export function CaseEditor({
         matchesCurrent={activeMatches}
         selectedRunId={selection?.runId ?? null}
         onCancel={(runId) => void debug.cancel(runId)}
-        canCancel={!readOnly}
+        canCancel={!roleReadOnly}
         fieldsTab={(fieldsActive) => (
           <ResponseFieldPanel
             workspaceId={workspaceId}
@@ -1770,13 +1827,13 @@ export function CaseEditor({
           onReport={handleHistoryReport}
           onRunSubmitted={handleRunSubmitted}
           captureProvenance={captureRunProvenance}
-          canCancel={!readOnly}
-          readOnly={readOnly}
+          canCancel={!roleReadOnly}
+          readOnly={roleReadOnly}
           showHistory={!separateHistory}
-          operationBlocked={debug.operationActive}
+          operationBlocked={debug.operationActive || assetLocked || assetArchived}
           onOperationActive={setVersionOperationActive}
           tryAcquireOperation={() => {
-            if (executionGateRef.current !== null) return false;
+            if (executionGateRef.current !== null || assetTokenRef.current !== null || assetArchived) return false;
             executionGateRef.current = "version";
             return true;
           }}

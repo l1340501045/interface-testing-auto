@@ -9,9 +9,10 @@ export default defineConfig({
     globals: true,
     setupFiles: ["./src/test/setup.ts"],
     include: ["src/**/*.test.{ts,tsx}"],
-    // App 级回归会同时挂载完整工作台。按容器实际可用 CPU 使用一半 worker；CI 只有
-    // 2 核时自动使用 1 个，避免固定高并发制造假超时，同时保留高配开发机的合理并行度。
-    maxWorkers: "50%",
+    // App 级回归会同时挂载完整工作台。实测 5 worker 会持续占用约 6～8 核，并让重 App
+    // 用例在 15 秒预算内漂移超时；2 worker 在同源码、同预算下完整通过。Vitest 5 按
+    // Math.round(percent * availableParallelism) 取整，因此 20% 在 10 核为 2、2 核至少为 1。
+    maxWorkers: "20%",
     // 只用于兜住“卡住不返回”的测试（例如渲染死循环），不做性能指标。比
     // setup.ts 里 Testing Library 的异步等待预算大，这样“元素一直不出现”会先以
     // 带 DOM 快照的库报错暴露出来，而不是被这里超时截断成一句无信息的时间到。

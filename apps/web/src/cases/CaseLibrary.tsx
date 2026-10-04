@@ -4,8 +4,9 @@ import type { ColumnsType } from "antd/es/table";
 import type { DataNode } from "antd/es/tree";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type Key } from "react";
 
-import { ApiError } from "../api/client";
-import type { AssetFolder, CaseLibraryFilters, CaseLibraryItem, CaseSavedView } from "../api/types";
+import { ApiError, apiSend, projectPath } from "../api/client";
+import { toAssetFolder } from "../api/guards";
+import type { AssetAction, AssetFolder, AssetOperation, CaseLibraryFilters, CaseLibraryItem, CaseSavedView } from "../api/types";
 import { Empty, ErrorText, Loading } from "../components/Feedback";
 import { useLeaveReport } from "../hooks/leaveGuard";
 import {
@@ -19,8 +20,10 @@ import {
   useCaseLibrary,
   useCaseViews,
 } from "./useCaseLibrary";
+import { AssetActionModal, type AssetActionTarget } from "./AssetActionModal";
+import type { AcquireAssetOperation } from "./assetController";
 
-export type OpenCaseResult = "opened" | "focused" | "limit_reached" | "unavailable";
+export type OpenCaseResult = "opened" | "focused" | "limit_reached" | "unavailable" | "busy";
 
 const METHOD_OPTIONS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"].map((value) => ({ value, label: value }));
 const SPECIAL_KEYS = new Set(["all", "unfiled", "favorites", "recent"]);
@@ -60,6 +63,10 @@ export function CaseLibrary({
   folderRefreshToken = 0,
   active,
   onOpen,
+  canEdit = false,
+  onAcquireAssetOperation,
+  assetFocus,
+  onAssetsChanged,
 }: {
   workspaceId: string;
   projectId: string;
@@ -67,6 +74,10 @@ export function CaseLibrary({
   folderRefreshToken?: number;
   active: boolean;
   onOpen: (caseId: string) => Promise<OpenCaseResult>;
+  canEdit?: boolean;
+  onAcquireAssetOperation?: AcquireAssetOperation;
+  assetFocus?: { token: number; workspaceId: string; projectId: string; principalId: string; caseId: string; name: string; method: string; path: string; mode: "restore" | "organize" } | null;
+  onAssetsChanged?: () => void;
 }) {
   const owner = `${workspaceId}/${projectId}/${principalId}`;
   const [filters, setFilters] = useState<CaseLibraryFilters>(defaultCaseLibraryFilters);
@@ -85,18 +96,27 @@ export function CaseLibrary({
   const [viewError, setViewError] = useState<string | null>(null);
   const [tableScrollY, setTableScrollY] = useState(240);
   const [feedback, setFeedback] = useState<{ type: "success" | "warning" | "error"; message: string } | null>(null);
+  const [assetAction, setAssetAction] = useState<{ action: AssetAction; target: AssetActionTarget } | null>(null);
+  const assetActionGeneration = useRef(0);
+  const [copiedCase, setCopiedCase] = useState<{ id: string; name: string } | null>(null);
   const ownerRef = useRef(owner);
+  const activeRef = useRef(active);
   const tableRegionRef = useRef<HTMLDivElement | null>(null);
   const seenFolderRefreshToken = useRef(folderRefreshToken);
   const viewWriteRef = useRef<{ owner: string; token: number } | null>(null);
   const viewWriteToken = useRef(0);
+  const consumedFocusTokens = useRef(new Set<number>());
   ownerRef.current = owner;
+  activeRef.current = active;
+  const beginAssetAction = (next: { action: AssetAction; target: AssetActionTarget }) => { assetActionGeneration.current += 1; setAssetAction(next); };
+  const closeAssetAction = () => { assetActionGeneration.current += 1; setAssetAction(null); };
 
   const folderTreeState = useAssetFolderTree(workspaceId, projectId, folderQuery, folderRefreshToken, active);
   const library = useCaseLibrary(workspaceId, projectId, filters, limit, cursor, active);
   const views = useCaseViews(workspaceId, projectId, active);
   const folderById = useMemo(() => new Map(folderTreeState.allItems.map((folder) => [folder.id, folder])), [folderTreeState.allItems]);
   const viewDirty = viewModalOpen && viewName !== viewBaseline;
+  const validAssetFocus = assetFocus?.workspaceId === workspaceId && assetFocus.projectId === projectId && assetFocus.principalId === principalId ? assetFocus : null;
   useLeaveReport(`case-library-view:${owner}`, { dirty: viewDirty, busy: viewBusy });
 
   useEffect(() => {
@@ -115,7 +135,19 @@ export function CaseLibrary({
     viewWriteRef.current = null;
     setViewBusy(false);
     setFeedback(null);
+    setAssetAction(null);
+    assetActionGeneration.current += 1;
+    setCopiedCase(null);
   }, [owner]);
+  useEffect(() => { if (!active) assetActionGeneration.current += 1; }, [active]);
+
+  useEffect(() => {
+    if (!active || validAssetFocus == null || consumedFocusTokens.current.has(validAssetFocus.token)) return;
+    consumedFocusTokens.current.add(validAssetFocus.token);
+    setSelectedViewId(null);
+    setFilters(normalizeCaseLibraryFilters({ ...defaultCaseLibraryFilters(), q: validAssetFocus.name, state: validAssetFocus.mode === "restore" ? "archived" : "all" }));
+    setCursorStack([null]);
+  }, [active, validAssetFocus]);
 
   useEffect(() => {
     if (seenFolderRefreshToken.current === folderRefreshToken) return;
@@ -265,13 +297,52 @@ export function CaseLibrary({
     }
   };
 
+  const openFolderRestore = async (folder: AssetFolder) => {
+    const actionOwner = owner;
+    const generation = ++assetActionGeneration.current;
+    const expectedArchiveOperationId = folder.archive_operation_id;
+    if (folder.restore_mode === null) { setFeedback({ type: "warning", message: "这个目录自身仍是活动状态；请先恢复它的归档上级，或整理受阻用例的归属。" }); return; }
+    if (folder.restore_mode === "unavailable") { setFeedback({ type: "error", message: "旧归档来源无法核验，不能猜测恢复根。" }); return; }
+    let root = folder;
+    if (folder.restore_mode === "locate_root") {
+      if (!folder.archive_root_id) { setFeedback({ type: "error", message: "服务端没有提供可核验的归档根。" }); return; }
+      try {
+        root = await apiSend(projectPath(workspaceId, projectId, `/asset-folders/${folder.archive_root_id}`), "GET", undefined, toAssetFolder);
+      } catch (error) {
+        if (ownerRef.current === actionOwner && activeRef.current) setFeedback({ type: "error", message: errorMessage(error) }); return;
+      }
+    }
+    if (ownerRef.current !== actionOwner || !activeRef.current || generation !== assetActionGeneration.current) return;
+    const locatedRootInvalid = folder.restore_mode === "locate_root" && (root.restore_mode !== "batch_root" || root.archive_operation_id !== expectedArchiveOperationId);
+    if (root.id !== (folder.restore_mode === "locate_root" ? folder.archive_root_id : folder.id) || root.availability === "available" || root.restore_mode === null || root.restore_mode === "unavailable" || locatedRootInvalid) { setFeedback({ type: "warning", message: "归档根或批次已经变化，请刷新目录后重新选择恢复对象。" }); return; }
+    beginAssetAction({ action: "folder_restore", target: { resourceType: "folder", item: root } });
+  };
+
+  const finishAssetOperation = (operation: AssetOperation) => {
+    if (operation.result.result_kind === "rejected") {
+      closeAssetAction();
+      setFeedback({ type: "warning", message: operation.result.message });
+      return;
+    }
+    onAssetsChanged?.();
+    refreshFoldersAndLibrary();
+    const copied = operation.action === "case_copy" ? operation.result.items.find((item) => item.resource_type === "case" && item.outcome === "succeeded") : undefined;
+    if (copied) {
+      setCopiedCase({ id: copied.id, name: copied.asset?.name ?? "新副本" });
+      setFeedback({ type: "success", message: "副本已创建并保留在用例库；需要时可明确打开，不会打断你后来选择的页面或标签。" });
+      return;
+    }
+    const counts = operation.result.counts;
+    setFeedback({ type: counts.failed || counts.conflict ? "warning" : "success", message: `操作完成：成功 ${counts.succeeded} 项，无变化 ${counts.no_change} 项，冲突或失败 ${counts.conflict + counts.failed} 项。` });
+  };
+
   const columns: ColumnsType<CaseLibraryItem> = [
     {
       title: "用例",
       key: "case",
       render: (_, item) => (
         <div className="case-library-name">
-          <strong>{item.name}</strong>
+          <strong>{item.name}{validAssetFocus?.caseId === item.id ? <Tag color="gold">待处理目标</Tag> : null}</strong>
           <span>{item.path}</span>
         </div>
       ),
@@ -302,7 +373,7 @@ export function CaseLibrary({
     {
       title: "操作",
       key: "actions",
-      width: 190,
+      width: 310,
       render: (_, item) => (
         <Space>
           <Button
@@ -321,12 +392,22 @@ export function CaseLibrary({
               const result = await onOpen(item.id);
               setBusyCaseId(null);
               if (result === "limit_reached") setFeedback({ type: "warning", message: "工作台已打开 20 个请求，请先关闭一个标签。" });
+              else if (result === "busy") setFeedback({ type: "warning", message: "这条用例正在确认资产操作，结果明确前不能打开新标签。" });
               else if (result === "unavailable") setFeedback({ type: "error", message: "这条用例已不可读取，请刷新用例库。" });
               else library.reload();
             }}
           >
             打开
           </Button>
+          {canEdit ? <>
+            {item.availability === "available" ? <>
+              <Button type="link" onClick={() => beginAssetAction({ action: "case_copy", target: { resourceType: "case", item } })}>复制</Button>
+              <Button type="link" onClick={() => beginAssetAction({ action: "move", target: { resourceType: "case", item } })}>移动</Button>
+              <Button danger type="link" onClick={() => beginAssetAction({ action: "archive", target: { resourceType: "case", item } })}>归档</Button>
+            </> : item.asset_status === "archived"
+              ? <Button type="link" onClick={() => beginAssetAction({ action: "restore", target: { resourceType: "case", item } })}>恢复</Button>
+              : <Button type="link" onClick={() => beginAssetAction({ action: "move", target: { resourceType: "case", item } })}>整理归属</Button>}
+          </> : null}
         </Space>
       ),
     },
@@ -337,7 +418,7 @@ export function CaseLibrary({
       const bucket = folderTreeState.child(folder.id);
       return {
         key: folder.id,
-        title: folderTitle(folder),
+        title: <Space size={4}><span>{folderTitle(folder)}</span>{canEdit && folder.availability === "available" ? <Button size="small" type="link" danger aria-label={`归档目录 ${folder.name}`} onKeyDown={(event) => event.stopPropagation()} onKeyUp={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); beginAssetAction({ action: "folder_archive", target: { resourceType: "folder", item: folder } }); }}>归档</Button> : null}</Space>,
         icon: <FolderOutlined />,
         isLeaf: !folder.has_children,
         children: bucket.items.length > 0 || bucket.nextCursor !== null
@@ -366,13 +447,15 @@ export function CaseLibrary({
   }
   const archivedNodes: DataNode[] = folderTreeState.archived.items.map((folder) => ({
     key: folder.id,
-    title: `${folderPath(folder.id, folder, false, false)}${folder.restore_mode === "unavailable" ? "（归档来源不可定位）" : "（已归档）"}`,
+    title: <Space size={4}><span>{`${folderPath(folder.id, folder, false, false)}${folder.restore_mode === "legacy_single" ? "（旧记录，仅恢复此目录）" : folder.restore_mode === "unavailable" ? "（归档来源不可定位）" : folder.restore_mode === null ? "（受归档上级阻挡）" : "（已归档）"}`}</span>{canEdit ? <Button size="small" type="link" aria-label={`恢复目录 ${folder.name}`} disabled={folder.restore_mode === "unavailable" || folder.restore_mode === null} title={folder.restore_mode === "unavailable" ? "归档来源无法核验，不能猜测恢复根" : folder.restore_mode === null ? "请处理真正归档的上级目录" : undefined} onKeyDown={(event) => event.stopPropagation()} onKeyUp={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void openFolderRestore(folder); }}>恢复</Button> : null}</Space>,
     icon: <FolderOutlined />,
     isLeaf: true,
   }));
   const searchNodes: DataNode[] = (folderTreeState.search?.items ?? []).map((folder) => ({
     key: folder.id,
-    title: folderPath(folder.id, folder, false, false),
+    title: <Space size={4}><span>{folderPath(folder.id, folder, false, false)}</span>{canEdit && folder.availability === "available"
+      ? <Button size="small" type="link" danger aria-label={`归档目录 ${folder.name}`} onKeyDown={(event) => event.stopPropagation()} onKeyUp={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); beginAssetAction({ action: "folder_archive", target: { resourceType: "folder", item: folder } }); }}>归档</Button>
+      : canEdit ? <Button size="small" type="link" aria-label={`恢复目录 ${folder.name}`} disabled={folder.restore_mode === "unavailable" || folder.restore_mode === null} onKeyDown={(event) => event.stopPropagation()} onKeyUp={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void openFolderRestore(folder); }}>恢复</Button> : null}</Space>,
     icon: <FolderOutlined />,
     isLeaf: true,
   }));
@@ -411,6 +494,18 @@ export function CaseLibrary({
         </div>
       </header>
       {feedback ? <Alert showIcon closable type={feedback.type} title={feedback.message} onClose={() => setFeedback(null)} /> : null}
+      {copiedCase ? <Alert showIcon type="success" title={`副本“${copiedCase.name}”已创建`} action={<Button onClick={async () => {
+        const result = await onOpen(copiedCase.id);
+        if (result === "limit_reached") setFeedback({ type: "warning", message: "工作台已打开 20 个请求；副本仍保留在用例库，请关闭一个标签后再打开。" });
+        else if (result === "unavailable" || result === "busy") setFeedback({ type: "warning", message: "副本当前无法打开，但已保留在用例库。" });
+      }}>打开副本</Button>} /> : null}
+      {validAssetFocus ? <Alert
+        showIcon
+        type="info"
+        title={library.data?.items.some((item) => item.id === validAssetFocus.caseId)
+          ? `已精确找到“${validAssetFocus.name}”` : library.loading ? "正在查找原用例…" : library.data?.next_cursor ? "原用例不在当前页，请点击下一页继续查找" : "当前查询结果中未找到原用例，请刷新后重试"}
+        description={`目标：${validAssetFocus.method} ${validAssetFocus.path}。只对标记为“待处理目标”的原用例执行${validAssetFocus.mode === "restore" ? "恢复" : "整理"}；同名用例不会被自动选中。`}
+      /> : null}
       <div className="case-library-layout">
         <aside className="case-library-tree" aria-label="用例目录与个人集合">
           <Space.Compact block>
@@ -549,6 +644,18 @@ export function CaseLibrary({
         <p className="caption">保存当前搜索、方法、状态、目录、个人集合和排序；不会保存页码或用例内容。</p>
         {viewError ? <Alert type="error" showIcon title={viewError} /> : null}
       </Modal>
+      {assetAction ? <AssetActionModal
+        workspaceId={workspaceId}
+        projectId={projectId}
+        principalId={principalId}
+        active={active}
+        target={assetAction.target}
+        action={assetAction.action}
+        folders={folderTreeState.allItems}
+        onAcquire={onAcquireAssetOperation}
+        onClose={closeAssetAction}
+        onDone={finishAssetOperation}
+      /> : null}
     </section>
   );
 }

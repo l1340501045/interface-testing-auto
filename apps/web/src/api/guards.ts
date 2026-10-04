@@ -387,8 +387,13 @@ function toAncestorPath(raw: unknown, field: string): AssetFolder["ancestor_path
 export function toAssetFolderPage(raw: unknown): AssetFolderPage {
   const record = asRecord(raw, "资产目录");
   return {
-    items: mapList(record.items, "资产目录.items", (item, index) => {
-      const row = asRecord(item, `资产目录.items[${index}]`);
+    items: mapList(record.items, "资产目录.items", (item, index) => toAssetFolder(item, `资产目录.items[${index}]`)),
+    total: asNumber(record.total, "资产目录.total"), next_cursor: asNullableString(record.next_cursor, "资产目录.next_cursor"),
+  };
+}
+
+export function toAssetFolder(raw: unknown, field = "资产目录"): AssetFolder {
+      const row = asRecord(raw, field);
       const restore = row.restore_mode;
       if (restore !== null && restore !== "batch_root" && restore !== "locate_root" && restore !== "legacy_single" && restore !== "unavailable") {
         throw new ContractError("目录.restore_mode 取值无效");
@@ -404,9 +409,6 @@ export function toAssetFolderPage(raw: unknown): AssetFolderPage {
         restore_mode: restore,
         ancestor_path: toAncestorPath(row.ancestor_path, "目录.ancestor_path"),
       };
-    }),
-    total: asNumber(record.total, "资产目录.total"), next_cursor: asNullableString(record.next_cursor, "资产目录.next_cursor"),
-  };
 }
 
 export function toCasePreference(raw: unknown): CasePreference {
@@ -548,6 +550,7 @@ export function toRunSummary(raw: unknown, field = "运行"): RunSummary {
     id: asString(record.id, `${field}.id`),
     target_type: asString(record.target_type, `${field}.target_type`),
     case_version_id: asNullableString(record.case_version_id, `${field}.case_version_id`),
+    debug_source_case_id: record.debug_source_case_id === undefined ? null : asNullableString(record.debug_source_case_id, `${field}.debug_source_case_id`),
     environment_id: asString(record.environment_id, `${field}.environment_id`),
     state: asString(record.state, `${field}.state`),
     outcome: asNullableString(record.outcome, `${field}.outcome`),
@@ -632,10 +635,14 @@ export function toDebugPreflight(raw: unknown): DebugPreflight {
     issues: mapList(record.issues, "预检结果.issues", (item, index): PreflightIssue => {
       const field = `预检结果.issues[${index}]`;
       const entry = asRecord(item, field);
+      const action = asString(entry.action, `${field}.action`);
+      if (!["edit_request", "select_environment", "manage_credentials", "authorize", "contact_admin", "configure_environment", "restore_case", "organize_case"].includes(action)) {
+        throw new ContractError(`未知预检动作：${action}`);
+      }
       return {
         code: asString(entry.code, `${field}.code`),
         message: asString(entry.message, `${field}.message`),
-        action: asString(entry.action, `${field}.action`) as PreflightIssue["action"],
+        action: action as PreflightIssue["action"],
       };
     }),
     can_authorize: asBoolean(record.can_authorize, "预检结果.can_authorize"),
