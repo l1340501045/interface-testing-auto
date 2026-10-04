@@ -7,7 +7,7 @@
  * 这里不替换 RunPanel：要验证的正是点下「发送」之后真正发出去的那些请求，以及
  * 调试与“保存并执行”两条路互不干扰。
  */
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { StrictMode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -39,6 +39,7 @@ vi.mock("../api/client", async (importOriginal) => {
 import { apiGet, apiSend, apiSendWithMeta, projectPath } from "../api/client";
 import { AppProviders } from "../theme/AppProviders";
 import { CaseEditor } from "./CaseEditor";
+import type { AssetEditorController } from "./assetController";
 
 const apiGetMock = vi.mocked(apiGet);
 const apiSendMock = vi.mocked(apiSend);
@@ -127,7 +128,7 @@ function route(method: string, path: string, body: unknown, headers?: Record<str
   throw new Error(`测试未覆盖的请求：${method} ${path}`);
 }
 
-type EditorTestProps = { projectRole?: string | null; strict?: boolean; active?: boolean };
+type EditorTestProps = { projectRole?: string | null; strict?: boolean; active?: boolean; caseSummaryId?: string | null; onRegisterAssetController?: (controller: AssetEditorController | null) => void };
 
 function editorNode(props: Omit<EditorTestProps, "strict"> = {}) {
   return <AppProviders>
@@ -201,6 +202,28 @@ beforeEach(() => {
 });
 
 describe("请求调试工作台", () => {
+  it("资产回执只推进名称、目录、状态与rev，保留请求和编辑器实例", async () => {
+    let controller: AssetEditorController | null = null;
+    await renderLoaded({ onRegisterAssetController: (next) => { controller = next; } });
+    expect(controller).not.toBeNull();
+    const token = "asset:metadata";
+    act(() => {
+      expect(controller?.lock(token, 3)).not.toBeNull();
+      expect(controller?.accept(token, 4, controller?.snapshot()?.inputRevision ?? -1, { id: CASE_ID, resource_type: "case", name: "错误推进", rev: 4, state: "active", folder_id: null, parent_id: null, archived_at: null })).toBe(false);
+      expect(controller?.accept(token, 3, controller?.snapshot()?.inputRevision ?? -1, { id: CASE_ID, resource_type: "case", name: "查询订单（已移动）", rev: 4, state: "active", folder_id: null, parent_id: null, archived_at: null })).toBe(true);
+      controller?.release(token);
+    });
+    await waitFor(() => expect((document.querySelector(".case-name-input") as HTMLInputElement).value).toBe("查询订单（已移动）"));
+    expect(screen.getByLabelText("路径")).toHaveProperty("value", "/echo");
+    expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, `/cases/${CASE_ID}`), "GET")).toHaveLength(1);
+  });
+  it("新请求调试不携带source_case_id", async () => {
+    renderEditor({ caseSummaryId: null });
+    fireEvent.click(await screen.findByRole("button", { name: "发送" }));
+    await waitFor(() => expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")).toHaveLength(1));
+    expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")[0].body).not.toHaveProperty("source_case_id");
+    for (const call of callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/debug-preflight"), "POST")) expect(call.body).not.toHaveProperty("source_case_id");
+  });
   it("未保存的用例也能直接发送当前内容，且不触发保存或发布", async () => {
     // DW-01／DW-02：导入或新建之后，地址行旁的发送入口直接提交临时快照。
     await renderLoaded();
@@ -213,8 +236,10 @@ describe("请求调试工作台", () => {
     // 提交的是 debug_snapshot，而不是 case_version_id：调试不落用例版本。
     expect(sent.body).toMatchObject({
       environment_id: ENV_ID,
+      source_case_id: CASE_ID,
       debug_snapshot: { request: { method: "GET", path: "/echo" }, assertions: [] },
     });
+    expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/debug-preflight"), "POST")[0]?.body).toMatchObject({ source_case_id: CASE_ID });
     // 完全没有保存或发布请求：调试与保存是两条路。
     expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, `/cases/${CASE_ID}`), "PATCH")).toEqual([]);
     expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, `/cases/${CASE_ID}/publish`), "POST")).toEqual([]);

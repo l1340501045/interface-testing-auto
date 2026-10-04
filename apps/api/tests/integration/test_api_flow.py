@@ -511,8 +511,16 @@ def test_case_folder_membership_is_explicit_and_filterable(
     assert still_in_b["folder_id"] == folder_b["id"], "被拒的跨项目目录不能改动归属"
 
     # ⑤ 已归档目录明确拒绝，不再接受新的用例；已归档目录里的用例不受影响。
-    archived = client.delete(f"{base}/folders/{folder_b['id']}")
-    assert archived.status_code == 204, archived.text
+    # S2 后旧 DELETE 明确停写；这里直接构造旧无批次归档，继续验证兼容读取/写拒绝。
+    connection = migrator_connection()
+    try:
+        connection.execute(
+            "UPDATE app.folders SET archived_at=now(), rev=rev+1 WHERE id=%s",
+            (folder_b["id"],),
+        )
+        connection.commit()
+    finally:
+        connection.close()
     assert folder_b["id"] not in [item["id"] for item in client.get(f"{base}/folders").json()]
     archived_etag = f'"{still_in_b["rev"]}"'
     into_archived = client.patch(
@@ -520,16 +528,16 @@ def test_case_folder_membership_is_explicit_and_filterable(
         json={"folder_id": folder_b["id"]},
         headers={"If-Match": archived_etag},
     )
-    assert into_archived.status_code == 400, into_archived.text
-    assert into_archived.json()["code"] == "folder_archived"
-    # 目录失效之后，只改名称仍然保留原归属——不能被悄悄改成未分组。
+    assert into_archived.status_code == 409, into_archived.text
+    assert into_archived.json()["code"] == "asset_unavailable"
+    # S2 后旧阻塞用例只能通过显式资产 move 救回，普通 PATCH 不再顺带编辑。
     kept = client.patch(
         f"{base}/cases/{case_id}",
         json={"name": "归档后改名"},
         headers={"If-Match": archived_etag},
     )
-    assert kept.status_code == 200, kept.text
-    assert kept.json()["folder_id"] == folder_b["id"], "目录已失效不等于把用例移出该目录"
+    assert kept.status_code == 409, kept.text
+    assert kept.json()["code"] == "asset_unavailable"
     # 在失效目录里新建也不允许：那会立刻得到一条挂在失效目录上的用例。
     created_in_archived = client.post(
         f"{base}/cases", json={**_case_payload(), "folder_id": folder_b["id"]}

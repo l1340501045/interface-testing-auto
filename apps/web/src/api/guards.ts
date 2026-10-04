@@ -7,7 +7,13 @@
  */
 import type {
   AssertionType,
+  AssetFolder,
+  AssetFolderPage,
   CaseDetail,
+  CaseLibraryFilters,
+  CaseLibraryPage,
+  CasePreference,
+  CaseSavedView,
   CaseSummary,
   CaseVersion,
   CredentialGrant,
@@ -271,6 +277,8 @@ export function toFolderList(raw: unknown): Folder[] {
       parent_id: asNullableString(record.parent_id, "目录.parent_id"),
       name: asString(record.name, "目录.name"),
       archived_at: asNullableString(record.archived_at, "目录.archived_at"),
+      rev: asNumber(record.rev, "目录.rev"),
+      availability: asEnum(record.availability, "目录.availability", new Set(["available", "ancestor_archived", "invalid_parent_chain"])),
     };
   });
 }
@@ -289,6 +297,138 @@ export function toCaseSummaryList(raw: unknown): CaseSummary[] {
       latest_version: latest === null || latest === undefined ? null : asNumber(latest, "用例.latest_version"),
     };
   });
+}
+
+const CASE_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]);
+const CASE_STATES = new Set(["active", "archived", "all"]);
+const CASE_COLLECTIONS = new Set(["all", "favorites", "recent"]);
+const CASE_SORTS = new Set(["updated_desc", "name_asc", "name_desc", "method_asc", "method_desc", "recent_desc"]);
+
+function asEnum<T extends string>(value: unknown, field: string, values: ReadonlySet<string>): T {
+  const parsed = asString(value, field);
+  if (!values.has(parsed)) throw new ContractError(`${field} 取值无效`);
+  return parsed as T;
+}
+
+export function toCaseLibraryFilters(raw: unknown, field = "筛选视图.filters"): CaseLibraryFilters {
+  const record = asRecord(raw, field);
+  const allowed = new Set(["schema_version", "q", "method", "state", "folder", "folder_id", "include_descendants", "collection", "sort"]);
+  for (const key of Object.keys(record)) if (!allowed.has(key)) throw new ContractError(`${field}.${key} 不受支持`);
+  if (record.schema_version !== 1) throw new ContractError(`${field}.schema_version 仅支持 1`);
+  const folder = asEnum<CaseLibraryFilters["folder"]>(record.folder, `${field}.folder`, new Set(["all", "unfiled", "exact"]));
+  const method = record.method === undefined || record.method === null ? undefined : asEnum<string>(record.method, `${field}.method`, CASE_METHODS);
+  const q = record.q === undefined || record.q === null ? undefined : asString(record.q, `${field}.q`);
+  if (q !== undefined && [...q].length > 200) throw new ContractError(`${field}.q 最多 200 个字符`);
+  const folderId = asNullableString(record.folder_id, `${field}.folder_id`);
+  const includeDescendants = asBoolean(record.include_descendants, `${field}.include_descendants`);
+  if (folder === "exact" && folderId === null) throw new ContractError(`${field}.folder_id 在精确目录筛选时必填`);
+  if (folder !== "exact" && folderId !== null) throw new ContractError(`${field}.folder_id 只用于精确目录筛选`);
+  if (folder !== "exact" && includeDescendants) throw new ContractError(`${field}.include_descendants 只用于精确目录筛选`);
+  const collection = asEnum<CaseLibraryFilters["collection"]>(record.collection, `${field}.collection`, CASE_COLLECTIONS);
+  const sort = asEnum<CaseLibraryFilters["sort"]>(record.sort, `${field}.sort`, CASE_SORTS);
+  if (sort === "recent_desc" && collection !== "recent") throw new ContractError(`${field}.sort 与最近打开集合不匹配`);
+  return {
+    schema_version: 1,
+    ...(q === undefined ? {} : { q }),
+    ...(method === undefined ? {} : { method }),
+    state: asEnum(record.state, `${field}.state`, CASE_STATES),
+    folder,
+    folder_id: folderId,
+    include_descendants: includeDescendants,
+    collection,
+    sort,
+  };
+}
+
+export function toCaseLibraryPage(raw: unknown): CaseLibraryPage {
+  const record = asRecord(raw, "用例库");
+  return {
+    items: mapList(record.items, "用例库.items", (item, index) => {
+      const row = asRecord(item, `用例库.items[${index}]`);
+      const folderId = asNullableString(row.folder_id, "用例.folder_id");
+      const folderPath = row.folder_path === null
+        ? null
+        : mapList(row.folder_path, "用例.folder_path", (part, partIndex) => {
+            const segment = asRecord(part, `用例.folder_path[${partIndex}]`);
+            return { id: asString(segment.id, "目录路径.id"), name: asString(segment.name, "目录路径.name") };
+          });
+      if (folderId === null && (folderPath === null || folderPath.length !== 0)) throw new ContractError("未分组用例的 folder_path 应为空数组");
+      if (folderId !== null && folderPath !== null && (folderPath.length === 0 || folderPath.at(-1)?.id !== folderId)) {
+        throw new ContractError("用例.folder_path 未指向所属目录");
+      }
+      return {
+        id: asString(row.id, "用例.id"),
+        name: asString(row.name, "用例.name"),
+        method: asEnum(row.method, "用例.method", CASE_METHODS),
+        path: asString(row.path, "用例.path"),
+        folder_id: folderId,
+        folder_path: folderPath,
+        asset_status: asEnum(row.asset_status, "用例.asset_status", new Set(["active", "archived"])),
+        availability: asEnum(row.availability, "用例.availability", new Set(["available", "case_archived", "folder_unavailable"])),
+        draft_rev: asNumber(row.draft_rev, "用例.draft_rev"),
+        updated_at: asString(row.updated_at, "用例.updated_at"),
+        latest_version: row.latest_version === null ? null : asNumber(row.latest_version, "用例.latest_version"),
+        favorite: asBoolean(row.favorite, "用例.favorite"),
+        last_opened_at: asNullableString(row.last_opened_at, "用例.last_opened_at"),
+      };
+    }),
+    total: asNumber(record.total, "用例库.total"),
+    next_cursor: asNullableString(record.next_cursor, "用例库.next_cursor"),
+  };
+}
+
+function toAncestorPath(raw: unknown, field: string): AssetFolder["ancestor_path"] {
+  return mapList(raw, field, (item, index) => {
+    const row = asRecord(item, `${field}[${index}]`);
+    return { id: asString(row.id, `${field}[${index}].id`), name: asString(row.name, `${field}[${index}].name`) };
+  });
+}
+
+export function toAssetFolderPage(raw: unknown): AssetFolderPage {
+  const record = asRecord(raw, "资产目录");
+  return {
+    items: mapList(record.items, "资产目录.items", (item, index) => toAssetFolder(item, `资产目录.items[${index}]`)),
+    total: asNumber(record.total, "资产目录.total"), next_cursor: asNullableString(record.next_cursor, "资产目录.next_cursor"),
+  };
+}
+
+export function toAssetFolder(raw: unknown, field = "资产目录"): AssetFolder {
+      const row = asRecord(raw, field);
+      const restore = row.restore_mode;
+      if (restore !== null && restore !== "batch_root" && restore !== "locate_root" && restore !== "legacy_single" && restore !== "unavailable") {
+        throw new ContractError("目录.restore_mode 取值无效");
+      }
+      return {
+        id: asString(row.id, "目录.id"), name: asString(row.name, "目录.name"),
+        parent_id: asNullableString(row.parent_id, "目录.parent_id"), rev: asNumber(row.rev, "目录.rev"),
+        archived_at: asNullableString(row.archived_at, "目录.archived_at"),
+        availability: asEnum(row.availability, "目录.availability", new Set(["available", "archived", "ancestor_archived", "invalid_parent_chain"])),
+        has_children: asBoolean(row.has_children, "目录.has_children"),
+        archive_operation_id: asNullableString(row.archive_operation_id, "目录.archive_operation_id"),
+        archive_root_id: asNullableString(row.archive_root_id, "目录.archive_root_id"),
+        restore_mode: restore,
+        ancestor_path: toAncestorPath(row.ancestor_path, "目录.ancestor_path"),
+      };
+}
+
+export function toCasePreference(raw: unknown): CasePreference {
+  const record = asRecord(raw, "用例偏好");
+  return { case_id: asString(record.case_id, "用例偏好.case_id"), favorite: asBoolean(record.favorite, "用例偏好.favorite"), last_opened_at: asNullableString(record.last_opened_at, "用例偏好.last_opened_at") };
+}
+
+export function toCaseSavedView(raw: unknown, field = "筛选视图"): CaseSavedView {
+  const record = asRecord(raw, field);
+  const name = asString(record.name, `${field}.name`);
+  if (name.trim() !== name || name.length < 1 || [...name].length > 100) throw new ContractError(`${field}.name 不是规范名称`);
+  return {
+    id: asString(record.id, `${field}.id`), name,
+    filters: toCaseLibraryFilters(record.filters, `${field}.filters`), rev: asNumber(record.rev, `${field}.rev`),
+    created_at: asString(record.created_at, `${field}.created_at`), updated_at: asString(record.updated_at, `${field}.updated_at`),
+  };
+}
+
+export function toCaseSavedViewList(raw: unknown): CaseSavedView[] {
+  return mapList(raw, "筛选视图列表", (item, index) => toCaseSavedView(item, `筛选视图[${index}]`));
 }
 
 export function toCaseDetail(raw: unknown): CaseDetail {
@@ -410,6 +550,7 @@ export function toRunSummary(raw: unknown, field = "运行"): RunSummary {
     id: asString(record.id, `${field}.id`),
     target_type: asString(record.target_type, `${field}.target_type`),
     case_version_id: asNullableString(record.case_version_id, `${field}.case_version_id`),
+    debug_source_case_id: record.debug_source_case_id === undefined ? null : asNullableString(record.debug_source_case_id, `${field}.debug_source_case_id`),
     environment_id: asString(record.environment_id, `${field}.environment_id`),
     state: asString(record.state, `${field}.state`),
     outcome: asNullableString(record.outcome, `${field}.outcome`),
@@ -494,10 +635,14 @@ export function toDebugPreflight(raw: unknown): DebugPreflight {
     issues: mapList(record.issues, "预检结果.issues", (item, index): PreflightIssue => {
       const field = `预检结果.issues[${index}]`;
       const entry = asRecord(item, field);
+      const action = asString(entry.action, `${field}.action`);
+      if (!["edit_request", "select_environment", "manage_credentials", "authorize", "contact_admin", "configure_environment", "restore_case", "organize_case"].includes(action)) {
+        throw new ContractError(`未知预检动作：${action}`);
+      }
       return {
         code: asString(entry.code, `${field}.code`),
         message: asString(entry.message, `${field}.message`),
-        action: asString(entry.action, `${field}.action`) as PreflightIssue["action"],
+        action: action as PreflightIssue["action"],
       };
     }),
     can_authorize: asBoolean(record.can_authorize, "预检结果.can_authorize"),

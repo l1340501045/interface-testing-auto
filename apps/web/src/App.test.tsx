@@ -86,6 +86,7 @@ let releaseCreate: (() => void) | null = null;
 let createdId = "";
 let caseSaveGate: { promise: Promise<void>; resolve: () => void } | null = null;
 const caseSaveByName = new Map<string, { promise: Promise<void>; resolve: () => void }>();
+const openedCalls: string[] = [];
 
 function project(key: string, name: string, workspaceId: string, id: string): unknown {
   return { id, workspace_id: workspaceId, key, name, status: "active", role: "admin", pool_id: null };
@@ -96,7 +97,7 @@ function caseRow(id: string, name: string, folderId: string | null = null): unkn
 }
 
 function folderRow(id: string, name: string): unknown {
-  return { id, parent_id: null, name, archived_at: null };
+  return { id, parent_id: null, name, archived_at: null, rev: 1, availability: "available" };
 }
 
 /**
@@ -160,6 +161,29 @@ function routes(path: string, method = "GET", body?: unknown): unknown {
     return projectsByWorkspace[workspaceId] ?? [];
   }
   if (clean.endsWith("/environments")) return environmentList;
+  if (clean.endsWith("/asset-folders")) return { items: [], total: 0, next_cursor: null };
+  if (clean.endsWith("/case-views")) return [];
+  if (clean.endsWith("/case-library")) {
+    const rows = casesByProject[projectInPath(clean)] ?? [];
+    return {
+      items: rows.map((row) => {
+        const item = row as { id: string; name: string; method: string; folder_id: string | null };
+        return {
+          id: item.id, name: item.name, method: item.method, path: "/orders", folder_id: item.folder_id,
+          folder_path: item.folder_id === null ? [] : [{ id: item.folder_id, name: "测试目录" }],
+          asset_status: "active", availability: "available", draft_rev: 1,
+          updated_at: "2026-10-04T00:00:00Z", latest_version: null, favorite: false, last_opened_at: null,
+        };
+      }),
+      total: rows.length,
+      next_cursor: null,
+    };
+  }
+  const openedPreference = /\/case-preferences\/([0-9a-f-]{36})\/opened$/.exec(clean);
+  if (method === "POST" && openedPreference !== null) {
+    openedCalls.push(openedPreference[1]!);
+    return { case_id: openedPreference[1], favorite: false, last_opened_at: "2026-10-04T00:00:00Z" };
+  }
   if (method === "POST" && clean.endsWith("/cases")) {
     const payload = (body ?? {}) as { name?: string; folder_id?: string | null; request?: unknown; assertions?: unknown[] };
     casePosts.push({ path, body });
@@ -210,11 +234,11 @@ beforeEach(() => {
   createdId = CREATED_1;
   caseSaveGate = null;
   caseSaveByName.clear();
+  openedCalls.length = 0;
   fixtures.workspaces = [{ id: WORKSPACE_ID, name: "默认工作空间", role: "admin" }];
   fixtures.logout.mockClear();
   apiGetMock.mockImplementation((async (path: string) => routes(path)) as never);
-  apiSendMock.mockImplementation((async (path: string, method: string, body: unknown) =>
-    routes(path, method, body)) as never);
+  apiSendMock.mockImplementation((async (path: string, method: string, body: unknown) => routes(path, method, body)) as never);
   // 用例保存走带 ETag 的调用；同样打到替身上，让“新建用例”这一段是真的走通的。
   apiSendWithMetaMock.mockImplementation((async (path: string, method: string, body: unknown) => {
     const data = routes(path, method, body);
@@ -403,9 +427,14 @@ describe("未保存内容的离开保护", () => {
     expect(apiSendWithMetaMock).toHaveBeenCalledTimes(1);
   });
 
-  it("在四个页面间往返不会重建编辑器或丢失草稿", async () => {
+  it("经过新增用例库和配置页往返不会重建编辑器或丢失草稿", async () => {
     await openDirtyNewCase();
     const draft = screen.getByLabelText("用例名称") as HTMLInputElement;
+
+    fireEvent.click(screen.getByRole("button", { name: "用例库" }));
+    expect(window.location.hash).toBe("#/cases");
+    expect(await screen.findByRole("region", { name: "用例库" })).toBeTruthy();
+    expect(screen.getByLabelText("用例名称")).toBe(draft);
 
     fireEvent.click(screen.getByRole("button", { name: "环境配置" }));
     expect(window.location.hash).toBe("#/environments");

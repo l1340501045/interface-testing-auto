@@ -32,11 +32,14 @@ def get_trace_id() -> str:
 class ApiError(Exception):
     """带稳定错误码的业务异常，HTTP 状态由调用点声明。"""
 
-    def __init__(self, status_code: int, code: str, message: str) -> None:
+    def __init__(
+        self, status_code: int, code: str, message: str, details: dict | None = None
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
+        self.details = details or {}
 
 
 def bad_request(code: str, message: str) -> ApiError:
@@ -78,7 +81,10 @@ def install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(ApiError)
     async def handle_api_error(_request: Request, exc: ApiError) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content=_payload(exc.code, exc.message))
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={**_payload(exc.code, exc.message), **exc.details},
+        )
 
     @app.exception_handler(RequestValidationError)
     async def handle_validation(_request: Request, exc: RequestValidationError) -> JSONResponse:

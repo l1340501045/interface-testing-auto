@@ -80,6 +80,8 @@ interface Operation {
   owner: Owner;
   inputStamp: InputStamp;
   submission: DebugSubmission;
+  /** 发起时冻结的来源；undefined 表示字段必须在整条原意图中缺席。 */
+  sourceCaseId: string | undefined;
   /** 发送时所选环境的名称：确认面板显示它，而不是当前选择。 */
   environmentLabel: string;
   /** 预检确认可用且本次用途尚未授权时的身份坐标；只有一次预检能写入它。 */
@@ -214,6 +216,7 @@ export function useDebugRun(
    * 时钟的当下值。返回 `null` 表示所有者已经失效（切了范围或主体）。
    */
   getConfigEpoch?: () => number | null,
+  sourceCaseId?: string,
 ) {
   const base = projectPath(workspaceId, projectId, "");
   const ownerKey = `${workspaceId}/${projectId}/${editorKey}/${principalId}`;
@@ -346,18 +349,19 @@ export function useDebugRun(
   const checkAbortRef = useRef<AbortController | null>(null);
 
   const fetchPreflight = useCallback(
-    async (submission: DebugSubmission, signal: AbortSignal): Promise<DebugPreflight> =>
+    async (submission: DebugSubmission, signal: AbortSignal, intentSourceCaseId = sourceCaseId): Promise<DebugPreflight> =>
       apiSend(
         `${base}/debug-preflight`,
         "POST",
         {
           environment_id: submission.environmentId,
           debug_snapshot: { request: submission.request, assertions: submission.assertions },
+          ...(intentSourceCaseId === undefined ? {} : { source_case_id: intentSourceCaseId }),
         },
         toDebugPreflight,
         { signal },
       ),
-    [base],
+    [base, sourceCaseId],
   );
 
   /**
@@ -407,13 +411,13 @@ export function useDebugRun(
    * 失去判断依据。
    */
   const checkPreflight = useCallback(
-    async (submission: DebugSubmission): Promise<PreflightOutcome> => {
+    async (submission: DebugSubmission, intentSourceCaseId: string | undefined): Promise<PreflightOutcome> => {
       const generation = ++checkGenerationRef.current;
       checkAbortRef.current?.abort();
       const controller = new AbortController();
       checkAbortRef.current = controller;
       try {
-        const result = await fetchPreflight(submission, controller.signal);
+        const result = await fetchPreflight(submission, controller.signal, intentSourceCaseId);
         if (generation !== checkGenerationRef.current) return { kind: "stale" };
         return { kind: "ok", value: result };
       } catch (cause) {
@@ -602,6 +606,7 @@ export function useDebugRun(
         owner: ownerRef.current,
         inputStamp: stamp,
         submission,
+        sourceCaseId,
         environmentLabel,
         profileId: null,
       };
@@ -609,7 +614,7 @@ export function useDebugRun(
       setError(null);
       setNotice(null);
 
-      const outcome = await checkPreflight(submission);
+      const outcome = await checkPreflight(submission, op.sourceCaseId);
       // 预检期间可能已经被取消、被配置变化作废，或用户点了停止等待。
       if (stateRef.current.phase !== "preflighting" || stateRef.current.op.token !== op.token) return;
       if (!owns(op)) return;
@@ -701,6 +706,7 @@ export function useDebugRun(
           {
             environment_id: op.submission.environmentId,
             debug_snapshot: { request: op.submission.request, assertions: op.submission.assertions },
+            ...(op.sourceCaseId === undefined ? {} : { source_case_id: op.sourceCaseId }),
           },
           (raw) => (raw === null || raw === undefined ? null : toRunSummary(raw)),
           { headers: { "Idempotency-Key": op.key }, signal: controller.signal },
@@ -769,7 +775,7 @@ export function useDebugRun(
         return null;
       }
     },
-    [base, canStartNewWrite, loadReport, owns, replace, toIdle],
+    [base, canStartNewWrite, loadReport, owns, replace, sourceCaseId, toIdle],
   );
 
   /**

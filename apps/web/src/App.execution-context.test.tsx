@@ -213,6 +213,9 @@ function route(rawPath: string, method: string, body?: unknown): unknown {
   if (method === "GET" && path.endsWith("/runs")) return historyRuns;
   if (method === "GET" && path.endsWith(`/cases/${CASE_ID}/versions`)) return [];
   if (method === "GET" && path.endsWith(`/cases/${CASE_ID}`)) return CASE_DETAIL;
+  if (method === "POST" && path.endsWith(`/case-preferences/${CASE_ID}/opened`)) {
+    return { case_id: CASE_ID, favorite: false, last_opened_at: "2026-10-04T00:00:00Z" };
+  }
   if (method === "POST" && path.endsWith("/debug-preflight")) {
     if (preflightOverride !== null) return preflightOverride;
     // 地址缺协议时服务端不会走到白名单判断，而是直接报“环境地址不合法”并建议去改环境。
@@ -266,7 +269,8 @@ function route(rawPath: string, method: string, body?: unknown): unknown {
   // 装配阶段的等待预算：这里等的是“用例编辑器挂载完成”，不是某个断言内容。
   // 整套测试并行跑十几个 jsdom 环境，CPU 争用会把同一段代码的墙上时间放大数倍
   // （与 test/setup.ts 记录的同一现象）。断言内容不因此放宽：期望的元素一字未改。
-  const SETUP_WAIT = { timeout: 20000 };
+  // 必须短于外层 15 秒测试门槛；否则装配失败只会报测试整体超时，丢失具体 waitFor/DOM 证据。
+  const SETUP_WAIT = { timeout: 5000 };
 
 /** 打开项目并选中用例，返回编辑器就绪后的容器。 */
 async function openCase(): Promise<void> {
@@ -276,7 +280,15 @@ async function openCase(): Promise<void> {
   await act(async () => {});
   // 等侧栏（目录／用例列表）真正挂载：项目选择到位不等于环境与目录已经读完。
   const browser = await screen.findByLabelText("用例目录");
-  fireEvent.click(await within(browser).findByRole("button", { name: /查询订单/ }));
+  const caseButton = await waitFor(() => {
+    const button = Array.from(browser.querySelectorAll<HTMLButtonElement>(".case-list button"))
+      .find((item) => item.textContent?.includes("查询订单"));
+    if (button === undefined) throw new Error("查询订单入口未挂载");
+    expect(button.type).toBe("button");
+    expect(button.textContent).toContain("查询订单");
+    return button;
+  }, SETUP_WAIT);
+  fireEvent.click(caseButton);
   await waitFor(
     () => expect((screen.getByLabelText("用例名称") as HTMLInputElement).value).toBe("查询订单"),
     SETUP_WAIT,
@@ -290,6 +302,7 @@ async function openCase(): Promise<void> {
     () => expect(calls.some((call) => call.method === "POST" && call.path.endsWith("/debug-preflight"))).toBe(true),
     SETUP_WAIT,
   );
+  expect(calls.filter((call) => call.method === "POST" && call.path.endsWith(`/case-preferences/${CASE_ID}/opened`))).toHaveLength(1);
 }
 
 /**
@@ -306,16 +319,21 @@ function environmentCollapseTrigger(panel: HTMLElement): HTMLElement {
 }
 
 async function openAdmin(): Promise<HTMLElement> {
-  fireEvent.click(screen.getByRole("button", { name: "环境配置" }));
+  const nav = Array.from(document.querySelectorAll<HTMLButtonElement>(".primary-nav .nav-item"))
+    .find((button) => button.textContent?.trim() === "环境配置");
+  if (nav === undefined) throw new Error("环境配置导航未挂载");
+  expect(nav.type).toBe("button");
+  fireEvent.click(nav);
   await act(async () => {});
-  const panel = screen.getByRole("region", { name: "环境配置" });
+  const panel = document.querySelector<HTMLElement>('section.content-page[aria-label="环境配置"]:not([hidden])');
   if (panel === null) throw new Error("管理入口未挂载");
-  const environmentTrigger = environmentCollapseTrigger(panel as HTMLElement);
+  expect(panel.getAttribute("aria-label")).toBe("环境配置");
+  const environmentTrigger = environmentCollapseTrigger(panel);
   if (environmentTrigger.getAttribute("aria-expanded") !== "true") {
     fireEvent.click(environmentTrigger);
     await waitFor(() => expect(environmentTrigger.getAttribute("aria-expanded")).toBe("true"));
   }
-  return panel as HTMLElement;
+  return panel;
 }
 
 /**
@@ -375,10 +393,14 @@ function selectedValueById(id: string): string {
 /** 发一次调试并等它显示真实结论，返回响应区。 */
 async function debugOnce(): Promise<HTMLElement> {
   fireEvent.click(screen.getByRole("button", { name: "发送" }));
-  await waitFor(() =>
-    expect(screen.getByRole("region", { name: "响应" }).textContent).toContain("200"),
-  );
-  return screen.getByRole("region", { name: "响应" });
+  const response = await waitFor(() => {
+    const current = document.querySelector<HTMLElement>('.workspace-editor:not([hidden]) [aria-label="响应"]');
+    if (current === null) throw new Error("活动编辑器响应区未挂载");
+    expect(current.getAttribute("aria-label")).toBe("响应");
+    expect(current.textContent).toContain("200");
+    return current;
+  });
+  return response;
 }
 
 beforeEach(() => {

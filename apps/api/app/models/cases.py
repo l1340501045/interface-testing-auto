@@ -22,6 +22,13 @@ class Folder(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ),
         project_fk("fk_folders_project"),
         project_object_fk(["parent_id"], "folders", "fk_folders_parent", ondelete="CASCADE"),
+        project_object_fk(
+            ["archive_operation_id"],
+            "asset_operations",
+            "fk_folders_archive_operation",
+            ondelete="RESTRICT",
+            use_alter=True,
+        ),
         {"comment": "用例目录，只负责组织与查找"},
     )
 
@@ -31,6 +38,12 @@ class Folder(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(200), nullable=False, comment="目录名称")
     normalized_name: Mapped[str] = mapped_column(String(200), nullable=False, comment="名称标准化，用于同级唯一")
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, comment="归档时间，空表示在用")
+    rev: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1", comment="目录乐观锁修订号"
+    )
+    archive_operation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True, comment="使目录进入当前归档态的资产操作；空表示活动态或旧归档记录"
+    )
 
 
 class Case(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -39,6 +52,13 @@ class Case(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UniqueConstraint("workspace_id", "project_id", "id", name="uq_cases_ws_project_id"),
         project_fk("fk_cases_project"),
         project_object_fk(["folder_id"], "folders", "fk_cases_folder", ondelete="SET NULL"),
+        project_object_fk(
+            ["archive_operation_id"],
+            "asset_operations",
+            "fk_cases_archive_operation",
+            ondelete="RESTRICT",
+            use_alter=True,
+        ),
         {"comment": "接口用例可编辑草稿"},
     )
 
@@ -51,6 +71,9 @@ class Case(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     rev: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1", comment="乐观锁修订号")
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="draft", server_default="draft", comment="状态：draft/archived"
+    )
+    archive_operation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True, comment="使本用例进入当前归档态的资产操作；空表示活动态或旧归档记录"
     )
 
 

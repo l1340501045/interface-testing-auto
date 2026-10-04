@@ -40,8 +40,13 @@ def purge_workspace(connection: psycopg.Connection, workspace_id: uuid.UUID) -> 
         "DELETE FROM app.runs WHERE workspace_id = %s",
         "DELETE FROM app.case_assertions WHERE workspace_id = %s",
         "DELETE FROM app.case_versions WHERE workspace_id = %s",
+        "DELETE FROM app.asset_archive_members WHERE workspace_id = %s",
+        "DELETE FROM app.asset_selections WHERE workspace_id = %s",
+        "DELETE FROM app.case_preferences WHERE workspace_id = %s",
+        "DELETE FROM app.case_saved_views WHERE workspace_id = %s",
         "DELETE FROM app.cases WHERE workspace_id = %s",
         "DELETE FROM app.folders WHERE workspace_id = %s",
+        "DELETE FROM app.asset_operations WHERE workspace_id = %s",
         # 凭证链按引用方向自外向内删除。顺序不能颠倒：身份通过 current_set_id
         # 引用集合（NO ACTION），先删集合会被外键拒绝；而删除身份会级联清理
         # 其配置版本、集合与集合绑定。

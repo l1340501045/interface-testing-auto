@@ -170,11 +170,12 @@ interface MountProps {
   /** 当前内容键：切换环境或改请求都会换它。 */
   inputKey: string;
   editorKey?: string;
+  sourceCaseId?: string;
 }
 
 function mount(principalId = USER_ID, configEpoch = 0) {
   return renderHook(
-    ({ epoch, principal, inputKey, editorKey }: MountProps) => {
+    ({ epoch, principal, inputKey, editorKey, sourceCaseId }: MountProps) => {
       // 真实 App 里这是同一个时钟：props 渲染时会读到当前值。测试需要单独制造
       // “时钟已变、props 仍旧”的窗口，因此时钟放在外面，由用例自行推进。
       if (epoch === epochClock.current + 1) epochClock.current = epoch;
@@ -187,6 +188,7 @@ function mount(principalId = USER_ID, configEpoch = 0) {
         inputKey,
         undefined,
         () => epochClock.current,
+        sourceCaseId,
       );
     },
     {
@@ -195,6 +197,7 @@ function mount(principalId = USER_ID, configEpoch = 0) {
         principal: principalId,
         inputKey: submissionKey(submission()),
         editorKey: "instance-1",
+        sourceCaseId: undefined as string | undefined,
       },
     },
   );
@@ -359,6 +362,20 @@ describe("R4 F5 签发前复核同步配置", () => {
 });
 
 describe("R4 F2 确认受理失败不证明未受理", () => {
+  it("无来源受理不明后首次保存，原键确认仍保持source_case_id缺席", async () => {
+    gated.add("runs");
+    const { result, rerender } = mount();
+    act(() => { void result.current.start(submission(), "测试环境"); });
+    await waitFor(() => expect(runs()).toHaveLength(1));
+    await act(async () => { fail("runs", new NetworkError("连接中断")); });
+    rerender({ epoch: 0, principal: USER_ID, inputKey: submissionKey(submission()), editorKey: "instance-1", sourceCaseId: "saved-case" });
+    gated.add("runs");
+    act(() => { void result.current.retryAcceptance(); });
+    await waitFor(() => expect(runs()).toHaveLength(2));
+    expect(runs()[0].body).not.toHaveProperty("source_case_id");
+    expect(runs()[1].body).toEqual(runs()[0].body);
+    expect(keys()[1]).toBe(keys()[0]);
+  });
   it("首次受理不明 → 配置变化 → 确认收到 403：仍是 unknown，原键保留", async () => {
     gated.add("runs");
     const { result, rerender } = mount();
@@ -373,7 +390,7 @@ describe("R4 F2 确认受理失败不证明未受理", () => {
     expect(result.current.phase).toBe("acceptance_unknown");
 
     // 配置变化：unknown 必须保留（改动草稿不证明上一次没被受理）。
-    rerender({ epoch: 1, principal: USER_ID, inputKey: submissionKey(submission()), editorKey: "instance-1" });
+    rerender({ epoch: 1, principal: USER_ID, inputKey: submissionKey(submission()), editorKey: "instance-1", sourceCaseId: undefined });
     await act(async () => {});
     expect(result.current.phase).toBe("acceptance_unknown");
 
@@ -428,6 +445,7 @@ describe("R3-11 待确认授权随内容变化撤销", () => {
       principal: USER_ID,
       inputKey: submissionKey({ ...submission(), environmentId: otherEnv }),
       editorKey: "instance-1",
+      sourceCaseId: undefined,
     });
     await act(async () => {});
 
@@ -452,6 +470,7 @@ describe("R3-11 待确认授权随内容变化撤销", () => {
       principal: USER_ID,
       inputKey: submissionKey(submission()),
       editorKey: "instance-1",
+      sourceCaseId: undefined,
     });
     await act(async () => {});
     expect(result.current.phase).toBe("awaiting_authorization");
@@ -522,7 +541,7 @@ describe("R3-04 受理不明在配置变化后仍然保留", () => {
 
     // 用户改了环境／变量 → 配置世代推进。受理不明**不能**因此被清成空闲：
     // 改动草稿并不证明上一次没被受理。
-    rerender({ epoch: 1, principal: USER_ID, inputKey: submissionKey(submission()), editorKey: "instance-1" });
+    rerender({ epoch: 1, principal: USER_ID, inputKey: submissionKey(submission()), editorKey: "instance-1", sourceCaseId: undefined });
     await act(async () => {});
     expect(result.current.operationActive).toBe(true);
 
@@ -641,6 +660,7 @@ describe("R3-15 主体变化使旧操作失效", () => {
       principal: "11111111-1111-4111-8111-111111111111",
       inputKey: submissionKey(submission()),
       editorKey: "instance-1",
+      sourceCaseId: undefined,
     });
     await act(async () => {});
     expect(result.current.phase).toBe("idle");
@@ -668,6 +688,7 @@ describe("R3-15 主体变化使旧操作失效", () => {
       principal: "11111111-1111-4111-8111-111111111111",
       inputKey: submissionKey(submission()),
       editorKey: "instance-1",
+      sourceCaseId: undefined,
     });
     await act(async () => {});
     expect(result.current.phase).not.toBe("preflighting");

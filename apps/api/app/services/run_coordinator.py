@@ -13,14 +13,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ..api import deps
 from ..config import Settings
 from ..kernel.assertion_spec import AssertionSpecError, validate_assertions
 from ..kernel.environment_url import EnvironmentUrlError, check_base_url
 from ..kernel.request_spec import RequestSpecError, validate_request
 from ..kernel.target_policy import TargetGuard, TargetPolicyError
 from ..models import (
+    Case,
     CaseVersion,
     Environment,
     IdempotencyRecord,
@@ -29,7 +32,9 @@ from ..models import (
     RunnerPool,
     RunnerPoolProjectGrant,
 )
+from . import asset_lifecycle
 from .debug_context import build_context_binding
+from .folder_graph import blocked_folder_ids, invalid_folder_ids
 from .permissions import require
 from .variable_inputs import merged_variables
 
@@ -51,6 +56,7 @@ class RunRequest:
     case_version_id: uuid.UUID | None = None
     debug_snapshot: dict | None = None
     idempotency_key: str | None = None
+    source_case_id: uuid.UUID | None = None
 
 
 @dataclass
@@ -65,6 +71,8 @@ def _request_hash(payload: RunRequest) -> str:
         "case_version_id": str(payload.case_version_id) if payload.case_version_id else None,
         "debug_snapshot": payload.debug_snapshot,
     }
+    if payload.source_case_id is not None:
+        body["source_case_id"] = str(payload.source_case_id)
     return hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
@@ -182,8 +190,8 @@ def resolve_target(
 
 
 def _load_source(
-    session: Session, scope_project_id: uuid.UUID, payload: RunRequest
-) -> tuple[str, uuid.UUID | None, dict, list[dict]]:
+    session: Session, scope: deps.ProjectScope, payload: RunRequest
+) -> tuple[str, uuid.UUID | None, uuid.UUID | None, dict, list[dict]]:
     """确定运行目标：已发布版本或临时调试快照，两者互斥。"""
     if (payload.case_version_id is None) == (payload.debug_snapshot is None):
         raise RunRejected(
@@ -193,12 +201,14 @@ def _load_source(
     if payload.case_version_id is not None:
         version = session.scalar(
             select(CaseVersion).where(
+                CaseVersion.workspace_id == scope.workspace_id,
                 CaseVersion.id == payload.case_version_id,
-                CaseVersion.project_id == scope_project_id,
-            )
+                CaseVersion.project_id == scope.project_id,
+            ).execution_options(populate_existing=True)
         )
         if version is None:
             raise RunRejected("case_version_missing", "用例版本不存在或不属于本项目。")
+        _require_case_available(session, scope, version.case_id)
         try:
             request = validate_request(version.request)
         except RequestSpecError as error:
@@ -207,7 +217,7 @@ def _load_source(
             assertions = validate_assertions(_load_version_assertions(session, version.id), request)
         except AssertionSpecError as error:
             raise RunRejected("case_invalid", f"用例版本断言配置无效：{error}") from error
-        return "case_version", version.id, request, assertions
+        return "case_version", version.id, None, request, assertions
 
     snapshot = payload.debug_snapshot or {}
     try:
@@ -219,7 +229,35 @@ def _load_source(
         validate_assertions(assertions, request)
     except AssertionSpecError as error:
         raise RunRejected("case_invalid", f"调试断言配置无效：{error}") from error
-    return "debug_snapshot", None, request, assertions
+    if payload.source_case_id is not None:
+        _require_case_available(session, scope, payload.source_case_id)
+    return "debug_snapshot", None, payload.source_case_id, request, assertions
+
+
+def _require_case_available(
+    session: Session, scope: deps.ProjectScope, case_id: uuid.UUID
+) -> Case:
+    case = session.scalar(
+        select(Case).where(
+            Case.workspace_id == scope.workspace_id,
+            Case.id == case_id,
+            Case.project_id == scope.project_id,
+        ).execution_options(populate_existing=True)
+    )
+    if case is None:
+        raise RunRejected("case_missing", "来源用例不存在或不属于本项目。")
+    if case.status == "archived":
+        raise RunRejected("case_archived", "来源用例已归档，请恢复后再执行。")
+    blocked = blocked_folder_ids(scope)
+    invalid = invalid_folder_ids(scope)
+    if case.folder_id is not None and session.scalar(
+        select(Case.id).where(
+            Case.id == case.id,
+            (Case.folder_id.in_(select(blocked.c.id)) | Case.folder_id.in_(select(invalid.c.id))),
+        )
+    ):
+        raise RunRejected("folder_unavailable", "来源用例所在目录不可用，请先整理目录。")
+    return case
 
 
 def _load_version_assertions(session: Session, version_id: uuid.UUID) -> list[dict]:
@@ -250,23 +288,26 @@ def create_run(
     session: Session,
     settings: Settings,
     *,
-    workspace_id: uuid.UUID,
-    project_id: uuid.UUID,
-    role: str,
-    principal_id: uuid.UUID,
+    scope: deps.ProjectScope,
     payload: RunRequest,
 ) -> Run:
-    require(role, "execute")
+    require(scope.role, "execute")
 
     if payload.idempotency_key:
-        existing = _idempotent_run(session, workspace_id, principal_id, payload)
+        existing = _idempotent_run(session, scope.workspace_id, scope.project_id, scope.principal.user_id, payload)
+        if existing is not None:
+            return existing
+
+    scope = asset_lifecycle.lock_project_and_reauthorize(session, scope, "execute")
+    if payload.idempotency_key:
+        existing = _idempotent_run(session, scope.workspace_id, scope.project_id, scope.principal.user_id, payload)
         if existing is not None:
             return existing
 
     environment = session.scalar(
         select(Environment).where(
             Environment.id == payload.environment_id,
-            Environment.project_id == project_id,
+            Environment.project_id == scope.project_id,
             Environment.status == "active",
         )
     )
@@ -274,7 +315,7 @@ def create_run(
         raise RunRejected("environment_missing", "环境不存在或已归档。")
 
     resolved = resolve_pool(session, settings, environment)
-    target_type, case_version_id, request, assertions = _load_source(session, project_id, payload)
+    target_type, case_version_id, debug_source_case_id, request, assertions = _load_source(session, scope, payload)
     _, target_origin = resolve_target(request, environment, resolved.guard)
 
     # 调试快照没有版本号可固定，只能靠内容摘要绑定授权；摘要必须在创建事务里
@@ -290,19 +331,20 @@ def create_run(
     # 产生的”。标记用受保护主密钥做 HMAC，不落内容摘要，详见 debug_context。
     context_binding = build_context_binding(
         settings.load_secret_key(),
-        workspace_id=workspace_id,
-        project_id=project_id,
-        principal_id=principal_id,
+        workspace_id=scope.workspace_id,
+        project_id=scope.project_id,
+        principal_id=scope.principal.user_id,
         request=request,
         assertions=assertions,
         variables=frozen_variables,
     )
     run = Run(
-        workspace_id=workspace_id,
-        project_id=project_id,
+        workspace_id=scope.workspace_id,
+        project_id=scope.project_id,
         target_type=target_type,
         case_version_id=case_version_id,
         debug_snapshot=payload.debug_snapshot if target_type == "debug_snapshot" else None,
+        debug_source_case_id=debug_source_case_id,
         environment_id=environment.id,
         trigger="manual",
         state="queued",
@@ -311,7 +353,7 @@ def create_run(
         business_deadline_at=business_deadline,
         hard_deadline_at=business_deadline + timedelta(milliseconds=settings.cleanup_budget_ms),
         cleanup_budget_ms=settings.cleanup_budget_ms,
-        created_by=principal_id,
+        created_by=scope.principal.user_id,
         snapshot={
             "environment": {
                 "id": str(environment.id),
@@ -333,8 +375,8 @@ def create_run(
 
     session.add(
         Job(
-            workspace_id=workspace_id,
-            project_id=project_id,
+            workspace_id=scope.workspace_id,
+            project_id=scope.project_id,
             run_id=run.id,
             pool_id=resolved.pool.id,
             state="queued",
@@ -344,9 +386,9 @@ def create_run(
     if payload.idempotency_key:
         session.add(
             IdempotencyRecord(
-                workspace_id=workspace_id,
-                project_id=project_id,
-                principal_id=principal_id,
+                workspace_id=scope.workspace_id,
+                project_id=scope.project_id,
+                principal_id=scope.principal.user_id,
                 action="run:create",
                 idempotency_key=payload.idempotency_key,
                 request_hash=_request_hash(payload),
@@ -354,12 +396,31 @@ def create_run(
                 expires_at=now + timedelta(hours=_IDEMPOTENCY_TTL_HOURS),
             )
         )
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError as error:
+        session.rollback()
+        if not payload.idempotency_key:
+            raise
+        existing = _idempotent_run(
+            session,
+            scope.workspace_id,
+            scope.project_id,
+            scope.principal.user_id,
+            payload,
+        )
+        if existing is not None:
+            return existing
+        raise RunRejected(
+            "idempotency_conflict",
+            "幂等键并发用于另一项运行，已回滚本次受理。",
+        ) from error
     return run
 
 
 def _idempotent_run(
-    session: Session, workspace_id: uuid.UUID, principal_id: uuid.UUID, payload: RunRequest
+    session: Session, workspace_id: uuid.UUID, project_id: uuid.UUID,
+    principal_id: uuid.UUID, payload: RunRequest
 ) -> Run | None:
     record = session.scalar(
         select(IdempotencyRecord).where(
@@ -373,6 +434,15 @@ def _idempotent_run(
         return None
     if record.request_hash != _request_hash(payload):
         raise RunRejected("idempotency_conflict", "幂等键已用于不同的请求内容，已拒绝。")
-    if record.result_ref is None:
-        return None
-    return session.get(Run, uuid.UUID(record.result_ref))
+    if record.project_id != project_id or record.result_ref is None:
+        raise RunRejected("idempotency_result_unavailable", "原运行结果不可用，已拒绝重新执行。")
+    try:
+        run_id = uuid.UUID(record.result_ref)
+    except ValueError as error:
+        raise RunRejected("idempotency_result_unavailable", "原运行结果不可用，已拒绝重新执行。") from error
+    run = session.scalar(select(Run).where(
+        Run.id == run_id, Run.workspace_id == workspace_id, Run.project_id == project_id,
+    ))
+    if run is None:
+        raise RunRejected("idempotency_result_unavailable", "原运行结果不可用，已拒绝重新执行。")
+    return run

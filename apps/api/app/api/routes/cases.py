@@ -30,6 +30,8 @@ from ...kernel.lossless_json import LosslessJSONError, loads
 from ...kernel.target_policy import TargetPolicyError, normalize_origin
 from ...kernel.valueliteral import ValueLiteral, ValueLiteralError
 from ...models import Case, CaseAssertion, CaseVersion, Folder
+from ...services import asset_lifecycle
+from ...services.folder_graph import blocked_folder_ids, invalid_folder_ids
 from .. import deps
 from ..errors import ApiError, bad_request, conflict, not_found
 from ..request_contract import is_v2, require_v2_capability
@@ -56,6 +58,22 @@ _VIEW_SCOPE = Depends(deps.view_scope)
 _EDIT_SCOPE = Depends(deps.edit_scope)
 
 
+def _gate(session: Session, scope: deps.ProjectScope) -> deps.ProjectScope:
+    try:
+        return asset_lifecycle.lock_project_and_reauthorize(session, scope, "edit")
+    except asset_lifecycle.AssetLifecycleError as error:
+        raise ApiError(error.status_code, error.code, error.message) from error
+
+
+def _ensure_source_folder_available(
+    session: Session, scope: deps.ProjectScope, folder_id: uuid.UUID | None
+) -> None:
+    try:
+        asset_lifecycle.resolve_available_folder(session, scope, folder_id)
+    except asset_lifecycle.AssetLifecycleError as error:
+        raise conflict("asset_unavailable", error.message) from error
+
+
 def _etag(rev: int) -> str:
     return f'"{rev}"'
 
@@ -75,7 +93,11 @@ def _check_precondition(if_match: str | None, rev: int) -> None:
 
 
 def _get_case(session: Session, scope: deps.ProjectScope, case_id: uuid.UUID) -> Case:
-    case = session.scalar(select(Case).where(Case.id == case_id, Case.project_id == scope.project_id))
+    case = session.scalar(select(Case).where(
+        Case.workspace_id == scope.workspace_id,
+        Case.id == case_id,
+        Case.project_id == scope.project_id,
+    ))
     if case is None:
         raise not_found("用例不存在")
     return case
@@ -90,8 +112,13 @@ def _get_case_locked(session: Session, scope: deps.ProjectScope, case_id: uuid.U
     """
     case = session.scalar(
         select(Case)
-        .where(Case.id == case_id, Case.project_id == scope.project_id)
+        .where(
+            Case.workspace_id == scope.workspace_id,
+            Case.id == case_id,
+            Case.project_id == scope.project_id,
+        )
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if case is None:
         raise not_found("用例不存在")
@@ -112,12 +139,25 @@ def _resolve_folder(session: Session, scope: deps.ProjectScope, folder_id: uuid.
     失效目录上的用例，按目录过滤时哪一边都不出现。
     """
     folder = session.scalar(
-        select(Folder).where(Folder.id == folder_id, Folder.project_id == scope.project_id)
+        select(Folder).where(
+            Folder.workspace_id == scope.workspace_id,
+            Folder.id == folder_id,
+            Folder.project_id == scope.project_id,
+        )
     )
     if folder is None:
         raise not_found("目录不存在")
     if folder.archived_at is not None:
         raise bad_request("folder_archived", "该目录已归档，不能再把用例放进去。")
+    blocked = blocked_folder_ids(scope)
+    invalid = invalid_folder_ids(scope)
+    if session.scalar(
+        select(Folder.id).where(
+            Folder.id == folder.id,
+            (Folder.id.in_(select(blocked.c.id)) | Folder.id.in_(select(invalid.c.id))),
+        )
+    ):
+        raise conflict("folder_unavailable", "该目录祖先不可用，请先整理目录。")
     return folder
 
 
@@ -185,6 +225,7 @@ def create_case(
     scope: deps.ProjectScope = _EDIT_SCOPE,
     session: Session = Depends(get_db),
 ) -> CaseOut:
+    scope = _gate(session, scope)
     require_v2_capability(request_contract, needed=is_v2(payload.request))
     if payload.folder_id is not None:
         _resolve_folder(session, scope, payload.folder_id)
@@ -236,7 +277,11 @@ def update_case(
     scope: deps.ProjectScope = _EDIT_SCOPE,
     session: Session = Depends(get_db),
 ) -> CaseOut:
+    scope = _gate(session, scope)
     case = _get_case_locked(session, scope, case_id)
+    if case.status == "archived":
+        raise conflict("asset_unavailable", "归档用例必须恢复后才能编辑。")
+    _ensure_source_folder_available(session, scope, case.folder_id)
     _check_precondition(if_match, case.rev)
     existing_v2 = is_v2(case.request)
     submitted_v2 = payload.request is not None and is_v2(payload.request)
@@ -293,11 +338,10 @@ def archive_case(
     scope: deps.ProjectScope = _EDIT_SCOPE,
     session: Session = Depends(get_db),
 ) -> Response:
-    case = _get_case(session, scope, case_id)
-    case.status = "archived"
-    case.rev += 1
-    deps.commit(session)
-    return Response(status_code=204)
+    raise conflict(
+        "asset_operation_required",
+        "归档已迁移到资产操作，请先预览并通过 asset-operations 确认。",
+    )
 
 
 # —— 发布与版本 ——
@@ -328,7 +372,11 @@ def publish_case(
     # 它固化的是哪个草稿修订：否则“用户看到草稿 v3、点发布”与“另一个保存把草稿
     # 改成 v4”之间的窗口会让 v4 被悄悄发布出去，而页面上显示的是 v3 的内容。
     # 条件更新与快照写入在同一行锁内完成，两个窗口各有一条测试。
+    scope = _gate(session, scope)
     case = _get_case_locked(session, scope, case_id)
+    if case.status == "archived":
+        raise conflict("asset_unavailable", "归档用例必须恢复后才能发布。")
+    _ensure_source_folder_available(session, scope, case.folder_id)
     require_v2_capability(request_contract, needed=is_v2(case.request))
     if case.rev != payload.draft_rev:
         raise conflict(

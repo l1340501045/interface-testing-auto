@@ -6,9 +6,8 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Header, Response
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
@@ -26,9 +25,16 @@ from ...models import (
     RunnerPoolProjectGrant,
     WorkspaceMembership,
 )
+from ...services import asset_lifecycle
+from ...services.folder_graph import (
+    begin_consistent_read,
+    blocked_folder_ids,
+    folder_descendants,
+    invalid_folder_ids,
+)
 from ...services.permissions import require
 from .. import deps
-from ..errors import bad_request, conflict, not_found
+from ..errors import ApiError, bad_request, conflict, not_found
 from ..schemas import (
     EnvironmentCreate,
     EnvironmentOut,
@@ -52,6 +58,31 @@ router = APIRouter(tags=["项目配置"])
 _EDIT_SCOPE = Depends(deps.edit_scope)
 _VIEW_SCOPE = Depends(deps.view_scope)
 _POOL_ADMIN_SCOPE = Depends(deps.pool_admin_scope)
+
+
+def _asset_gate(session: Session, scope: deps.ProjectScope) -> deps.ProjectScope:
+    try:
+        return asset_lifecycle.lock_project_and_reauthorize(session, scope, "edit")
+    except asset_lifecycle.AssetLifecycleError as error:
+        raise ApiError(error.status_code, error.code, error.message) from error
+
+
+def _folder_precondition(if_match: str | None, rev: int) -> None:
+    if if_match is None:
+        raise ApiError(428, "precondition_required", "请先读取最新目录修订再修改。")
+    if if_match.strip() not in {"*", f'"{rev}"'}:
+        raise conflict("revision_conflict", "目录已被其他操作更新，请刷新后重试。")
+
+
+def _available_folder(
+    session: Session, scope: deps.ProjectScope, folder_id: uuid.UUID
+) -> Folder:
+    try:
+        folder = asset_lifecycle.resolve_available_folder(session, scope, folder_id)
+    except asset_lifecycle.AssetLifecycleError as error:
+        raise ApiError(error.status_code, error.code, error.message) from error
+    assert folder is not None
+    return folder
 
 
 # —— 工作空间 ——
@@ -551,8 +582,15 @@ def put_variables(
 # —— 目录 ——
 
 
-def _folder_out(item: Folder) -> FolderOut:
-    return FolderOut(id=item.id, parent_id=item.parent_id, name=item.name, archived_at=item.archived_at)
+def _folder_out(item: Folder, availability: str | None = None) -> FolderOut:
+    return FolderOut(
+        id=item.id,
+        parent_id=item.parent_id,
+        name=item.name,
+        archived_at=item.archived_at,
+        rev=item.rev,
+        availability=availability or ("archived" if item.archived_at is not None else "available"),
+    )
 
 
 def _normalize(value: str) -> str:
@@ -565,12 +603,25 @@ def _normalize(value: str) -> str:
 def list_folders(
     scope: deps.ProjectScope = _VIEW_SCOPE, session: Session = Depends(get_db)
 ) -> list[FolderOut]:
-    items = session.scalars(
+    scope = begin_consistent_read(session, scope)
+    items = list(session.scalars(
         select(Folder)
         .where(Folder.project_id == scope.project_id, Folder.archived_at.is_(None))
         .order_by(Folder.name)
-    )
-    return [_folder_out(item) for item in items]
+    ))
+    blocked = blocked_folder_ids(scope)
+    invalid = invalid_folder_ids(scope)
+    blocked_ids = set(session.scalars(select(blocked.c.id)))
+    invalid_ids = set(session.scalars(select(invalid.c.id)))
+    return [
+        _folder_out(
+            item,
+            "invalid_parent_chain"
+            if item.id in invalid_ids
+            else ("ancestor_archived" if item.id in blocked_ids else "available"),
+        )
+        for item in items
+    ]
 
 
 @router.post(
@@ -583,8 +634,9 @@ def create_folder(
     scope: deps.ProjectScope = _EDIT_SCOPE,
     session: Session = Depends(get_db),
 ) -> FolderOut:
+    scope = _asset_gate(session, scope)
     if payload.parent_id is not None:
-        _get_folder(session, scope, payload.parent_id)
+        _available_folder(session, scope, payload.parent_id)
     normalized = _normalize(payload.name)
     duplicate = session.scalar(
         select(Folder).where(
@@ -615,18 +667,39 @@ def create_folder(
 def update_folder(
     folder_id: uuid.UUID,
     payload: FolderUpdate,
+    if_match: str | None = Header(default=None, alias="If-Match"),
     scope: deps.ProjectScope = _EDIT_SCOPE,
     session: Session = Depends(get_db),
 ) -> FolderOut:
-    folder = _get_folder(session, scope, folder_id)
+    scope = _asset_gate(session, scope)
+    folder = session.scalar(
+        select(Folder)
+        .where(
+            Folder.workspace_id == scope.workspace_id,
+            Folder.id == folder_id,
+            Folder.project_id == scope.project_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if folder is None:
+        raise not_found("目录不存在")
+    _folder_precondition(if_match, folder.rev)
+    if folder.archived_at is not None:
+        raise conflict("asset_unavailable", "归档目录必须恢复后才能修改。")
     if payload.name is not None:
         folder.name = payload.name
         folder.normalized_name = _normalize(payload.name)
-    if payload.parent_id is not None:
+    if "parent_id" in payload.model_fields_set:
         if payload.parent_id == folder_id:
             raise bad_request("folder_cycle", "目录不能作为自己的父目录")
-        _get_folder(session, scope, payload.parent_id)
+        if payload.parent_id is not None:
+            _available_folder(session, scope, payload.parent_id)
+            descendants = folder_descendants(scope, folder_id)
+            if session.scalar(select(descendants.c.id).where(descendants.c.id == payload.parent_id)):
+                raise bad_request("folder_cycle", "目录不能移动到自己的后代目录中。")
         folder.parent_id = payload.parent_id
+    folder.rev += 1
     deps.commit(session)
     return _folder_out(folder)
 
@@ -639,15 +712,19 @@ def archive_folder(
     scope: deps.ProjectScope = _EDIT_SCOPE,
     session: Session = Depends(get_db),
 ) -> Response:
-    folder = _get_folder(session, scope, folder_id)
-    folder.archived_at = datetime.now(UTC)
-    deps.commit(session)
-    return Response(status_code=204)
+    raise conflict(
+        "asset_selection_required",
+        "目录归档必须先预览完整范围并通过资产操作确认。",
+    )
 
 
 def _get_folder(session: Session, scope: deps.ProjectScope, folder_id: uuid.UUID) -> Folder:
     folder = session.scalar(
-        select(Folder).where(Folder.id == folder_id, Folder.project_id == scope.project_id)
+        select(Folder).where(
+            Folder.workspace_id == scope.workspace_id,
+            Folder.id == folder_id,
+            Folder.project_id == scope.project_id,
+        )
     )
     if folder is None:
         raise not_found("目录不存在")

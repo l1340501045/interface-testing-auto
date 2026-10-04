@@ -92,7 +92,99 @@ export interface Folder {
   parent_id: string | null;
   name: string;
   archived_at: string | null;
+  rev: number;
+  availability: "available" | "ancestor_archived" | "invalid_parent_chain";
 }
+
+export type CaseAssetState = "active" | "archived" | "all";
+export type CaseCollection = "all" | "favorites" | "recent";
+export type CaseLibrarySort =
+  | "updated_desc"
+  | "name_asc"
+  | "name_desc"
+  | "method_asc"
+  | "method_desc"
+  | "recent_desc";
+
+export interface CaseLibraryFilters {
+  schema_version: 1;
+  q?: string;
+  method?: string;
+  state: CaseAssetState;
+  folder: "all" | "unfiled" | "exact";
+  folder_id: string | null;
+  include_descendants: boolean;
+  collection: CaseCollection;
+  sort: CaseLibrarySort;
+}
+
+export interface CaseLibraryItem {
+  id: string;
+  name: string;
+  method: string;
+  path: string;
+  folder_id: string | null;
+  folder_path: Array<{ id: string; name: string }> | null;
+  asset_status: "active" | "archived";
+  availability: "available" | "case_archived" | "folder_unavailable";
+  draft_rev: number;
+  updated_at: string;
+  latest_version: number | null;
+  favorite: boolean;
+  last_opened_at: string | null;
+}
+
+export interface CaseLibraryPage {
+  items: CaseLibraryItem[];
+  total: number;
+  next_cursor: string | null;
+}
+
+export interface AssetFolder {
+  id: string;
+  name: string;
+  parent_id: string | null;
+  rev: number;
+  archived_at: string | null;
+  availability: "available" | "archived" | "ancestor_archived" | "invalid_parent_chain";
+  has_children: boolean;
+  archive_operation_id: string | null;
+  archive_root_id: string | null;
+  restore_mode: "batch_root" | "locate_root" | "legacy_single" | "unavailable" | null;
+  ancestor_path: Array<{ id: string; name: string }>;
+}
+
+export interface AssetFolderPage {
+  items: AssetFolder[];
+  total: number;
+  next_cursor: string | null;
+}
+
+export interface CasePreference {
+  case_id: string;
+  favorite: boolean;
+  last_opened_at: string | null;
+}
+
+export interface CaseSavedView {
+  id: string;
+  name: string;
+  filters: CaseLibraryFilters;
+  rev: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export type AssetAction = "case_copy" | "move" | "archive" | "restore" | "folder_archive" | "folder_restore";
+export type AssetResourceType = "case" | "folder";
+export interface AssetSelectionItem { resource_type: AssetResourceType; id: string; rev: number | null; state: "active" | "archived" | null; name: string | null; parent_id: string | null; folder_id: string | null; outcome: "eligible" | "excluded"; code: string | null; }
+export interface AssetSelection { selection_id: string; schema_version: 1; action: AssetAction; mode: "explicit" | "filter" | "folder"; workspace_id: string; project_id: string; principal_id: string; created_at: string; expires_at: string; counts: { selected: number; eligible: number; excluded: number; cases: number; folders: number }; root: { resource_type: "folder"; id: string; expected_rev: number } | null; preview_items: AssetSelectionItem[]; excluded_items: AssetSelectionItem[]; }
+export interface AssetMetadata { id: string; resource_type: AssetResourceType; name: string; rev: number; state: "active" | "archived"; folder_id: string | null; parent_id: string | null; archived_at: string | null; }
+export interface AssetOperationItem { resource_type: AssetResourceType; id: string; outcome: "succeeded" | "no_change" | "conflict" | "not_found_or_inaccessible" | "invalid_target"; code: string | null; message: string; new_rev: number | null; asset: AssetMetadata | null; }
+export type AssetOperationResult =
+  | { result_kind: "completed"; selection_id: string | null; root: { resource_type: "folder"; id: string } | null; counts: { input: number; succeeded: number; no_change: number; conflict: number; failed: number }; items: AssetOperationItem[]; members: Array<{ resource_type: AssetResourceType; id: string; before_rev: number; after_rev: number; original_parent_id: string | null; before_state: "active" | "archived" }> }
+  | { result_kind: "rejected"; selection_id: string | null; code: string; message: string; no_asset_changes: true; conflicts: Array<{ resource_type: AssetResourceType; id: string | null; code: string; message: string; current_rev: number | null }> };
+export interface AssetOperation { operation_id: string; operation_key: string; action: AssetAction; workspace_id: string; project_id: string; principal_id: string; result_schema_version: 1; created_at: string; result: AssetOperationResult; }
 
 interface RequestSpecBase {
   method: string;
@@ -225,6 +317,7 @@ export interface RunSummary {
   id: string;
   target_type: string;
   case_version_id: string | null;
+  debug_source_case_id?: string | null;
   environment_id: string;
   state: string;
   outcome: string | null;
@@ -295,7 +388,9 @@ export type PreflightAction =
   | "manage_credentials"
   | "authorize"
   | "contact_admin"
-  | "configure_environment";
+  | "configure_environment"
+  | "restore_case"
+  | "organize_case";
 
 export type PreflightAuthState =
   | "none"

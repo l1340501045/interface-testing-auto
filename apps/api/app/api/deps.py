@@ -94,6 +94,40 @@ def authenticate(session: Session, settings: Settings, raw_token: str | None) ->
     )
 
 
+def reauthenticate_principal(session: Session, principal: Principal) -> Principal:
+    """在新的事务快照内重新核验原请求的账号与会话事实。
+
+    调用方已经持有首次认证产生的 user_id/session_id；这里不接受客户端补传身份，
+    只按这两个服务端冻结标识重读数据库。账号停用、原会话撤销、过期或改属其他
+    主体均立即失效，返回的新 Principal 也只包含本快照中的用户属性。
+    """
+    user = session.scalar(
+        select(User)
+        .where(User.id == principal.user_id)
+        .execution_options(populate_existing=True)
+    )
+    if user is None or user.status != "active":
+        raise unauthorized("账号不可用")
+    now = datetime.now(UTC)
+    login = session.scalar(
+        select(LoginSession).where(
+            LoginSession.id == principal.session_id,
+            LoginSession.user_id == user.id,
+            LoginSession.revoked_at.is_(None),
+            LoginSession.expires_at > now,
+        )
+    )
+    if login is None:
+        raise unauthorized("会话已失效，请重新登录")
+    return Principal(
+        user_id=user.id,
+        username=user.username,
+        display_name=user.display_name,
+        is_admin=user.is_admin,
+        session_id=login.id,
+    )
+
+
 def require_csrf(request: Request, session: Session, raw_token: str | None) -> None:
     """写请求必须携带与会话匹配的 CSRF 令牌（双提交）。"""
     if request.method in _CSRF_EXEMPT_METHODS:

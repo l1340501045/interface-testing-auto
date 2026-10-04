@@ -208,8 +208,8 @@ export async function apiSendWithMeta<T>(
   return { data: parse(result.body), etag: result.headers.get("ETag") };
 }
 
-export async function apiDelete(path: string): Promise<void> {
-  await send(`${API_PREFIX}${path}`, { method: "DELETE" });
+export async function apiDelete(path: string, options?: { headers?: Record<string, string>; signal?: AbortSignal }): Promise<void> {
+  await send(`${API_PREFIX}${path}`, { method: "DELETE", headers: options?.headers, signal: options?.signal });
 }
 
 export function projectPath(workspaceId: string, projectId: string, suffix: string): string {

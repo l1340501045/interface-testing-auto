@@ -15,7 +15,7 @@
 import { useState } from "react";
 import { Button, Collapse, Empty, Input, Space, Tree } from "antd";
 
-import { ApiError, apiDelete, apiSend, projectPath } from "../api/client";
+import { ApiError, apiSend, projectPath } from "../api/client";
 import type { Folder } from "../api/types";
 import { useLeaveReport } from "../hooks/leaveGuard";
 import { useCaseList } from "./useCases";
@@ -33,6 +33,7 @@ export function CaseBrowser({
   foldersError,
   onFoldersChanged,
   refreshToken,
+  onManageAssets,
 }: {
   workspaceId: string;
   projectId: string;
@@ -49,10 +50,12 @@ export function CaseBrowser({
   foldersError: string | null;
   onFoldersChanged: () => void;
   refreshToken: number;
+  onManageAssets?: () => void;
 }) {
   const [folderId, setFolderId] = useState<string | null>(null);
   const [newFolder, setNewFolder] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const selectedFolderAvailable = folderId === null || folders.some((folder) => folder.id === folderId && folder.availability === "available");
 
   const list = useCaseList(workspaceId, projectId, folderId, refreshToken);
 
@@ -74,23 +77,11 @@ export function CaseBrowser({
     }
   }
 
-  async function archiveFolder(id: string) {
-    setError(null);
-    try {
-      await apiDelete(projectPath(workspaceId, projectId, `/folders/${id}`));
-      if (folderId === id) setFolderId(null);
-      onFoldersChanged();
-      list.reload();
-    } catch (cause) {
-      setError(cause instanceof ApiError ? cause.message : "归档目录失败");
-    }
-  }
-
   return (
     <aside className="browser" aria-label="用例目录">
       <div className="browser-head">
         <h2>用例</h2>
-        <Button htmlType="button" type="primary" onClick={() => onCreate(folderId)} disabled={!canEdit}>
+        <Button htmlType="button" type="primary" onClick={() => onCreate(folderId)} disabled={!canEdit || !selectedFolderAvailable}>
           ＋新建用例
         </Button>
       </div>
@@ -112,7 +103,8 @@ export function CaseBrowser({
             { key: "__all__", title: "全部用例" },
             ...folders.map((folder) => ({
               key: folder.id,
-              title: <Space className="folder-item" size={4}><span>{folder.name}</span>{canEdit ? <Button htmlType="button" type="link" size="small" aria-label={`归档目录 ${folder.name}`} onClick={(event) => { event.stopPropagation(); void archiveFolder(folder.id); }}>归档</Button> : null}</Space>,
+              disabled: folder.availability !== "available",
+              title: <Space className="folder-item" size={4}><span>{folder.name}{folder.availability === "available" ? "" : "（不可用）"}</span>{canEdit && folder.availability === "available" && onManageAssets ? <Button htmlType="button" type="link" size="small" aria-label={`管理目录 ${folder.name}`} onClick={(event) => { event.stopPropagation(); onManageAssets(); }}>管理</Button> : null}</Space>,
             })),
           ]}
         />

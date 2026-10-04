@@ -72,6 +72,10 @@ function actionLabel(action: PreflightIssue["action"]): string {
       return "联系身份管理员";
     case "configure_environment":
       return "前往环境设置";
+    case "restore_case":
+      return "前往用例库恢复";
+    case "organize_case":
+      return "前往用例库整理";
     default:
       return "处理后再试";
   }
@@ -96,6 +100,8 @@ export function SendBar({
   preflighting,
   onOpenAdmin,
   onOpenEnvironment,
+  onRestoreCase,
+  onOrganizeCase,
   canAuthorize,
   onSubmitAuthorization,
   onCancelAuthorization,
@@ -129,6 +135,8 @@ export function SendBar({
    * 去凭证列表——两者不是同一个地方。缺省时退回 `onOpenAdmin`，因此老调用点不需要改动。
    */
   onOpenEnvironment?: () => void;
+  onRestoreCase?: () => void;
+  onOrganizeCase?: () => void;
   canAuthorize: boolean;
   /** 等待用户确认本次授权（此时普通发送入口不出现）。 */
   onSubmitAuthorization: () => void;
@@ -263,12 +271,12 @@ export function SendBar({
           {contentIssues.map((issue) => (
             <li key={issue.code}>
               <span>{issue.message}</span>
-              {issue.action === "configure_environment" ? (
+              {issue.action === "configure_environment" || issue.action === "restore_case" || issue.action === "organize_case" ? (
                 /*
                   环境类问题给**真能点的下一步**：只写一句“建议：前往环境设置”，用户还得自己
                   去侧栏里找那一段。按钮复用外壳已有的展开入口，不新建第二套管理界面。
                 */
-                <Button htmlType="button" type="link" onClick={openEnvironment}>
+                <Button htmlType="button" type="link" onClick={issue.action === "restore_case" ? onRestoreCase : issue.action === "organize_case" ? onOrganizeCase : openEnvironment}>
                   {actionLabel(issue.action)}
                 </Button>
               ) : (
