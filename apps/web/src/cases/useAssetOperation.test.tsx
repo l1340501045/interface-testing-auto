@@ -95,4 +95,41 @@ describe("资产操作控制器", () => {
     await act(async () => { await result.current.submit(payload, "asset:key-1"); });
     expect(result.current.state.phase).toBe("unknown");
   });
+  it("写入进入unknown后迟到preview成功不能覆盖原意图", async () => {
+    let releasePreview!: () => void;
+    const gate = new Promise<void>((resolve) => { releasePreview = resolve; });
+    let previewCalls = 0;
+    apiSendMock.mockImplementation((async (path: string, method: string, _body: unknown, parse: (raw: unknown) => unknown) => {
+      if (path === undefined) return undefined;
+      if (String(path).endsWith("/asset-selections")) { previewCalls += 1; if (previewCalls === 2) await gate; return parse({ ...selection, selection_id: previewCalls === 1 ? "selection-1" : "selection-2" }); }
+      if (String(path).endsWith("/asset-operations") && method === "POST") throw new ApiError(503, "unavailable", "结果不明", null);
+      throw new Error(`unexpected ${method} ${String(path)}`);
+    }) as never);
+    const { result } = renderHook(() => useAssetOperation("w", "p", "u", true), { wrapper });
+    await act(async () => { await result.current.preview(selectionBody); });
+    let late!: Promise<unknown>;
+    act(() => { late = result.current.preview(selectionBody); });
+    await act(async () => { await result.current.submit(payload, "asset:frozen"); });
+    expect(result.current.state).toMatchObject({ phase: "unknown", key: "asset:frozen", payload });
+    await act(async () => { releasePreview(); await late; });
+    expect(result.current.state).toMatchObject({ phase: "unknown", key: "asset:frozen", payload });
+  });
+  it("写入进入unknown后迟到preview错误不能覆盖原意图", async () => {
+    let rejectPreview!: () => void;
+    const gate = new Promise<void>((_resolve, reject) => { rejectPreview = () => reject(new Error("迟到预览失败")); });
+    let previewCalls = 0;
+    apiSendMock.mockImplementation((async (path: string, method: string, _body: unknown, parse: (raw: unknown) => unknown) => {
+      if (path === undefined) return undefined;
+      if (String(path).endsWith("/asset-selections")) { previewCalls += 1; if (previewCalls === 2) await gate; return parse(selection); }
+      if (String(path).endsWith("/asset-operations") && method === "POST") throw new ApiError(503, "unavailable", "结果不明", null);
+      throw new Error(`unexpected ${method} ${String(path)}`);
+    }) as never);
+    const { result } = renderHook(() => useAssetOperation("w", "p", "u", true), { wrapper });
+    await act(async () => { await result.current.preview(selectionBody); });
+    let late!: Promise<unknown>;
+    act(() => { late = result.current.preview(selectionBody); });
+    await act(async () => { await result.current.submit(payload, "asset:frozen-error"); });
+    await act(async () => { rejectPreview(); await late; });
+    expect(result.current.state).toMatchObject({ phase: "unknown", key: "asset:frozen-error", payload });
+  });
 });

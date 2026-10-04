@@ -21,6 +21,7 @@ export function useAssetOperation(workspaceId: string, projectId: string, princi
   const replace = useCallback((next: State) => { stateRef.current = next; setState(next); }, []);
   useLeaveReport(`asset-operation:${owner}`, { dirty: state.phase === "preview", busy: state.phase === "submitting" || state.phase === "unknown" });
   useEffect(() => { previewGeneration.current += 1; replace({ phase: "idle" }); }, [owner, replace]);
+  const writeActive = () => { const phase = stateRef.current.phase; return phase === "submitting" || phase === "unknown"; };
 
   const validate = useCallback((operation: AssetOperation, key: string, payload: AssetOperationPayload, preview: AssetSelection | null) => {
     if (operation.workspace_id !== workspaceId || operation.project_id !== projectId || operation.principal_id !== principalId || operation.operation_key !== key || operation.action !== payload.action) throw new Error("资产操作回执归属不匹配");
@@ -53,26 +54,27 @@ export function useAssetOperation(workspaceId: string, projectId: string, princi
     return operation;
   }, [principalId, projectId, workspaceId]);
 
-  const preview = useCallback(async (body: Record<string, unknown>) => {
+  const preview = useCallback(async (body: Record<string, unknown>, isCurrent: () => boolean = () => true) => {
     if (!active || stateRef.current.phase === "submitting" || stateRef.current.phase === "unknown") return null;
     previewGeneration.current += 1;
     const generation = previewGeneration.current;
     try {
       const value = await apiSend(projectPath(workspaceId, projectId, "/asset-selections"), "POST", body, toAssetSelection);
       if (value.workspace_id !== workspaceId || value.project_id !== projectId || value.principal_id !== principalId || value.action !== body.action) throw new Error("资产预览归属不匹配");
+      if (value.mode !== body.mode) throw new Error("资产预览模式与请求不匹配");
       if (value.mode === "explicit") {
         const requested = Array.isArray(body.items) ? body.items as Array<{ resource_type?: unknown; id?: unknown; expected_rev?: unknown }> : [];
         const returned = [...value.preview_items, ...value.excluded_items];
         if (requested.length !== returned.length || requested.some((item) => !returned.some((candidate) => candidate.resource_type === item.resource_type && candidate.id === item.id && (candidate.outcome === "excluded" || candidate.rev === item.expected_rev)))) throw new Error("资产预览对象与请求不匹配");
-      } else {
+      } else if (value.mode === "folder") {
         const requestedRoot = body.root as { resource_type?: unknown; id?: unknown; expected_rev?: unknown } | undefined;
         if (requestedRoot?.resource_type !== "folder" || value.root?.id !== requestedRoot.id || value.root?.expected_rev !== requestedRoot.expected_rev) throw new Error("目录预览根与请求不匹配");
-      }
-      if (liveOwner.current !== owner || generation !== previewGeneration.current) return null;
+      } else if (typeof body.filters !== "object" || body.filters === null || value.root !== null || value.counts.folders !== 0 || [...value.preview_items, ...value.excluded_items].some((item) => item.resource_type !== "case")) throw new Error("筛选预览与请求不匹配");
+      if (liveOwner.current !== owner || generation !== previewGeneration.current || writeActive() || !isCurrent()) return null;
       replace({ phase: "preview", selection: value, request: body });
       return value;
     } catch (error) {
-      if (liveOwner.current === owner && generation === previewGeneration.current) replace({ phase: "error", message: error instanceof Error ? error.message : "预览失败" });
+      if (liveOwner.current === owner && generation === previewGeneration.current && !writeActive() && isCurrent()) replace({ phase: "error", message: error instanceof Error ? error.message : "预览失败" });
       return null;
     }
   }, [active, owner, principalId, projectId, replace, workspaceId]);
@@ -84,6 +86,7 @@ export function useAssetOperation(workspaceId: string, projectId: string, princi
 
   const submit = useCallback(async (payload: AssetOperationPayload, key = newAssetOperationKey()) => {
     if (!active || stateRef.current.phase === "submitting" || stateRef.current.phase === "unknown") return null;
+    previewGeneration.current += 1;
     const previewValue = stateRef.current.phase === "preview" ? stateRef.current.selection : null;
     replace({ phase: "submitting", key, payload, preview: previewValue });
     try {
@@ -125,5 +128,13 @@ export function useAssetOperation(workspaceId: string, projectId: string, princi
     }
   }, [active, owner, post, projectId, replace, validate, workspaceId]);
 
-  return { state, preview, submit, reconcile, reset: useCallback(() => { previewGeneration.current += 1; replace({ phase: "idle" }); }, [replace]) };
+  return {
+    state,
+    preview,
+    submit,
+    reconcile,
+    getPhase: useCallback(() => stateRef.current.phase, []),
+    invalidatePreview: useCallback(() => { previewGeneration.current += 1; }, []),
+    reset: useCallback(() => { previewGeneration.current += 1; replace({ phase: "idle" }); }, [replace]),
+  };
 }

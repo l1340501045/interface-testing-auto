@@ -197,6 +197,7 @@ body { background: #f5f7fa; }
 .case-library-table-region > .ant-table-wrapper { min-height: 0; height: 100%; overflow: hidden; }
 .case-library-toolbar { display: grid; grid-template-columns: minmax(240px, 1fr) 130px 140px 140px auto; gap: 8px; align-items: center; }
 .case-library-views { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.case-library-control-stack { display: grid; gap: 8px; min-height: 0; }
 .case-library-views > .ant-select { min-width: 220px; }
 .case-library-name { display: grid; gap: 3px; min-width: 220px; }
 .case-library-name span { color: var(--ink-soft); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-all; }

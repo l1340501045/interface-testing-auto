@@ -24,4 +24,15 @@ describe("S2资产网络合同", () => {
       expect(toAssetOperation({operation_id:"o",operation_key:"k",action:"move",...scope,result_schema_version:1,created_at:"c",result:{result_kind:"completed",selection_id:"s",root:null,counts,items:[{resource_type:"case",id:"c",outcome,code:null,message:"未变化",new_rev:null,asset:{id:"c",resource_type:"case",name:"用例",rev:2,state:"active",folder_id:null,parent_id:null,archived_at:null}}],members:[]}}).result.result_kind).toBe("completed");
     }
   });
+  it("解析S3 filter selection并保持完整Case集合", () => {
+    const parsed=toAssetSelection({selection_id:"s-filter",schema_version:1,action:"archive",mode:"filter",...scope,created_at:"c",expires_at:"e",counts:{selected:2,eligible:1,excluded:1,cases:2,folders:0},root:null,preview_items:[{resource_type:"case",id:"a",rev:1,state:"active",name:"A",parent_id:null,folder_id:null,outcome:"eligible",code:null}],excluded_items:[{resource_type:"case",id:"b",rev:2,state:"archived",name:"B",parent_id:null,folder_id:null,outcome:"excluded",code:"revision_or_state_conflict"}]});
+    expect(parsed.mode).toBe("filter");
+    expect([...parsed.preview_items,...parsed.excluded_items].map((item)=>item.id)).toEqual(["a","b"]);
+  });
+  it("目录按eligible上限保留大量excluded，普通Case仍按selected限制", () => {
+    const excluded=Array.from({length:500},(_,index)=>({resource_type:"case",id:`c-${index}`,rev:1,state:"archived",name:`C${index}`,parent_id:null,folder_id:null,outcome:"excluded",code:"already_archived"}));
+    expect(toAssetSelection({selection_id:"sf",schema_version:1,action:"folder_archive",mode:"folder",...scope,created_at:"c",expires_at:"e",counts:{selected:501,eligible:1,excluded:500,cases:500,folders:1},root:{resource_type:"folder",id:"root",expected_rev:1},preview_items:[{resource_type:"folder",id:"root",rev:1,state:"active",name:"根",parent_id:null,folder_id:null,outcome:"eligible",code:null}],excluded_items:excluded}).counts.selected).toBe(501);
+    const tooMany=[...excluded,{resource_type:"case",id:"extra",rev:1,state:"active",name:"E",parent_id:null,folder_id:null,outcome:"eligible",code:null}];
+    expect(()=>toAssetSelection({selection_id:"sc",schema_version:1,action:"archive",mode:"filter",...scope,created_at:"c",expires_at:"e",counts:{selected:501,eligible:1,excluded:500,cases:501,folders:0},root:null,preview_items:[tooMany.at(-1)],excluded_items:excluded})).toThrow(ContractError);
+  });
 });

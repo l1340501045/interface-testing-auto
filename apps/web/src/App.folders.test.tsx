@@ -23,6 +23,7 @@ const PROJECT_ID = "22222222-2222-4222-8222-222222222222";
 const FOLDER_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const FOLDER_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const NEW_CASE_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const BULK_CASE_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 
 vi.mock("./session/useSession", () => ({
   useSession: () => ({
@@ -87,6 +88,8 @@ const writes: { method: string; path: string; body: Record<string, unknown> }[] 
 const personalWrites: { method: string; path: string; body: unknown }[] = [];
 
 let nextCaseId = NEW_CASE_ID;
+let bulkMixedMode = false;
+let bulkOperationCount = 0;
 
 function emptyRequest(): Record<string, unknown> {
   return { method: "GET", path: "/orders", query_params: [], headers: [], body_type: "none", body: "" };
@@ -160,6 +163,7 @@ function route(path: string, method: string, body?: Record<string, unknown>): un
   if (method === "GET" && clean.endsWith("/assertion-types")) return [];
   if (method === "GET" && clean.endsWith("/case-views")) return [];
   if (method === "GET" && clean.endsWith("/case-library")) {
+    if (bulkMixedMode) return { items: cases.map((row) => ({ id: row.id, name: row.name, method: String(row.request.method ?? "GET"), path: String(row.request.path ?? "/"), folder_id: row.folder_id, folder_path: row.folder_id === FOLDER_A ? [{ id: FOLDER_A, name: "A 模块" }] : row.folder_id === FOLDER_B ? [{ id: FOLDER_B, name: "B 模块" }] : [], asset_status: "active", availability: "available", draft_rev: row.rev, updated_at: "2026-10-04T00:00:00Z", latest_version: null, favorite: false, last_opened_at: null })), total: cases.length, next_cursor: null };
     return { items: [], total: 0, next_cursor: null };
   }
   if (method === "GET" && clean.endsWith("/asset-folders")) {
@@ -182,6 +186,10 @@ function route(path: string, method: string, body?: Record<string, unknown>): un
   }
   if (method === "POST" && clean.endsWith("/asset-selections")) {
     const payload = body ?? {};
+    if (payload.mode === "explicit") {
+      const requested = payload.items as Array<{ id: string; expected_rev: number }>;
+      return { selection_id: bulkOperationCount === 0 ? "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee" : "ffffffff-ffff-4fff-8fff-ffffffffffff", schema_version: 1, action: payload.action, mode: "explicit", workspace_id: WORKSPACE_ID, project_id: PROJECT_ID, principal_id: "u-1", created_at: "2026-10-04T00:00:00Z", expires_at: "2030-10-04T00:00:00Z", counts: { selected: requested.length, eligible: requested.length, excluded: 0, cases: requested.length, folders: 0 }, root: null, preview_items: requested.map((item) => { const row=cases.find((candidate)=>candidate.id===item.id); return { resource_type: "case", id: item.id, rev: item.expected_rev, state: "active", name: row?.name ?? "不可见用例", parent_id: null, folder_id: row?.folder_id ?? null, outcome: "eligible", code: null }; }), excluded_items: [] };
+    }
     const root = payload.root as { id: string; expected_rev: number };
     const folder = folders.find((item) => item.id === root.id);
     if (folder === undefined) throw new Error("目录不存在");
@@ -255,6 +263,7 @@ function route(path: string, method: string, body?: Record<string, unknown>): un
 }
 
 beforeEach(() => {
+  window.location.hash = "#/workbench";
   apiGetMock.mockReset();
   apiSendMock.mockReset();
   apiSendWithMetaMock.mockReset();
@@ -267,6 +276,8 @@ beforeEach(() => {
   writes.length = 0;
   personalWrites.length = 0;
   nextCaseId = NEW_CASE_ID;
+  bulkMixedMode = false;
+  bulkOperationCount = 0;
 
   apiGetMock.mockImplementation((async (path: string) => route(path, "GET")) as never);
   apiDeleteMock();
@@ -288,6 +299,16 @@ function installSendMocks() {
     if (/\/case-preferences\/[0-9a-f-]{36}\/opened$/.test(basePath(path))) personalWrites.push({ method, path, body });
     else if (method !== "GET") writes.push({ method, path, body: body ?? {} });
     if (basePath(path).endsWith("/asset-operations") && method === "POST") {
+      if (bulkMixedMode && body?.action === "move") {
+        bulkOperationCount += 1;
+        const retry = bulkOperationCount === 2;
+        const selectedId = retry ? BULK_CASE_ID : NEW_CASE_ID;
+        const selected = cases.find((item) => item.id === selectedId);
+        if (selected === undefined) throw new Error("批量用例不存在");
+        selected.folder_id = FOLDER_B; selected.rev += 1;
+        const succeeded = { resource_type: "case", id: selected.id, outcome: "succeeded", code: null, message: "已移动", new_rev: selected.rev, asset: { id: selected.id, resource_type: "case", name: selected.name, rev: selected.rev, state: "active", folder_id: FOLDER_B, parent_id: null, archived_at: null } };
+        return { operation_id: retry ? "ffffffff-ffff-4fff-8fff-ffffffffffff" : "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", operation_key: options?.headers?.["Idempotency-Key"], action: "move", workspace_id: WORKSPACE_ID, project_id: PROJECT_ID, principal_id: "u-1", result_schema_version: 1, created_at: "2026-10-04T00:00:01Z", result: { result_kind: "completed", selection_id: retry ? "ffffffff-ffff-4fff-8fff-ffffffffffff" : "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", root: null, counts: { input: retry ? 1 : 2, succeeded: 1, no_change: 0, conflict: retry ? 0 : 1, failed: 0 }, items: retry ? [succeeded] : [succeeded, { resource_type: "case", id: BULK_CASE_ID, outcome: "conflict", code: "revision_conflict", message: "修订冲突", new_rev: null, asset: null }], members: [] } };
+      }
       const folder = folders.find((item) => item.id === FOLDER_A);
       if (folder === undefined) throw new Error("目录不存在");
       folder.archived_at = "2026-10-04T00:00:01Z"; folder.rev += 1;
@@ -317,14 +338,32 @@ async function renderShell(): Promise<HTMLElement> {
 }
 
 async function archiveFolderThroughLibrary(browser: HTMLElement, name: string): Promise<void> {
-  fireEvent.click(within(browser).getByRole("button", { name: `管理目录 ${name}` }));
+  const modalButton = (dialog: HTMLElement, label: string) => waitFor(() => {
+    const button = within(dialog).getByRole("button", { name: label }) as HTMLButtonElement;
+    if (button.disabled) throw new Error(`Modal按钮尚不可用：${label}`);
+    return button;
+  });
+  const manage = await waitFor(() => {
+    const button = browser.querySelector<HTMLButtonElement>(`button[aria-label="管理目录 ${name}"]`);
+    if (button === null || button.disabled) throw new Error(`目录管理入口尚不可用：${name}`);
+    expect(button.type).toBe("button");
+    return button;
+  });
+  fireEvent.click(manage);
   const library = await screen.findByRole("region", { name: "用例库" });
-  fireEvent.click(await within(library).findByRole("button", { name: `归档目录 ${name}` }));
-  fireEvent.click(await screen.findByRole("button", { name: "生成预览" }));
-  expect(await screen.findByText(/将处理 \d+ 项/)).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "确认执行" }));
+  const archive = await waitFor(() => {
+    const button = library.querySelector<HTMLButtonElement>(`button[aria-label="归档目录 ${name}"]`);
+    if (button === null || button.disabled) throw new Error(`目录归档入口尚不可用：${name}`);
+    expect(button.type).toBe("button");
+    return button;
+  });
+  fireEvent.click(archive);
+  const dialog = await screen.findByRole("dialog");
+  fireEvent.click(await modalButton(dialog, "生成预览"));
+  expect(await within(dialog).findByText(/将处理 \d+ 项/)).toBeTruthy();
+  fireEvent.click(await modalButton(dialog, "确认执行"));
   await waitFor(() => expect(folders.find((item) => item.name === name)?.archived_at).not.toBeNull());
-  fireEvent.click(await screen.findByRole("button", { name: "完成" }));
+  fireEvent.click(await modalButton(dialog, "完成"));
 }
 
 function browserList(browser: HTMLElement): string[] {
@@ -354,6 +393,43 @@ function selectedFolderLabel(): string {
 describe("用例目录承载用例的闭环", () => {
   beforeEach(() => {
     installSendMocks();
+  });
+
+  it("真实App批量完成自动刷新后保留结果，并只重试冲突项", async () => {
+    bulkMixedMode = true;
+    cases = [
+      { id: NEW_CASE_ID, folder_id: FOLDER_A, name: "批量成功项", request: emptyRequest(), rev: 1, snapshot_hash: "h-a" },
+      { id: BULK_CASE_ID, folder_id: FOLDER_A, name: "批量冲突项", request: { ...emptyRequest(), path: "/conflict" }, rev: 1, snapshot_hash: "h-b" },
+    ];
+    await renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "用例库" }));
+    const library = await screen.findByRole("region", { name: "用例库" });
+    await within(library).findByText("批量成功项");
+    const checkboxes = within(library).getAllByRole("checkbox");
+    fireEvent.click(checkboxes[1]); fireEvent.click(checkboxes[2]);
+    fireEvent.click(within(library).getByRole("button", { name: "批量移动" }));
+    const dialog = await screen.findByRole("dialog");
+    const targetSelect = within(dialog).getAllByRole("combobox").at(-1) as HTMLElement;
+    fireEvent.mouseDown(targetSelect);
+    fireEvent.click(await screen.findByText("B 模块", { selector: ".ant-select-item-option-content" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "生成预览" }));
+    await within(dialog).findByText("将处理 2 项，排除 0 项");
+    fireEvent.click(within(dialog).getByRole("button", { name: "确认执行" }));
+    expect(await within(dialog).findByText("本次输入 2 项：成功 1，无变化 0，冲突 1，失败 0")).toBeTruthy();
+    expect(within(dialog).getByText("批量冲突项")).toBeTruthy();
+    const retry = within(dialog).getByRole("button", { name: "重新读取并重试失败项" });
+    expect(within(dialog).getByRole("button", { name: "完成" })).toBeTruthy();
+    expect(apiGetMock.mock.calls.some(([path]) => String(path).includes("/case-library?"))).toBe(true);
+    fireEvent.click(retry);
+    await within(dialog).findByText("将处理 1 项，排除 0 项");
+    expect(apiSendMock.mock.calls.filter(([path, method]) => method === "GET" && String(path).endsWith(`/cases/${BULK_CASE_ID}`))).toHaveLength(1);
+    fireEvent.click(within(dialog).getByRole("button", { name: "确认执行" }));
+    expect(await within(dialog).findByText("本次输入 1 项：成功 1，无变化 0，冲突 0，失败 0")).toBeTruthy();
+    expect(within(dialog).getByText("第 1 次结果已保留")).toBeTruthy();
+    expect(writes.filter((item) => item.path.endsWith("/asset-operations"))).toHaveLength(2);
+    expect((writes.filter((item) => item.path.endsWith("/asset-selections"))[1].body.items as Array<{ id: string }>).map((item) => item.id)).toEqual([BULK_CASE_ID]);
+    fireEvent.click(within(dialog).getByRole("button", { name: "完成" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 
   it("在 A 目录里新建：用例落进 A，A 的过滤列表立刻能看到它", async () => {
@@ -560,5 +636,6 @@ describe("用例目录承载用例的闭环", () => {
     expect(within(library).queryByText("A 模块", { selector: ".ant-tree-title" })).toBeNull();
     expect(apiGetMock.mock.calls.filter(([path]) => String(path).includes("/case-library?")).length).toBeGreaterThan(libraryReadsBefore);
   });
+
 
 });

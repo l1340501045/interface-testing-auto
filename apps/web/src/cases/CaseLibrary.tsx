@@ -1,8 +1,8 @@
 import { DeleteOutlined, EditOutlined, FolderOutlined, SaveOutlined, StarFilled, StarOutlined } from "@ant-design/icons";
-import { Alert, Button, Checkbox, Input, Modal, Select, Space, Table, Tag, Tree } from "antd";
+import { Alert, Button, Checkbox, Input, Modal, Segmented, Select, Space, Table, Tag, Tree } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import type { DataNode } from "antd/es/tree";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type Key } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type Key } from "react";
 
 import { ApiError, apiSend, projectPath } from "../api/client";
 import { toAssetFolder } from "../api/guards";
@@ -99,6 +99,10 @@ export function CaseLibrary({
   const [assetAction, setAssetAction] = useState<{ action: AssetAction; target: AssetActionTarget } | null>(null);
   const assetActionGeneration = useRef(0);
   const [copiedCase, setCopiedCase] = useState<{ id: string; name: string } | null>(null);
+  const [bulkMode, setBulkMode] = useState<"page" | "filter">("page");
+  const [selectedCaseIds, setSelectedCaseIds] = useState<string[]>([]);
+  const [assetPhase, setAssetPhase] = useState("idle");
+  const assetPhaseReaderRef = useRef<(() => string) | null>(null);
   const ownerRef = useRef(owner);
   const activeRef = useRef(active);
   const tableRegionRef = useRef<HTMLDivElement | null>(null);
@@ -109,13 +113,22 @@ export function CaseLibrary({
   ownerRef.current = owner;
   activeRef.current = active;
   const beginAssetAction = (next: { action: AssetAction; target: AssetActionTarget }) => { assetActionGeneration.current += 1; setAssetAction(next); };
-  const closeAssetAction = () => { assetActionGeneration.current += 1; setAssetAction(null); };
+  const closeAssetAction = () => { assetActionGeneration.current += 1; setAssetAction(null); setAssetPhase("idle"); assetPhaseReaderRef.current = null; };
+  const currentAssetPhase = () => assetPhaseReaderRef.current?.() ?? assetPhase;
+  const prepareQueryChange = () => {
+    setSelectedCaseIds([]);
+    const phase = currentAssetPhase();
+    if (assetAction !== null && phase !== "submitting" && phase !== "unknown" && phase !== "done") closeAssetAction();
+  };
+  const registerAssetPhaseReader = useCallback((reader: (() => string) | null) => { assetPhaseReaderRef.current = reader; }, []);
 
   const folderTreeState = useAssetFolderTree(workspaceId, projectId, folderQuery, folderRefreshToken, active);
   const library = useCaseLibrary(workspaceId, projectId, filters, limit, cursor, active);
   const views = useCaseViews(workspaceId, projectId, active);
   const folderById = useMemo(() => new Map(folderTreeState.allItems.map((folder) => [folder.id, folder])), [folderTreeState.allItems]);
   const viewDirty = viewModalOpen && viewName !== viewBaseline;
+  const synchronousAssetPhase = currentAssetPhase();
+  const assetQueryLocked = assetAction !== null && synchronousAssetPhase !== "submitting" && synchronousAssetPhase !== "unknown" && synchronousAssetPhase !== "done";
   const validAssetFocus = assetFocus?.workspaceId === workspaceId && assetFocus.projectId === projectId && assetFocus.principalId === principalId ? assetFocus : null;
   useLeaveReport(`case-library-view:${owner}`, { dirty: viewDirty, busy: viewBusy });
 
@@ -136,13 +149,16 @@ export function CaseLibrary({
     setViewBusy(false);
     setFeedback(null);
     setAssetAction(null);
+    assetPhaseReaderRef.current = null;
     assetActionGeneration.current += 1;
     setCopiedCase(null);
+    setBulkMode("page"); setSelectedCaseIds([]);
   }, [owner]);
   useEffect(() => { if (!active) assetActionGeneration.current += 1; }, [active]);
 
   useEffect(() => {
     if (!active || validAssetFocus == null || consumedFocusTokens.current.has(validAssetFocus.token)) return;
+    prepareQueryChange();
     consumedFocusTokens.current.add(validAssetFocus.token);
     setSelectedViewId(null);
     setFilters(normalizeCaseLibraryFilters({ ...defaultCaseLibraryFilters(), q: validAssetFocus.name, state: validAssetFocus.mode === "restore" ? "archived" : "all" }));
@@ -151,6 +167,7 @@ export function CaseLibrary({
 
   useEffect(() => {
     if (seenFolderRefreshToken.current === folderRefreshToken) return;
+    prepareQueryChange();
     seenFolderRefreshToken.current = folderRefreshToken;
     setCursorStack([null]);
     library.reload();
@@ -180,10 +197,22 @@ export function CaseLibrary({
   }, [feedback, filters.folder, library.data, library.error, views.error]);
 
   const replaceFilters = (next: CaseLibraryFilters) => {
+    prepareQueryChange();
     setFilters(normalizeCaseLibraryFilters(next));
     setCursorStack([null]);
   };
-  const refreshFoldersAndLibrary = () => {
+  const startBulkAction = (action: "move" | "archive" | "restore") => {
+    if (!library.data) return;
+    if (bulkMode === "filter" && library.data.total > 500) { setFeedback({ type: "error", message: `当前筛选命中 ${library.data.total} 条，单次最多处理 500 条；请缩小筛选范围。` }); return; }
+    const selector = bulkMode === "filter"
+      ? { mode: "filter" as const, filters: normalizeCaseLibraryFilters(filters) }
+      : { mode: "explicit" as const, items: library.data.items.filter((item) => selectedCaseIds.includes(item.id)).map((item) => ({ resource_type: "case" as const, id: item.id, expected_rev: item.draft_rev })) };
+    const count = selector.mode === "filter" ? library.data.total : selector.items.length;
+    if (count === 0) { setFeedback({ type: "warning", message: bulkMode === "filter" ? "当前筛选没有可处理的用例。" : "请先勾选当前页中的用例。" }); return; }
+    beginAssetAction({ action, target: { resourceType: "bulk", intentId: crypto.randomUUID(), label: bulkMode === "filter" ? `当前筛选全部命中（${count} 条）` : `当前页所选（${count} 条）`, selector } });
+  };
+  const refreshFoldersAndLibrary = (preserveAssetIntent = false) => {
+    if (!preserveAssetIntent) prepareQueryChange();
     folderTreeState.refresh();
     setCursorStack([null]);
     library.reload();
@@ -325,7 +354,7 @@ export function CaseLibrary({
       return;
     }
     onAssetsChanged?.();
-    refreshFoldersAndLibrary();
+    refreshFoldersAndLibrary(true);
     const copied = operation.action === "case_copy" ? operation.result.items.find((item) => item.resource_type === "case" && item.outcome === "succeeded") : undefined;
     if (copied) {
       setCopiedCase({ id: copied.id, name: copied.asset?.name ?? "新副本" });
@@ -514,7 +543,7 @@ export function CaseLibrary({
             setFolderQuery(value);
             setExpandedFolderKeys(value.trim() ? ["folder-search-results"] : ["folders", "archived-folders"]);
           }} />
-          <Button disabled={viewBusy} onClick={refreshFoldersAndLibrary}>刷新目录</Button>
+          <Button disabled={viewBusy} onClick={() => refreshFoldersAndLibrary()}>刷新目录</Button>
           </Space.Compact>
           {(folderTreeState.root.loading && folderTreeState.root.items.length === 0) ? <Loading label="正在加载目录…" /> : null}
           {folderTreeState.failures.map(([key, bucket]) => (
@@ -575,7 +604,7 @@ export function CaseLibrary({
               <Checkbox disabled={viewBusy} checked={filters.include_descendants} onChange={(event) => patchFilters({ include_descendants: event.target.checked })}>包含子目录</Checkbox>
             ) : null}
           </div>
-          <div className="case-library-views">
+          <div className="case-library-control-stack"><div className="case-library-views">
             <Select
               aria-label="保存的筛选视图"
               allowClear
@@ -595,13 +624,20 @@ export function CaseLibrary({
             <span className="caption">{views.data === null ? "—" : views.data.length}/20</span>
             {views.error ? <ErrorText message={views.error.message} /> : null}
           </div>
+          {canEdit ? <div className="case-library-views" aria-label="批量整理">
+            <Segmented disabled={assetQueryLocked} value={bulkMode} options={[{ value: "page", label: `当前页所选（${selectedCaseIds.length}）` }, { value: "filter", label: `筛选全部命中（${library.data?.total ?? "—"}）` }]} onChange={(value) => { setBulkMode(value as "page" | "filter"); setSelectedCaseIds([]); }} />
+            <Button disabled={assetAction !== null || library.loading} onClick={() => startBulkAction("move")}>批量移动</Button>
+            <Button disabled={assetAction !== null || library.loading} danger onClick={() => startBulkAction("archive")}>批量归档</Button>
+            <Button disabled={assetAction !== null || library.loading} onClick={() => startBulkAction("restore")}>批量恢复</Button>
+            <span className="caption">本页处理当前勾选项；全部命中包含其它页面中符合当前筛选的用例。</span>
+          </div> : null}</div>
           <div ref={tableRegionRef} className="case-library-table-region">
           {library.error ? (
             <Alert
               type="error"
               showIcon
               title={library.error.message}
-              action={<Space><Button onClick={library.reload}>重试当前查询</Button><Button onClick={() => setCursorStack([null])}>返回第一页</Button></Space>}
+              action={<Space><Button onClick={() => { prepareQueryChange(); library.reload(); }}>重试当前查询</Button><Button onClick={() => { prepareQueryChange(); setCursorStack([null]); }}>返回第一页</Button></Space>}
             />
           ) : library.loading && library.data === null ? (
             <Loading label="正在查询用例…" />
@@ -614,15 +650,16 @@ export function CaseLibrary({
               columns={columns}
               dataSource={library.data.items}
               pagination={false}
+              rowSelection={bulkMode === "page" ? { selectedRowKeys: selectedCaseIds, preserveSelectedRowKeys: false, getCheckboxProps: () => ({ disabled: library.loading || assetAction !== null }), onChange: (keys) => { if (library.loading || assetAction !== null || library.data === null) return; const currentIds = new Set(library.data.items.map((item) => item.id)); setSelectedCaseIds(keys.map(String).filter((id) => currentIds.has(id))); } } : undefined}
               scroll={{ x: 980, y: tableScrollY }}
             />
           ) : null}
           </div>
           <div className="case-library-pagination" aria-label="用例库分页">
             <span>{library.data === null ? "总数尚未加载" : `共 ${library.data.total} 条，第 ${cursorStack.length} 页`}</span>
-            <Select aria-label="每页数量" value={limit} options={[20, 50, 100].map((value) => ({ value, label: `${value} 条/页` }))} onChange={(value) => { setLimit(value); setCursorStack([null]); }} />
-            <Button disabled={cursorStack.length <= 1 || library.loading} onClick={() => setCursorStack((current) => current.slice(0, -1))}>上一页</Button>
-            <Button disabled={library.data?.next_cursor == null || library.loading} onClick={() => setCursorStack((current) => [...current, library.data?.next_cursor ?? null])}>下一页</Button>
+            <Select aria-label="每页数量" disabled={assetQueryLocked} value={limit} options={[20, 50, 100].map((value) => ({ value, label: `${value} 条/页` }))} onChange={(value) => { prepareQueryChange(); setLimit(value); setCursorStack([null]); }} />
+            <Button disabled={assetQueryLocked || cursorStack.length <= 1 || library.loading} onClick={() => { prepareQueryChange(); setCursorStack((current) => current.slice(0, -1)); }}>上一页</Button>
+            <Button disabled={assetQueryLocked || library.data?.next_cursor == null || library.loading} onClick={() => { prepareQueryChange(); setCursorStack((current) => [...current, library.data?.next_cursor ?? null]); }}>下一页</Button>
           </div>
         </div>
       </div>
@@ -655,6 +692,8 @@ export function CaseLibrary({
         onAcquire={onAcquireAssetOperation}
         onClose={closeAssetAction}
         onDone={finishAssetOperation}
+        onPhaseChange={setAssetPhase}
+        onPhaseReader={registerAssetPhaseReader}
       /> : null}
     </section>
   );

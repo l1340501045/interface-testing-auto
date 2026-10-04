@@ -31,7 +31,7 @@ export function toAssetSelection(raw: unknown): AssetSelection {
   const rootValue = value.root === null ? null : object(value.root, "资产预览.root");
   const parsed: AssetSelection = {
     selection_id: string(value.selection_id, "资产预览.selection_id"), schema_version: 1,
-    action: action(value.action, "资产预览.action"), mode: oneOf(value.mode, "资产预览.mode", ["explicit", "folder"] as const),
+    action: action(value.action, "资产预览.action"), mode: oneOf(value.mode, "资产预览.mode", ["explicit", "filter", "folder"] as const),
     workspace_id: string(value.workspace_id, "资产预览.workspace_id"), project_id: string(value.project_id, "资产预览.project_id"), principal_id: string(value.principal_id, "资产预览.principal_id"),
     created_at: string(value.created_at, "资产预览.created_at"), expires_at: string(value.expires_at, "资产预览.expires_at"),
     counts: { selected: integer(counts.selected, "counts.selected"), eligible: integer(counts.eligible, "counts.eligible"), excluded: integer(counts.excluded, "counts.excluded"), cases: integer(counts.cases, "counts.cases"), folders: integer(counts.folders, "counts.folders") },
@@ -41,10 +41,16 @@ export function toAssetSelection(raw: unknown): AssetSelection {
   const folderAction = parsed.action === "folder_archive" || parsed.action === "folder_restore";
   if ((parsed.mode === "folder") !== folderAction || (parsed.root !== null) !== folderAction) throw new ContractError("资产预览动作与选择模式不匹配");
   if (parsed.counts.selected !== parsed.counts.eligible + parsed.counts.excluded) throw new ContractError("资产预览数量不守恒");
+  if ((parsed.mode === "folder" ? parsed.counts.eligible : parsed.counts.selected) > 500) throw new ContractError("资产预览超过单次500项上限");
   if (parsed.preview_items.length !== parsed.counts.eligible || parsed.excluded_items.length !== parsed.counts.excluded) throw new ContractError("资产预览明细数量不匹配");
   const identities = [...parsed.preview_items, ...parsed.excluded_items].map((item) => `${item.resource_type}:${item.id}`);
   if (new Set(identities).size !== identities.length) throw new ContractError("资产预览包含重复对象");
   if (parsed.preview_items.some((item) => item.outcome !== "eligible") || parsed.excluded_items.some((item) => item.outcome !== "excluded")) throw new ContractError("资产预览对象分组错误");
+  const allItems = [...parsed.preview_items, ...parsed.excluded_items];
+  const actualCases = allItems.filter((item) => item.resource_type === "case").length;
+  const actualFolders = allItems.filter((item) => item.resource_type === "folder").length;
+  if (parsed.counts.cases !== actualCases || parsed.counts.folders !== actualFolders || parsed.counts.selected !== allItems.length) throw new ContractError("资产预览分类数量不匹配");
+  if (parsed.mode !== "folder" && (parsed.counts.selected < 1 || actualFolders !== 0)) throw new ContractError("普通用例预览必须包含至少一个Case");
   return parsed;
 }
 
