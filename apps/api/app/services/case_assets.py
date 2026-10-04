@@ -156,6 +156,78 @@ def _case_filter_payload(query: CaseLibraryQuery) -> dict:
     }
 
 
+def build_case_library_filter_statement(
+    scope: deps.ProjectScope, query: CaseLibraryQuery
+):
+    """构造无事务副作用、无分页的授权筛选查询，供列表与S3冻结共用。"""
+    blocked = blocked_folder_ids(scope)
+    invalid = invalid_folder_ids(scope)
+    blocked_exists = func.coalesce(
+        or_(Case.folder_id.in_(select(blocked.c.id)), Case.folder_id.in_(select(invalid.c.id))),
+        False,
+    )
+    preference_join = and_(
+        CasePreference.workspace_id == scope.workspace_id,
+        CasePreference.project_id == scope.project_id,
+        CasePreference.principal_id == scope.principal.user_id,
+        CasePreference.case_id == Case.id,
+    )
+    latest = (
+        select(CaseVersion.case_id.label("case_id"), func.max(CaseVersion.version).label("latest_version"))
+        .where(CaseVersion.workspace_id == scope.workspace_id, CaseVersion.project_id == scope.project_id)
+        .group_by(CaseVersion.case_id)
+        .subquery()
+    )
+    method_expr = func.upper(Case.request["method"].as_string())
+    path_expr = func.coalesce(Case.request["path"].as_string(), "")
+    normalized_name_expr = func.lower(Case.name)
+    availability = sql_case(
+        (Case.status == "archived", literal("case_archived")),
+        (blocked_exists, literal("folder_unavailable")),
+        else_=literal("available"),
+    ).label("availability")
+    asset_status = sql_case(
+        (Case.status == "archived", literal("archived")), else_=literal("active")
+    ).label("asset_status")
+    favorite = func.coalesce(CasePreference.favorite, False).label("favorite")
+    statement = (
+        select(
+            Case.id, Case.name, normalized_name_expr.label("normalized_name"),
+            method_expr.label("method"), path_expr.label("path"),
+            Case.folder_id, asset_status, availability, Case.rev.label("draft_rev"),
+            Case.updated_at, latest.c.latest_version, favorite, CasePreference.last_opened_at,
+        )
+        .outerjoin(CasePreference, preference_join)
+        .outerjoin(latest, latest.c.case_id == Case.id)
+        .where(Case.workspace_id == scope.workspace_id, Case.project_id == scope.project_id)
+    )
+    if query.q:
+        pattern = f"%{_escape_like(query.q)}%"
+        statement = statement.where(
+            or_(Case.name.ilike(pattern, escape="\\"), path_expr.ilike(pattern, escape="\\"))
+        )
+    if query.method:
+        statement = statement.where(method_expr == query.method)
+    if query.state == "active":
+        statement = statement.where(Case.status != "archived", ~blocked_exists)
+    elif query.state == "archived":
+        statement = statement.where(or_(Case.status == "archived", blocked_exists))
+    if query.folder == "unfiled":
+        statement = statement.where(Case.folder_id.is_(None))
+    elif query.folder == "exact" and query.folder_id is not None:
+        descendants = folder_descendants(scope, query.folder_id)
+        statement = statement.where(
+            Case.folder_id.in_(select(descendants.c.id))
+            if query.include_descendants
+            else Case.folder_id == query.folder_id
+        )
+    if query.collection == "favorites":
+        statement = statement.where(CasePreference.favorite.is_(True))
+    elif query.collection == "recent":
+        statement = statement.where(CasePreference.last_opened_at.is_not(None))
+    return statement, normalized_name_expr, method_expr
+
+
 def list_case_library(
     session: Session,
     settings: Settings,
@@ -182,73 +254,9 @@ def list_case_library(
         if folder_exists is None:
             raise not_found("目录不存在或无权访问")
 
-    blocked = blocked_folder_ids(scope)
-    invalid = invalid_folder_ids(scope)
-    # 未分组用例的 folder_id 为 NULL；SQL 的 `NULL IN (...)` 与取反都会得到 NULL，
-    # 若不显式收敛为 false，默认 active 查询会把全部未分组用例静默排除。
-    blocked_exists = func.coalesce(
-        or_(Case.folder_id.in_(select(blocked.c.id)), Case.folder_id.in_(select(invalid.c.id))),
-        False,
+    statement, normalized_name_expr, method_expr = build_case_library_filter_statement(
+        scope, query
     )
-    preference_join = and_(
-        CasePreference.workspace_id == scope.workspace_id,
-        CasePreference.project_id == scope.project_id,
-        CasePreference.principal_id == scope.principal.user_id,
-        CasePreference.case_id == Case.id,
-    )
-    latest = (
-        select(CaseVersion.case_id.label("case_id"), func.max(CaseVersion.version).label("latest_version"))
-        .where(CaseVersion.project_id == scope.project_id)
-        .group_by(CaseVersion.case_id)
-        .subquery()
-    )
-    method_expr = func.upper(Case.request["method"].as_string())
-    path_expr = func.coalesce(Case.request["path"].as_string(), "")
-    normalized_name_expr = func.lower(Case.name)
-    availability = sql_case(
-        (Case.status == "archived", literal("case_archived")),
-        (blocked_exists, literal("folder_unavailable")),
-        else_=literal("available"),
-    ).label("availability")
-    asset_status = sql_case(
-        (Case.status == "archived", literal("archived")), else_=literal("active")
-    ).label("asset_status")
-    favorite = func.coalesce(CasePreference.favorite, False).label("favorite")
-
-    statement = (
-        select(
-            Case.id, Case.name, normalized_name_expr.label("normalized_name"),
-            method_expr.label("method"), path_expr.label("path"),
-            Case.folder_id, asset_status, availability, Case.rev.label("draft_rev"),
-            Case.updated_at, latest.c.latest_version, favorite, CasePreference.last_opened_at,
-        )
-        .outerjoin(CasePreference, preference_join)
-        .outerjoin(latest, latest.c.case_id == Case.id)
-        .where(Case.project_id == scope.project_id)
-    )
-    if query.q:
-        pattern = f"%{_escape_like(query.q)}%"
-        statement = statement.where(
-            or_(Case.name.ilike(pattern, escape="\\"), path_expr.ilike(pattern, escape="\\"))
-        )
-    if query.method:
-        statement = statement.where(method_expr == query.method)
-    if query.state == "active":
-        statement = statement.where(Case.status != "archived", ~blocked_exists)
-    elif query.state == "archived":
-        statement = statement.where(or_(Case.status == "archived", blocked_exists))
-    if query.folder == "unfiled":
-        statement = statement.where(Case.folder_id.is_(None))
-    elif query.folder == "exact" and query.folder_id is not None:
-        if query.include_descendants:
-            descendants = folder_descendants(scope, query.folder_id)
-            statement = statement.where(Case.folder_id.in_(select(descendants.c.id)))
-        else:
-            statement = statement.where(Case.folder_id == query.folder_id)
-    if query.collection == "favorites":
-        statement = statement.where(CasePreference.favorite.is_(True))
-    elif query.collection == "recent":
-        statement = statement.where(CasePreference.last_opened_at.is_not(None))
 
     total = session.scalar(select(func.count()).select_from(statement.subquery())) or 0
     filters = _filter_digest(_case_filter_payload(query))

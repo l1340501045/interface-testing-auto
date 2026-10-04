@@ -248,17 +248,23 @@ class AssetSelectionRootIn(ApiModel):
 class AssetSelectionCreate(ApiModel):
     schema_version: Literal[1] = 1
     action: AssetAction
-    mode: Literal["explicit", "folder"]
+    mode: Literal["explicit", "filter", "folder"]
     items: list[AssetSelectionItemIn] | None = None
     root: AssetSelectionRootIn | None = None
+    filters: CaseViewFilters | None = None
     parameters: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_shape(self) -> AssetSelectionCreate:
         if self.mode == "explicit":
-            if self.action not in {"move", "archive", "restore"} or self.items is None or len(self.items) != 1 or self.root is not None:
-                raise ValueError("explicit 选择仅允许一个用例的 move/archive/restore")
-        elif self.action not in {"folder_archive", "folder_restore"} or self.root is None or self.items is not None:
+            if self.action not in {"move", "archive", "restore"} or not self.items or self.root is not None or self.filters is not None:
+                raise ValueError("explicit 选择必须提供用例 items")
+            if len({item.id for item in self.items}) != len(self.items):
+                raise ValueError("explicit items 不能包含重复用例")
+        elif self.mode == "filter":
+            if self.action not in {"move", "archive", "restore"} or self.filters is None or self.items is not None or self.root is not None:
+                raise ValueError("filter 选择必须提供用例库 filters")
+        elif self.action not in {"folder_archive", "folder_restore"} or self.root is None or self.items is not None or self.filters is not None:
             raise ValueError("folder 选择必须提供目录根并使用 folder_archive/folder_restore")
         return self
 
@@ -267,7 +273,7 @@ class AssetSelectionOut(ApiModel):
     selection_id: uuid.UUID
     schema_version: Literal[1] = 1
     action: AssetAction
-    mode: Literal["explicit", "folder"]
+    mode: Literal["explicit", "filter", "folder"]
     workspace_id: uuid.UUID
     project_id: uuid.UUID
     principal_id: uuid.UUID
@@ -353,6 +359,9 @@ class CaseViewFilters(ApiModel):
         if self.sort == "recent_desc" and self.collection != "recent":
             raise ValueError("recent_desc 只允许用于最近打开集合")
         return self
+
+
+AssetSelectionCreate.model_rebuild()
 
 
 class CaseSavedViewCreate(ApiModel):

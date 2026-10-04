@@ -32,6 +32,7 @@ from ..models import (
     WorkspaceMembership,
 )
 from .archive_source import resolve_archive_source
+from .case_assets import CaseLibraryQuery, build_case_library_filter_statement
 from .folder_graph import (
     begin_consistent_read,
     blocked_folder_ids,
@@ -51,6 +52,12 @@ class AssetLifecycleError(Exception):
         super().__init__(message)
         self.status_code, self.code, self.message = status_code, code, message
         self.details = details or {}
+
+
+class AssetItemFailure(Exception):
+    def __init__(self, outcome: str, code: str, message: str) -> None:
+        super().__init__(message)
+        self.outcome, self.code, self.message = outcome, code, message
 
 
 def lock_project_and_reauthorize(
@@ -171,30 +178,8 @@ def _compute_selection(
     eligible: list[dict] = []
     excluded: list[dict] = []
     root_out = None
-    if payload.mode == "explicit":
-        requested = payload.items[0]
-        case = session.scalar(
-            select(Case).where(
-                Case.workspace_id == scope.workspace_id,
-                Case.project_id == scope.project_id,
-                Case.id == requested.id,
-            )
-        )
-        if case is None:
-            excluded.append({"resource_type": "case", "id": str(requested.id), "rev": None, "state": None, "name": None, "parent_id": None, "folder_id": None, "outcome": "excluded", "code": "not_found_or_inaccessible"})
-        else:
-            state = "archived" if case.status == "archived" else "active"
-            valid = case.rev == requested.expected_rev
-            if payload.action in {"move", "archive"}:
-                valid = valid and state == "active"
-            if payload.action == "restore":
-                valid = valid and state == "archived"
-            target = params.get("target_folder_id") if "target_folder_id" in params else case.folder_id
-            if target is not None:
-                resolve_available_folder(session, scope, uuid.UUID(str(target)))
-            (eligible if valid else excluded).append(
-                _item("case", case, "eligible" if valid else "excluded", None if valid else "revision_or_state_conflict")
-            )
+    if payload.mode in {"explicit", "filter"}:
+        return _compute_case_selection(session, scope, payload, params)
     else:
         requested = payload.root
         root = session.scalar(
@@ -295,6 +280,130 @@ def _compute_selection(
     return eligible, excluded, root_out, {"members": members, "parameters": params, "counts": counts}
 
 
+def _compute_case_selection(
+    session: Session,
+    scope: deps.ProjectScope,
+    payload: AssetSelectionCreate,
+    params: dict,
+) -> tuple[list[dict], list[dict], None, dict]:
+    requested: list[tuple[uuid.UUID, int | None]]
+    availability_by_id: dict[uuid.UUID, str] = {}
+    if payload.mode == "explicit":
+        if len(payload.items) > 500:
+            raise AssetLifecycleError(413, "selection_too_large", "选择输入超过500，未创建预览")
+        requested = [(item.id, item.expected_rev) for item in payload.items]
+    else:
+        filters = payload.filters
+        query = CaseLibraryQuery(
+            q=filters.q,
+            method=filters.method,
+            state=filters.state,
+            folder=filters.folder,
+            folder_id=filters.folder_id,
+            include_descendants=filters.include_descendants,
+            collection=filters.collection,
+            sort=filters.sort,
+            limit=20,
+            cursor=None,
+        )
+        if query.folder_id is not None:
+            exists_id = session.scalar(select(Folder.id).where(
+                Folder.workspace_id == scope.workspace_id,
+                Folder.project_id == scope.project_id,
+                Folder.id == query.folder_id,
+            ))
+            if exists_id is None:
+                raise AssetLifecycleError(404, "not_found", "目录不存在或无权访问")
+        statement, _name_expr, _method_expr = build_case_library_filter_statement(scope, query)
+        filtered = statement.subquery("asset_filter_selection")
+        order = _filter_order(filtered, filters.sort)
+        rows = session.execute(select(filtered).order_by(*order).limit(501)).all()
+        if len(rows) > 500:
+            raise AssetLifecycleError(413, "selection_too_large", "筛选命中超过500，未创建预览")
+        requested = [(row.id, row.draft_rev) for row in rows]
+        availability_by_id = {row.id: row.availability for row in rows}
+    if not requested:
+        raise AssetLifecycleError(400, "selection_empty", "当前选择没有任何用例")
+
+    ids = [item_id for item_id, _rev in requested]
+    cases = {
+        item.id: item
+        for item in session.scalars(select(Case).where(
+            Case.workspace_id == scope.workspace_id,
+            Case.project_id == scope.project_id,
+            Case.id.in_(ids),
+        ))
+    }
+    unavailable_restore_folders: set[uuid.UUID] = set()
+    if payload.action == "restore" and "target_folder_id" not in params:
+        restore_folder_ids = {item.folder_id for item in cases.values() if item.folder_id}
+        if restore_folder_ids:
+            blocked = blocked_folder_ids(scope)
+            invalid = invalid_folder_ids(scope)
+            unavailable_restore_folders = set(session.scalars(
+                select(Folder.id).where(
+                    Folder.workspace_id == scope.workspace_id,
+                    Folder.project_id == scope.project_id,
+                    Folder.id.in_(restore_folder_ids),
+                    (
+                        Folder.archived_at.is_not(None)
+                        | Folder.id.in_(select(blocked.c.id))
+                        | Folder.id.in_(select(invalid.c.id))
+                    ),
+                )
+            ))
+    target_present = "target_folder_id" in params
+    if target_present and params.get("target_folder_id") is not None:
+        resolve_available_folder(session, scope, uuid.UUID(params["target_folder_id"]))
+    ordered: list[dict] = []
+    for case_id, expected_rev in requested:
+        case = cases.get(case_id)
+        if case is None:
+            ordered.append({
+                "resource_type": "case", "id": str(case_id), "rev": None,
+                "state": None, "name": None, "parent_id": None, "folder_id": None,
+                "archive_operation_id": None, "outcome": "excluded",
+                "code": "not_found_or_inaccessible",
+            })
+            continue
+        state = "archived" if case.status == "archived" else "active"
+        valid_rev = case.rev == expected_rev
+        valid_action = state == ("archived" if payload.action == "restore" else "active")
+        code = None if valid_rev and valid_action else (
+            "revision_conflict" if not valid_rev else "asset_state_conflict"
+        )
+        if code is None and case.folder_id in unavailable_restore_folders:
+            code = "target_invalid"
+        item = _item("case", case, "eligible" if code is None else "excluded", code)
+        # filter 保持case-library全部命中；availability只用于分类，不删输入。
+        if payload.mode == "filter" and payload.action == "restore" and availability_by_id.get(case.id) == "folder_unavailable" and state == "active":
+            item["outcome"], item["code"] = "excluded", "asset_state_conflict"
+        ordered.append(item)
+    eligible = [item for item in ordered if item["outcome"] == "eligible"]
+    excluded = [item for item in ordered if item["outcome"] != "eligible"]
+    counts = {
+        "selected": len(ordered), "eligible": len(eligible), "excluded": len(excluded),
+        "cases": len(ordered), "folders": 0,
+    }
+    return eligible, excluded, None, {
+        "members": ordered, "parameters": params, "counts": counts,
+    }
+
+
+def _filter_order(filtered, sort: str) -> tuple:
+    if sort == "updated_desc":
+        return filtered.c.updated_at.desc(), filtered.c.id.desc()
+    if sort == "name_asc":
+        return filtered.c.normalized_name.asc(), filtered.c.id.asc()
+    if sort == "name_desc":
+        return filtered.c.normalized_name.desc(), filtered.c.id.desc()
+    if sort == "method_asc":
+        return filtered.c.method.asc(), filtered.c.id.asc()
+    if sort == "method_desc":
+        return filtered.c.method.desc(), filtered.c.id.desc()
+    return filtered.c.last_opened_at.desc(), filtered.c.id.desc()
+
+
 def create_selection(
     session: Session, scope: deps.ProjectScope, payload: AssetSelectionCreate
 ) -> AssetSelectionOut:
@@ -312,6 +421,7 @@ def create_selection(
             "mode": payload.mode,
             "root": root,
             "items": [item.model_dump(mode="json") for item in (payload.items or [])],
+            "filters": payload.filters.model_dump(mode="json") if payload.filters else None,
             "dependencies": dependencies,
         },
         members=frozen["members"], target=frozen["parameters"] or None,
@@ -515,6 +625,10 @@ def execute_operation(
 
 def _execute_selection(session: Session, scope: deps.ProjectScope, selection: AssetSelection, payload: AssetOperationCreate, key: str, request_hash: str) -> AssetOperation:
     members = selection.members
+    if selection.selector.get("mode") in {"explicit", "filter"}:
+        return _execute_case_batch(
+            session, scope, selection, payload, key, request_hash
+        )
     if payload.action == "folder_archive":
         root_id = uuid.UUID(selection.selector["root"]["id"])
         descendants = folder_descendants(scope, root_id)
@@ -663,6 +777,186 @@ def _execute_selection(session: Session, scope: deps.ProjectScope, selection: As
     return operation
 
 
+def _execute_case_batch(
+    session: Session,
+    scope: deps.ProjectScope,
+    selection: AssetSelection,
+    payload: AssetOperationCreate,
+    key: str,
+    request_hash: str,
+) -> AssetOperation:
+    members = selection.members
+    params = _parameters(payload.action, payload.parameters)
+    # 显式共同目标是selection级依赖；失效时整次持久rejected。
+    if payload.action == "move" or (
+        payload.action == "restore" and "target_folder_id" in params
+    ):
+        if selection.selector.get("dependencies", []) != _dependency_snapshot(
+            session,
+            scope,
+            [
+                uuid.UUID(item["id"])
+                for item in selection.selector.get("dependencies", [])
+            ],
+        ):
+            return _rejected(
+                session, scope, key, payload.action, request_hash,
+                "selection_changed", "目标目录已变化，请重新预览", selection.id,
+            )
+        target = params.get("target_folder_id")
+        resolve_available_folder(session, scope, uuid.UUID(target) if target else None)
+
+    ids = sorted(
+        {uuid.UUID(item["id"]) for item in members}, key=str
+    )
+    locked = {
+        item.id: item
+        for item in session.scalars(
+            select(Case)
+            .where(
+                Case.workspace_id == scope.workspace_id,
+                Case.project_id == scope.project_id,
+                Case.id.in_(ids),
+            )
+            .order_by(Case.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    }
+    operation = _persist_operation(
+        session, scope, key, payload.action, request_hash, {}
+    )
+    results: list[dict] = []
+    now = datetime.now(UTC)
+    for frozen in members:
+        case_id = uuid.UUID(frozen["id"])
+        case = locked.get(case_id)
+        try:
+            with session.begin_nested():
+                result = _apply_case_item(
+                    session, scope, operation, payload.action, params,
+                    frozen, case, now,
+                )
+                session.flush()
+        except AssetItemFailure as error:
+            result = {
+                "resource_type": "case", "id": frozen["id"],
+                "outcome": error.outcome, "code": error.code,
+                "message": error.message, "new_rev": None, "asset": None,
+            }
+        results.append(result)
+    operation.result = {
+        "result_kind": "completed",
+        "selection_id": str(selection.id),
+        "root": None,
+        "counts": {
+            "input": len(results),
+            "succeeded": sum(item["outcome"] == "succeeded" for item in results),
+            "no_change": sum(item["outcome"] == "no_change" for item in results),
+            "conflict": sum(item["outcome"] == "conflict" for item in results),
+            "failed": sum(
+                item["outcome"] in {"not_found_or_inaccessible", "invalid_target"}
+                for item in results
+            ),
+        },
+        "items": results,
+        "members": [],
+    }
+    return operation
+
+
+def _apply_case_item(
+    session: Session,
+    scope: deps.ProjectScope,
+    operation: AssetOperation,
+    action: str,
+    params: dict,
+    frozen: dict,
+    case: Case | None,
+    now: datetime,
+) -> dict:
+    if case is None or frozen.get("rev") is None:
+        raise AssetItemFailure(
+            "not_found_or_inaccessible",
+            "not_found_or_inaccessible",
+            "用例不存在或当前不可访问",
+        )
+    state = "archived" if case.status == "archived" else "active"
+    current_folder = str(case.folder_id) if case.folder_id else None
+    current_operation = str(case.archive_operation_id) if case.archive_operation_id else None
+    if (
+        case.rev != frozen.get("rev")
+        or state != frozen.get("state")
+        or current_folder != frozen.get("folder_id")
+        or current_operation != frozen.get("archive_operation_id")
+    ):
+        raise AssetItemFailure("conflict", "revision_conflict", "用例已在预览后变化")
+    if frozen.get("outcome") != "eligible":
+        code = frozen.get("code") or "asset_state_conflict"
+        raise AssetItemFailure(
+            "invalid_target" if code == "target_invalid" else "conflict",
+            code,
+            "用例不适用于当前动作",
+        )
+
+    before_rev = case.rev
+    original_folder = case.folder_id
+    if action == "move":
+        if state != "active":
+            raise AssetItemFailure("conflict", "asset_state_conflict", "归档用例不能移动")
+        target = params.get("target_folder_id")
+        target_id = uuid.UUID(str(target)) if target else None
+        if case.folder_id == target_id:
+            return _case_result(case, "no_change", "already_applied", None)
+        case.folder_id = target_id
+    elif action == "archive":
+        if state != "active":
+            raise AssetItemFailure("conflict", "asset_state_conflict", "用例已归档")
+        case.status = "archived"
+        case.archive_operation_id = operation.id
+    elif action == "restore":
+        if state != "archived":
+            raise AssetItemFailure("conflict", "asset_state_conflict", "用例未归档")
+        target = params.get("target_folder_id") if "target_folder_id" in params else case.folder_id
+        target_id = uuid.UUID(str(target)) if target else None
+        if "target_folder_id" not in params and target_id is not None:
+            try:
+                resolve_available_folder(session, scope, target_id)
+            except AssetLifecycleError as error:
+                raise AssetItemFailure("invalid_target", "target_invalid", error.message) from error
+        case.folder_id = target_id
+        case.status = "draft"
+        case.archive_operation_id = None
+    else:
+        raise AssetItemFailure("invalid_target", "invalid_asset_operation", "不支持的批量动作")
+    case.rev += 1
+    if action == "archive":
+        session.add(AssetArchiveMember(
+            workspace_id=scope.workspace_id,
+            project_id=scope.project_id,
+            operation_id=operation.id,
+            case_id=case.id,
+            folder_id=None,
+            before_rev=before_rev,
+            archived_rev=case.rev,
+            original_parent_id=original_folder,
+            before_state="active",
+        ))
+    return _case_result(case, "succeeded", None, case.rev)
+
+
+def _case_result(
+    case: Case, outcome: str, code: str | None, new_rev: int | None
+) -> dict:
+    return {
+        "resource_type": "case", "id": str(case.id),
+        "outcome": outcome, "code": code,
+        "message": "操作成功" if outcome == "succeeded" else "未发生变化",
+        "new_rev": new_rev,
+        "asset": _asset_metadata("case", case),
+    }
+
+
 def _preview_dependencies(
     session: Session,
     scope: deps.ProjectScope,
@@ -680,11 +974,10 @@ def _preview_dependencies(
         if target:
             dependency_ids.add(uuid.UUID(target))
     elif payload.action == "restore":
-        target = params.get("target_folder_id") if "target_folder_id" in params else (
-            eligible[0].get("folder_id") if eligible else None
-        )
-        if target:
-            dependency_ids.add(uuid.UUID(str(target)))
+        if "target_folder_id" in params:
+            target = params.get("target_folder_id")
+            if target:
+                dependency_ids.add(uuid.UUID(str(target)))
     elif payload.action == "folder_restore":
         root_id = uuid.UUID(root["id"])
         root_item = next((item for item in eligible if item["resource_type"] == "folder" and item["id"] == str(root_id)), None)
