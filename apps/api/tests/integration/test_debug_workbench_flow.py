@@ -179,6 +179,7 @@ def test_queued_run_does_not_switch_target_when_environment_changes(
     moved = client.patch(
         f"{base}/environments/{environment['id']}",
         json={"base_url": CONTROLLED_TARGET_ALT_BASE_URL},
+        headers={"If-Match": str(environment["rev"])},
     )
     assert moved.status_code == 200, moved.text
 

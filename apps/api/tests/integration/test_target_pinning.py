@@ -138,6 +138,7 @@ def test_target_change_between_prepare_and_send_blocks_the_request(
         patched = client.patch(
             f"{project_base(account, project)}/environments/{environment['id']}",
             json={"base_url": CONTROLLED_TARGET_ALT_BASE_URL},
+            headers={"If-Match": str(environment["rev"])},
         )
         narrowed = client.put(
             f"{_pools_base(account, project)}/{project['pool_id']}/targets",

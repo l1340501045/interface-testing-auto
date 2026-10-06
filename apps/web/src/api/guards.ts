@@ -37,10 +37,19 @@ import type {
   RunStep,
   RunSummary,
   RunnerPool,
+  ConfigBasis,
+  ResolutionLocation,
+  ResolutionPreview,
+  ResolutionIssue,
   Secret,
   SecretVersion,
   SessionInfo,
   VariablesSet,
+  VariableContext,
+  VariableSource,
+  AvailableVariableSource,
+  FrozenResolution,
+  ValueLiteral,
   Workspace,
   WorkspaceMember,
 } from "./types";
@@ -73,6 +82,12 @@ function asNumber(value: unknown, field: string): number {
   return value;
 }
 
+function asInteger(value: unknown, field: string, minimum = 0): number {
+  const result = asNumber(value, field);
+  if (!Number.isInteger(result) || result < minimum) throw new ContractError(`${field} 应为不小于 ${minimum} 的整数`);
+  return result;
+}
+
 function asBoolean(value: unknown, field: string): boolean {
   if (typeof value !== "boolean") throw new ContractError(`${field} 应为布尔值`);
   return value;
@@ -90,6 +105,149 @@ function asRecord(value: unknown, field: string): Record<string, unknown> {
 
 function mapList<T>(value: unknown, field: string, item: (raw: unknown, index: number) => T): T[] {
   return asArray(value, field).map(item);
+}
+
+function toValueLiteral(raw: unknown, field: string): ValueLiteral {
+  const record = asRecord(raw, field);
+  const type = asString(record.type, `${field}.type`);
+  if (type === "number" || type === "string" || type === "json") {
+    return { type, text: asString(record.text, `${field}.text`) };
+  }
+  if (type === "boolean") return { type, value: asBoolean(record.value, `${field}.value`) };
+  if (type === "null") return { type };
+  throw new ContractError(`${field}.type 不是支持的普通变量类型`);
+}
+
+function toConfigBasis(raw: unknown, field: string): ConfigBasis {
+  const record = asRecord(raw, field);
+  return {
+    project_variables_version: asInteger(record.project_variables_version, `${field}.project_variables_version`),
+    project_config_version_id: asNullableString(record.project_config_version_id, `${field}.project_config_version_id`),
+    environment_rev: asInteger(record.environment_rev, `${field}.environment_rev`, 1),
+    environment_config_version: asInteger(record.environment_config_version, `${field}.environment_config_version`, 1),
+    environment_config_version_id: asString(record.environment_config_version_id, `${field}.environment_config_version_id`),
+  };
+}
+
+function toResolutionScope(raw: unknown, field: string) {
+  const record = asRecord(raw, field);
+  return {
+    workspace_id: asString(record.workspace_id, `${field}.workspace_id`),
+    project_id: asString(record.project_id, `${field}.project_id`),
+    environment_id: asString(record.environment_id, `${field}.environment_id`),
+  };
+}
+
+function toVariableSource(raw: unknown, field: string): VariableSource {
+  const record = asRecord(raw, field);
+  const level = asString(record.level, `${field}.level`);
+  if (level !== "project" && level !== "environment") throw new ContractError(`${field}.level 不是支持的变量来源`);
+  const base = {
+    level: level as VariableSource["level"],
+    resource_id: asString(record.resource_id, `${field}.resource_id`),
+    revision: asInteger(record.revision, `${field}.revision`),
+  };
+  if (record.unavailable_reason === null) {
+    return { ...base, value: toValueLiteral(record.value, `${field}.value`), unavailable_reason: null };
+  }
+  const unavailableReason = asString(record.unavailable_reason, `${field}.unavailable_reason`);
+  if (record.value !== null) throw new ContractError(`${field}.value 在来源不可用时应为 null`);
+  return { ...base, value: null, unavailable_reason: unavailableReason };
+}
+
+function toAvailableVariableSource(raw: unknown, field: string): AvailableVariableSource {
+  const source = toVariableSource(raw, field);
+  if (source.unavailable_reason !== null) throw new ContractError(`${field} 必须是可用普通变量来源`);
+  return source;
+}
+
+function toUtf16Span(raw: unknown, field: string): { start: number; end: number } | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const record = asRecord(raw, field);
+  const start = asInteger(record.start, `${field}.start`);
+  const end = asInteger(record.end, `${field}.end`);
+  if (end < start) throw new ContractError(`${field}.end 不能小于 start`);
+  return { start, end };
+}
+
+function toResolutionLocation(raw: unknown, field: string): ResolutionLocation {
+  const record = asRecord(raw, field);
+  const kind = asString(record.kind, `${field}.kind`);
+  const span = toUtf16Span(record.utf16_span, `${field}.utf16_span`);
+  if (kind === "path") {
+    if (asString(record.field, `${field}.field`) !== "path") throw new ContractError(`${field}.field 应为 path`);
+    return { kind, field: "path", ...(span === undefined ? {} : { utf16_span: span }) };
+  }
+  if (kind === "body") {
+    if (asString(record.field, `${field}.field`) !== "body") throw new ContractError(`${field}.field 应为 body`);
+    return { kind, field: "body", selector: mapList(record.selector, `${field}.selector`, itemGuard(`${field}.selector`, toLocatorStep)), ...(span === undefined ? {} : { utf16_span: span }) };
+  }
+  if (kind === "query" || kind === "header") {
+    if (asString(record.field, `${field}.field`) !== "value") throw new ContractError(`${field}.field 应为 value`);
+    if (record.row_id !== undefined && record.row_id !== null) {
+      const rowId = asString(record.row_id, `${field}.row_id`);
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rowId)) {
+        throw new ContractError(`${field}.row_id 应为 UUID`);
+      }
+      if (record.index != null || record.occurrence != null || record.input_fingerprint != null) {
+        throw new ContractError(`${field} 的 v2 行不能混入 v1 索引字段`);
+      }
+      return { kind, field: "value", row_id: rowId, ...(span === undefined ? {} : { utf16_span: span }) };
+    }
+    if (record.index == null || record.occurrence == null || record.input_fingerprint == null) {
+      throw new ContractError(`${field} 的 v1 行缺少 index、occurrence 或 input_fingerprint`);
+    }
+    return {
+      kind,
+      field: "value",
+      index: asInteger(record.index, `${field}.index`),
+      occurrence: asInteger(record.occurrence, `${field}.occurrence`),
+      input_fingerprint: asString(record.input_fingerprint, `${field}.input_fingerprint`),
+      ...(span === undefined ? {} : { utf16_span: span }),
+    };
+  }
+  throw new ContractError(`${field}.kind 不是支持的请求位置`);
+}
+
+const PREFLIGHT_ACTIONS = new Set([
+  "edit_request", "select_environment", "manage_credentials", "authorize", "contact_admin",
+  "configure_environment", "restore_case", "organize_case",
+]);
+
+function toPreflightAction(raw: unknown, field: string): PreflightIssue["action"] {
+  const action = asString(raw, field);
+  if (!PREFLIGHT_ACTIONS.has(action)) throw new ContractError(`未知预检动作：${action}`);
+  return action as PreflightIssue["action"];
+}
+
+function toResolutionIssue(raw: unknown, field: string): ResolutionIssue {
+  const record = asRecord(raw, field);
+  return {
+    issue_id: asString(record.issue_id, `${field}.issue_id`),
+    code: asString(record.code, `${field}.code`),
+    message: asString(record.message, `${field}.message`),
+    action: toPreflightAction(record.action, `${field}.action`),
+    location: record.location === null ? null : toResolutionLocation(record.location, `${field}.location`),
+  };
+}
+
+function toResolutionBinding(raw: unknown, field: string): ResolutionPreview["bindings"][number] {
+  const binding = asRecord(raw, field);
+  const valueType = asString(binding.value_type, `${field}.value_type`);
+  if (!["number", "string", "boolean", "null", "json"].includes(valueType)) {
+    throw new ContractError(`${field}.value_type 未知`);
+  }
+  return {
+    binding_id: asString(binding.binding_id, `${field}.binding_id`),
+    reference: asString(binding.reference, `${field}.reference`),
+    name: asString(binding.name, `${field}.name`),
+    location: toResolutionLocation(binding.location, `${field}.location`),
+    source: toAvailableVariableSource(binding.source, `${field}.source`),
+    overridden_sources: mapList(binding.overridden_sources, `${field}.overridden_sources`, (source, sourceIndex) =>
+      toVariableSource(source, `${field}.overridden_sources[${sourceIndex}]`)),
+    value_type: valueType as ResolutionPreview["bindings"][number]["value_type"],
+    rendered_preview: asString(binding.rendered_preview, `${field}.rendered_preview`),
+  };
 }
 
 // —— 各资源的校验器 ——
@@ -258,6 +416,8 @@ function toEnvironmentItem(raw: unknown, field: string): Environment {
     pool_id: asNullableString(record.pool_id, `${field}.pool_id`),
     variables: asRecord(record.variables, `${field}.variables`),
     status: asString(record.status, `${field}.status`),
+    rev: asInteger(record.rev, `${field}.rev`, 1),
+    config_version: record.config_version === null ? null : asInteger(record.config_version, `${field}.config_version`, 1),
   };
 }
 
@@ -267,6 +427,94 @@ export function toEnvironment(raw: unknown): Environment {
 
 export function toEnvironmentList(raw: unknown): Environment[] {
   return mapList(raw, "环境列表", (item, index) => toEnvironmentItem(item, `环境[${index}]`));
+}
+
+export function toVariableContext(raw: unknown): VariableContext {
+  const record = asRecord(raw, "变量目录");
+  if (asInteger(record.schema_version, "变量目录.schema_version", 1) !== 1) {
+    throw new ContractError("变量目录.schema_version 不受支持");
+  }
+  return {
+    schema_version: 1,
+    scope: toResolutionScope(record.scope, "变量目录.scope"),
+    config_basis: toConfigBasis(record.config_basis, "变量目录.config_basis"),
+    variables: mapList(record.variables, "变量目录.variables", (item, index) => {
+      const field = `变量目录.variables[${index}]`;
+      const entry = asRecord(item, field);
+      const locations = mapList(entry.available_locations, `${field}.available_locations`, (value, locationIndex) => {
+        const location = asString(value, `${field}.available_locations[${locationIndex}]`);
+        if (!["path", "query_value", "header_value", "body"].includes(location)) {
+          throw new ContractError(`${field}.available_locations[${locationIndex}] 不是支持的插入位置`);
+        }
+        return location as VariableContext["variables"][number]["available_locations"][number];
+      });
+      return {
+        name: asString(entry.name, `${field}.name`),
+        reference: asNullableString(entry.reference, `${field}.reference`),
+        value: entry.value === null ? null : toValueLiteral(entry.value, `${field}.value`),
+        effective_source: entry.effective_source === null ? null : toAvailableVariableSource(entry.effective_source, `${field}.effective_source`),
+        overridden_sources: mapList(entry.overridden_sources, `${field}.overridden_sources`, (source, sourceIndex) =>
+          toVariableSource(source, `${field}.overridden_sources[${sourceIndex}]`)),
+        available_locations: locations,
+        restricted_body_types: mapList(entry.restricted_body_types, `${field}.restricted_body_types`, (value, bodyIndex) => {
+          const bodyType = asString(value, `${field}.restricted_body_types[${bodyIndex}]`);
+          if (bodyType !== "form") throw new ContractError(`${field}.restricted_body_types[${bodyIndex}] 未知`);
+          return bodyType;
+        }),
+        unavailable_reason: asNullableString(entry.unavailable_reason, `${field}.unavailable_reason`),
+      };
+    }),
+  };
+}
+
+export function toResolutionPreview(raw: unknown): ResolutionPreview {
+  const record = asRecord(raw, "解析预览");
+  if (asInteger(record.schema_version, "解析预览.schema_version", 1) !== 1) {
+    throw new ContractError("解析预览.schema_version 不受支持");
+  }
+  const ordinary = asString(record.ordinary_resolution, "解析预览.ordinary_resolution");
+  if (ordinary !== "ready" && ordinary !== "invalid") throw new ContractError("解析预览.ordinary_resolution 未知");
+  const maskedTarget = record.masked_target === null
+    ? null
+    : (() => {
+        const target = asRecord(record.masked_target, "解析预览.masked_target");
+        return {
+          url: asString(target.url, "解析预览.masked_target.url"),
+          method: asString(target.method, "解析预览.masked_target.method"),
+        };
+      })();
+  const auth = asRecord(record.auth, "解析预览.auth");
+  const authStatus = asString(auth.status, "解析预览.auth.status");
+  if (!["none", "ready", "needs_authorization", "unavailable", "ambiguous", "unchecked"].includes(authStatus)) {
+    throw new ContractError("解析预览.auth.status 未知");
+  }
+  return {
+    schema_version: 1,
+    scope: toResolutionScope(record.scope, "解析预览.scope"),
+    ready: asBoolean(record.ready, "解析预览.ready"),
+    ordinary_resolution: ordinary,
+    masked_target: maskedTarget,
+    bindings: mapList(record.bindings, "解析预览.bindings", (item, index) => toResolutionBinding(item, `解析预览.bindings[${index}]`)),
+    issues: mapList(record.issues, "解析预览.issues", (item, index) =>
+      toResolutionIssue(item, `解析预览.issues[${index}]`)),
+    auth: {
+      required: asBoolean(auth.required, "解析预览.auth.required"),
+      status: authStatus as ResolutionPreview["auth"]["status"],
+      injection_slots: mapList(auth.injection_slots, "解析预览.auth.injection_slots", (item, index) => {
+        const field = `解析预览.auth.injection_slots[${index}]`;
+        const slot = asRecord(item, field);
+        const kind = asString(slot.kind, `${field}.kind`);
+        const status = asString(slot.status, `${field}.status`);
+        if (kind !== "header" && kind !== "query") throw new ContractError(`${field}.kind 未知`);
+        if (!["available", "conflict", "pending_worker_verification"].includes(status)) throw new ContractError(`${field}.status 未知`);
+        return { kind, name: asString(slot.name, `${field}.name`), status: status as ResolutionPreview["auth"]["injection_slots"][number]["status"] };
+      }),
+      requires_worker_verification: asBoolean(auth.requires_worker_verification, "解析预览.auth.requires_worker_verification"),
+    },
+    config_basis: toConfigBasis(record.config_basis, "解析预览.config_basis"),
+    context_fingerprint: asString(record.context_fingerprint, "解析预览.context_fingerprint"),
+    resolution_context: asNullableString(record.resolution_context, "解析预览.resolution_context"),
+  };
 }
 
 export function toFolderList(raw: unknown): Folder[] {
@@ -595,12 +843,61 @@ export function toDebugSnapshotDigest(raw: unknown): string {
   return asString(record.hash, "调试摘要.hash");
 }
 
+function toFrozenResolution(raw: unknown): FrozenResolution | null {
+  if (raw === null || raw === undefined) return null;
+  try {
+    const record = asRecord(raw, "运行报告.resolution");
+    if (asInteger(record.schema_version, "运行报告.resolution.schema_version", 1) !== 1) return null;
+    return {
+      schema_version: 1,
+      config_basis: toConfigBasis(record.config_basis, "运行报告.resolution.config_basis"),
+      variable_sources: mapList(record.variable_sources, "运行报告.resolution.variable_sources", (item, index) => {
+        const field = `运行报告.resolution.variable_sources[${index}]`;
+        const source = asRecord(item, field);
+        return {
+          name: asString(source.name, `${field}.name`),
+          source: toAvailableVariableSource(source.source, `${field}.source`),
+          overridden_sources: mapList(source.overridden_sources, `${field}.overridden_sources`, (entry, sourceIndex) =>
+            toVariableSource(entry, `${field}.overridden_sources[${sourceIndex}]`)),
+        };
+      }),
+      bindings: mapList(record.bindings, "运行报告.resolution.bindings", (item, index) =>
+        toResolutionBinding(item, `运行报告.resolution.bindings[${index}]`)),
+      context_fingerprint: asString(record.context_fingerprint, "运行报告.resolution.context_fingerprint"),
+    };
+  } catch {
+    // 新旁路字段损坏或版本未知只表示“冻结来源不可验证”，不能让旧报告基本内容不可读。
+    return null;
+  }
+}
+
 function toRunContext(raw: unknown): RunContext | null {
   // 缺席与 null 同义：后端在“来源无法证明”（旧记录、旧执行器、主密钥已轮换）时不给
   // 结论。缺失不是错误，因此这里不抛异常，只是没有可用来关联的标记。
   if (raw === null || raw === undefined) return null;
   const record = asRecord(raw, "运行报告.context");
   const environment = asRecord(record.environment, "运行报告.context.environment");
+  const resolution = record.resolution;
+  let decodedResolution: RunContext["resolution"] = null;
+  if (resolution !== null && resolution !== undefined) {
+    try {
+        const proof = asRecord(resolution, "运行报告.context.resolution");
+        if (asInteger(proof.schema_version, "运行报告.context.resolution.schema_version", 1) !== 1) {
+          throw new ContractError("运行报告.context.resolution.schema_version 不受支持");
+        }
+        if (asString(proof.guard, "运行报告.context.resolution.guard") !== "ordinary_binding_enforced_v1") {
+          throw new ContractError("运行报告.context.resolution.guard 不受支持");
+        }
+        decodedResolution = {
+          schema_version: 1 as const,
+          guard: "ordinary_binding_enforced_v1" as const,
+          context_fingerprint: asString(proof.context_fingerprint, "运行报告.context.resolution.context_fingerprint"),
+          binding_fingerprint: asString(proof.binding_fingerprint, "运行报告.context.resolution.binding_fingerprint"),
+        };
+    } catch {
+      decodedResolution = null;
+    }
+  }
   return {
     snapshot_fingerprint: asString(
       record.snapshot_fingerprint,
@@ -613,6 +910,7 @@ function toRunContext(raw: unknown): RunContext | null {
       base_url: asString(environment.base_url, "运行报告.context.environment.base_url"),
     },
     input_fingerprint: asString(record.input_fingerprint, "运行报告.context.input_fingerprint"),
+    resolution: decodedResolution,
   };
 }
 
@@ -635,14 +933,10 @@ export function toDebugPreflight(raw: unknown): DebugPreflight {
     issues: mapList(record.issues, "预检结果.issues", (item, index): PreflightIssue => {
       const field = `预检结果.issues[${index}]`;
       const entry = asRecord(item, field);
-      const action = asString(entry.action, `${field}.action`);
-      if (!["edit_request", "select_environment", "manage_credentials", "authorize", "contact_admin", "configure_environment", "restore_case", "organize_case"].includes(action)) {
-        throw new ContractError(`未知预检动作：${action}`);
-      }
       return {
         code: asString(entry.code, `${field}.code`),
         message: asString(entry.message, `${field}.message`),
-        action: action as PreflightIssue["action"],
+        action: toPreflightAction(entry.action, `${field}.action`),
       };
     }),
     can_authorize: asBoolean(record.can_authorize, "预检结果.can_authorize"),
@@ -652,6 +946,9 @@ export function toDebugPreflight(raw: unknown): DebugPreflight {
       profile_id: asNullableString(auth.profile_id, "预检结果.auth.profile_id"),
     },
     context: toRunContext(record.context),
+    resolution: record.resolution === null || record.resolution === undefined
+      ? null
+      : toResolutionPreview(record.resolution),
   };
 }
 
@@ -684,6 +981,7 @@ export function toRunReport(raw: unknown): RunReport {
     request: request === null || request === undefined ? null : asRecord(request, "运行报告.request"),
     response: response === null || response === undefined ? null : asRecord(response, "运行报告.response"),
     context: toRunContext(record.context),
+    resolution: toFrozenResolution(record.resolution),
   };
 }
 

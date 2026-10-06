@@ -77,6 +77,8 @@ function makeEnvironment(baseUrl: string) {
     pool_id: null,
     variables: {},
     status: "active",
+    rev: 1,
+    config_version: 1,
   };
 }
 let environment = makeEnvironment("http://echo.test");
@@ -124,6 +126,14 @@ const PREFLIGHT_READY = {
     input_fingerprint: "in-1",
   },
 };
+const RESOLUTION = {
+  schema_version: 1, scope: { workspace_id: WORKSPACE_ID, project_id: PROJECT_ID, environment_id: ENV_ID }, ready: true,
+  ordinary_resolution: "ready", masked_target: { url: "http://echo.test/echo", method: "GET" }, bindings: [], issues: [],
+  auth: { required: false, status: "none", injection_slots: [], requires_worker_verification: false },
+  config_basis: { project_variables_version: 1, project_config_version_id: null, environment_rev: 1, environment_config_version: 1, environment_config_version_id: "cfg" },
+  context_fingerprint: "source-fp", resolution_context: "resolution-context",
+};
+Object.assign(PREFLIGHT_READY, { resolution: RESOLUTION });
 
 const RUN_REPORT = {
   run: {
@@ -154,7 +164,9 @@ const RUN_REPORT = {
     snapshot_fingerprint: "fp-1",
     environment: { id: ENV_ID, name: "测试环境", kind: "test", base_url: "http://echo.test" },
     input_fingerprint: "in-1",
+    resolution: { schema_version: 1, guard: "ordinary_binding_enforced_v1", context_fingerprint: "source-fp", binding_fingerprint: "binding-fp" },
   },
+  resolution: { schema_version: 1, config_basis: RESOLUTION.config_basis, variable_sources: [], bindings: [], context_fingerprint: "source-fp" },
 };
 
 /** 去掉查询串：列表接口会带筛选参数，路由按基础路径匹配。 */
@@ -233,17 +245,20 @@ function route(rawPath: string, method: string, body?: unknown): unknown {
         can_authorize: true,
         auth: { required: false, state: "none", profile_id: null },
         context: null,
+        resolution: null,
       };
     }
     // 预检按**当前**环境回答：环境改了之后旧结论不再匹配。
     return {
       ...PREFLIGHT_READY,
+      resolution: { ...RESOLUTION, masked_target: { url: `${environment.base_url}/echo`, method: "GET" } },
       context: {
         ...PREFLIGHT_READY.context,
         environment: { ...PREFLIGHT_READY.context.environment, base_url: environment.base_url },
       },
     };
   }
+  if (method === "POST" && path.endsWith("/resolution-preview")) return RESOLUTION;
   if (method === "POST" && path.endsWith("/runs")) {
     return { ...RUN_REPORT.run, state: "queued", outcome: null };
   }

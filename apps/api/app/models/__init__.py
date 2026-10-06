@@ -18,7 +18,14 @@ from .credentials import (
     SecretVersion,
 )
 from .identity import Session, User, Workspace, WorkspaceMembership
-from .projects import Environment, Project, ProjectConfigVersion, RunnerPool, RunnerPoolProjectGrant
+from .projects import (
+    Environment,
+    EnvironmentConfigVersion,
+    Project,
+    ProjectConfigVersion,
+    RunnerPool,
+    RunnerPoolProjectGrant,
+)
 from .runs import AssertionResult, AuditEvent, IdempotencyRecord, Job, Run, RunStepAttempt
 
 __all__ = [
@@ -39,6 +46,7 @@ __all__ = [
     "CredentialSetSecretVersion",
     "CredentialUseGrant",
     "Environment",
+    "EnvironmentConfigVersion",
     "Folder",
     "IdempotencyRecord",
     "Job",

@@ -214,6 +214,8 @@ function renderEditor(caseSummaryId: string | null) {
           pool_id: null,
           variables: {},
           status: "active",
+          rev: 1,
+          config_version: 1,
         },
       ]}
       selectedEnvironmentId={ENV_ID}

@@ -95,6 +95,10 @@ printf '%s' "$ADMIN_PASSWORD" | docker compose run -T --rm api \
 - 旧 `DELETE /cases/{id}`、`DELETE /folders/{id}` 停止执行归档，分别返回 `409/asset_operation_required`、`409/asset_selection_required`。请改用 `/asset-selections` 预览，再用 `/asset-operations` 及 `Idempotency-Key` 确认；`/asset-operations/by-key/{key}` 用于查询原结果。
 - Folder PATCH 须携 `If-Match`；显式 `parent_id=null` 表示移动到根目录。
 - 已保存用例的 `debug_snapshot` 运行带顶层 `source_case_id`，独立临时请求省略。原无来源请求的幂等与内容授权规则保持；归档不能作为取消旧已受理运行的方式。
+- 环境列表返回 `rev` 和 `config_version`。`PATCH /environments/{id}` 须携编辑起点的 `If-Match: <rev>`；项目变量 `PUT /variables` 须携读取到的 `If-Match: <version>`，首次写入为 `0`。缺条件返回 `409/config_revision_required`，陈旧条件返回 `409/config_revision_conflict`；重新读取后明确处理冲突，不能自动覆盖。
+- `GET /variable-context?environment_id=...` 提供普通变量及来源；`POST /resolution-preview` 接受执行环境及 `debug_snapshot` 或 `case_version_id` 二选一。原 `/debug-preflight` 保留已有信封，并在同级 `resolution` 提供解析依据。预览不创建运行、不使用秘密或发送被测请求。
+- `/runs` 可携非空 `resolution_context` 检查普通配置是否仍与预览一致；它不能替代运行权限或凭证授权。首次普通变量缺失、绑定失败、认证槽位冲突分别返回 `400/variable_undefined`、`400/binding_invalid`、`400/credential_slot_conflict`，此时没有创建运行或队列任务。依据变化返回 `409/resolution_context_changed`；当前配置记录不一致返回 `409/config_inconsistent`。未携新依据的旧合法调用仍由服务端完整解析。
+- 已受理操作继续用原幂等键、内容及依据确认，不因后来配置变化或预览到期重新发送。旧报告没有变量来源时显示未记录，不用当前配置补写历史。
 
 ### 多请求标签与参数录入
 
@@ -129,6 +133,16 @@ printf '%s' "$ADMIN_PASSWORD" | docker compose run -T --rm api \
 变量写法是 `{{变量名}}`，取值来自项目普通变量与执行环境普通变量（同名时环境级优先），
 在**发送前**按本次执行的冻结输入解析。未定义的变量在发出请求前直接失败：不会静默替换，
 也不会把 `{{...}}` 当字面量发出去。保存和导入都不发送请求。
+
+路径、参数值、请求头值和正文旁可以选择已有普通变量，插入到当前光标或选区；
+中文、点号等是变量完整名字，不表示额外的命名空间。选择器只提供本次有效来源，
+「查看变量来源」可查看采用的值、版本以及被同名环境变量覆盖的项目值。
+不能安全直接引用的旧名字会保留并说明原因，秘密不出现在普通变量列表中。
+
+缺失变量的提示可以定位原输入；修正后继续发送，无需先保存用例。
+尚未应用的批量或原始文本内容不参与当前解析。环境配置冲突时，页面保留名称、地址和变量草稿，
+并要求明确采用新修订或取消后重新编辑。报告显示运行受理时记录的冻结来源，之后保存配置不会改写它；
+实际绑定是否完成仍以执行进程的证据为准。
 
 **纯文本正文、路径、查询参数、请求头**是文本协议，按字面文本替换，不存在类型：
 数字变量 `shared=1` 在这几处写成 `1`。

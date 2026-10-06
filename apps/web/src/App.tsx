@@ -1250,6 +1250,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
                 onSelect={setSettingsEnvironmentId}
                 canEdit={canEdit(currentProject?.role ?? null)}
                 onChanged={onEnvironmentsChanged}
+                onReload={environments.reload}
                 open={environmentOpen || environmentList.length === 0}
                 onOpenChange={setEnvironmentOpen}
               />

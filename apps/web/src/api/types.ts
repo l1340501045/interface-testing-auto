@@ -85,6 +85,10 @@ export interface Environment {
   pool_id: string | null;
   variables: Record<string, unknown>;
   status: string;
+  /** 环境配置的并发修订；写入时必须通过 If-Match 原样提交。 */
+  rev: number;
+  /** 当前不可变配置版本；异常旧数据可能暂时没有，不能按 0 使用。 */
+  config_version: number | null;
 }
 
 export interface Folder {
@@ -367,6 +371,12 @@ export interface RunContext {
     base_url: string;
   };
   input_fingerprint: string;
+  resolution?: {
+    schema_version: 1;
+    guard: "ordinary_binding_enforced_v1";
+    context_fingerprint: string;
+    binding_fingerprint: string;
+  } | null;
 }
 
 export interface RunReport {
@@ -377,6 +387,8 @@ export interface RunReport {
   response: Record<string, unknown> | null;
   /** 缺席与 null 同义：这条记录给不出“按哪份配置产生”的结论，只能当历史查看。 */
   context: RunContext | null;
+  /** 受理时冻结的普通变量来源；旧运行或不可验证数据为 null。 */
+  resolution?: FrozenResolution | null;
 }
 
 // —— 发送前预检 ——
@@ -405,6 +417,117 @@ export interface PreflightIssue {
   action: PreflightAction;
 }
 
+export interface ResolutionIssue extends PreflightIssue {
+  issue_id: string;
+  location: ResolutionLocation | null;
+}
+
+export interface ConfigBasis {
+  project_variables_version: number;
+  project_config_version_id: string | null;
+  environment_rev: number;
+  environment_config_version: number;
+  environment_config_version_id: string;
+}
+
+export interface ResolutionScope {
+  workspace_id: string;
+  project_id: string;
+  environment_id: string;
+}
+
+export interface VariableSourceBase {
+  level: "project" | "environment";
+  resource_id: string;
+  revision: number;
+}
+
+export interface AvailableVariableSource extends VariableSourceBase {
+  value: ValueLiteral;
+  unavailable_reason: null;
+}
+
+export interface UnavailableVariableSource extends VariableSourceBase {
+  value: null;
+  unavailable_reason: string;
+}
+
+export type VariableSource = AvailableVariableSource | UnavailableVariableSource;
+
+export type VariableLocation = "path" | "query_value" | "header_value" | "body";
+
+export interface VariableContextItem {
+  name: string;
+  reference: string | null;
+  value: ValueLiteral | null;
+  effective_source: AvailableVariableSource | null;
+  overridden_sources: VariableSource[];
+  available_locations: VariableLocation[];
+  restricted_body_types: Array<"form">;
+  unavailable_reason: string | null;
+}
+
+export interface VariableContext {
+  schema_version: 1;
+  scope: ResolutionScope;
+  config_basis: ConfigBasis;
+  variables: VariableContextItem[];
+}
+
+export type ResolutionLocation =
+  | { kind: "path"; field: "path"; utf16_span?: { start: number; end: number } }
+  | { kind: "query" | "header"; field: "value"; row_id: string; utf16_span?: { start: number; end: number } }
+  | { kind: "query" | "header"; field: "value"; index: number; occurrence: number; input_fingerprint: string; utf16_span?: { start: number; end: number } }
+  | { kind: "body"; field: "body"; selector: LocatorStep[]; utf16_span?: { start: number; end: number } };
+
+export interface ResolutionBinding {
+  binding_id: string;
+  reference: string;
+  name: string;
+  location: ResolutionLocation;
+  source: AvailableVariableSource;
+  overridden_sources: VariableSource[];
+  value_type: LiteralType;
+  rendered_preview: string;
+}
+
+export interface ResolutionAuth {
+  required: boolean;
+  status: PreflightAuthState | "unchecked";
+  injection_slots: Array<{
+    kind: "header" | "query";
+    name: string;
+    status: "available" | "conflict" | "pending_worker_verification";
+  }>;
+  requires_worker_verification: boolean;
+}
+
+export interface ResolutionPreview {
+  schema_version: 1;
+  scope: ResolutionScope;
+  ready: boolean;
+  ordinary_resolution: "ready" | "invalid";
+  masked_target: { url: string; method: string } | null;
+  bindings: ResolutionBinding[];
+  issues: ResolutionIssue[];
+  auth: ResolutionAuth;
+  config_basis: ConfigBasis;
+  context_fingerprint: string;
+  resolution_context: string | null;
+}
+
+export interface FrozenResolution {
+  schema_version: 1;
+  config_basis: ConfigBasis;
+  variable_sources: Array<{
+    name: string;
+    source: AvailableVariableSource;
+    overridden_sources: VariableSource[];
+  }>;
+  bindings: ResolutionBinding[];
+  context_fingerprint: string;
+}
+
 export interface DebugPreflight {
   ready: boolean;
   issues: PreflightIssue[];
@@ -415,6 +538,8 @@ export interface DebugPreflight {
     profile_id: string | null;
   };
   context: RunContext | null;
+  /** 旧服务端可缺席；缺席/null 都表示未建立 S1 解析范围。 */
+  resolution?: ResolutionPreview | null;
 }
 
 // —— 管理页契约：普通变量、执行池白名单与人工凭证 ——

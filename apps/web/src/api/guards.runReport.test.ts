@@ -55,4 +55,37 @@ describe("运行报告兼容解释", () => {
     expect(report.steps[0]?.outcome).toBe("error");
     expect(report.steps[0]?.interpretation).toBeNull();
   });
+
+  it("未知或损坏的 S1 来源证明不破坏旧报告，也不被当成已验证", () => {
+    const raw = rawReport() as Record<string, unknown>;
+    raw.context = {
+      snapshot_fingerprint: "snapshot",
+      environment: { id: "env-1", name: "环境", kind: "test", base_url: "http://echo.test" },
+      input_fingerprint: "input",
+      resolution: { schema_version: 99, guard: "future_guard" },
+    };
+    raw.resolution = { schema_version: 99, context_fingerprint: "unknown" };
+    const report = toRunReport(raw);
+    expect(report.run.id).toBe("run-1");
+    expect(report.context?.resolution).toBeNull();
+    expect(report.resolution).toBeNull();
+  });
+
+  it("报告冻结 binding 接受 response_model 的可空位置字段并保留 v1 坐标", () => {
+    const raw = rawReport() as Record<string, unknown>;
+    raw.resolution = {
+      schema_version: 1,
+      config_basis: { project_variables_version: 1, project_config_version_id: null, environment_rev: 1, environment_config_version: 1, environment_config_version_id: "cfg" },
+      variable_sources: [],
+      bindings: [{
+        binding_id: "b1", reference: "{{地区.代码}}", name: "地区.代码",
+        location: { kind: "header", field: "value", row_id: null, index: 0, occurrence: 0, input_fingerprint: "input", selector: null, utf16_span: null },
+        source: { level: "project", resource_id: "p1", revision: 1, value: { type: "string", text: "cn" }, unavailable_reason: null },
+        overridden_sources: [], value_type: "string", rendered_preview: "cn",
+      }],
+      context_fingerprint: "source-fp",
+    };
+    const report = toRunReport(raw);
+    expect(report.resolution?.bindings[0]?.location).toEqual({ kind: "header", field: "value", index: 0, occurrence: 0, input_fingerprint: "input" });
+  });
 });

@@ -31,6 +31,13 @@ import { App } from "./App";
 
 const calls: { path: string; method: string; body: unknown; headers?: Record<string, string> }[] = [];
 let runAttempts = 0;
+const RESOLUTION = {
+  schema_version: 1, scope: { workspace_id: WS, project_id: A, environment_id: ENV }, ready: true,
+  ordinary_resolution: "ready", masked_target: { url: "http://echo.test/echo", method: "GET" }, bindings: [], issues: [],
+  auth: { required: false, status: "none", injection_slots: [], requires_worker_verification: false },
+  config_basis: { project_variables_version: 0, project_config_version_id: null, environment_rev: 1, environment_config_version: 1, environment_config_version_id: "cfg" },
+  context_fingerprint: "source-fp", resolution_context: "resolution-context",
+};
 
 const request = { method: "GET", path: "/echo", query_params: [], headers: [], body_type: "none", body: "" };
 
@@ -40,7 +47,7 @@ function raw(path: string, method: string, body: unknown, headers?: Record<strin
     { id: A, workspace_id: WS, key: "a", name: "项目甲", status: "active", role: "admin", pool_id: null },
     { id: B, workspace_id: WS, key: "b", name: "项目乙", status: "active", role: "admin", pool_id: null },
   ];
-  if (path.endsWith("/environments")) return [{ id: ENV, name: "环境", kind: "test", base_url: "http://echo.test", pool_id: null, variables: {}, status: "active" }];
+  if (path.endsWith("/environments")) return [{ id: ENV, name: "环境", kind: "test", base_url: "http://echo.test", pool_id: null, variables: {}, status: "active", rev: 1, config_version: 1 }];
   if (path.endsWith("/folders") || path.endsWith("/assertion-types")) return [];
   if (path.endsWith("/cases")) return path.includes(`/projects/${A}`) ? [{ id: CASE, folder_id: null, name: "unknown 用例", method: "GET", status: "draft", rev: 1, latest_version: 1 }] : [];
   if (path.endsWith(`/cases/${CASE}`)) return { id: CASE, folder_id: null, name: "unknown 用例", request, assertions: [], rev: 1, status: "draft", latest_version: 1, updated_at: "2026-09-27T00:00:00Z", snapshot_hash: "same" };
@@ -50,8 +57,9 @@ function raw(path: string, method: string, body: unknown, headers?: Record<strin
     if (runAttempts === 1) throw new NetworkError("断线");
     return { id: RUN };
   }
+  if (method === "POST" && path.endsWith("/resolution-preview")) return RESOLUTION;
   if (path.includes("/runs")) return [];
-  if (method === "POST" && path.endsWith("/debug-preflight")) return { ready: true, issues: [], can_authorize: false, auth: { required: false, state: "none", profile_id: null }, context: null };
+  if (method === "POST" && path.endsWith("/debug-preflight")) return { ready: true, issues: [], can_authorize: false, auth: { required: false, state: "none", profile_id: null }, context: null, resolution: RESOLUTION };
   if (path.endsWith("/variables") || path.endsWith("/runner-pools") || path.endsWith("/credentials/secrets") || path.endsWith("/credentials/profiles") || path.endsWith("/credentials/grants") || path.endsWith("/members")) return [];
   throw new Error(`未覆盖请求：${method} ${path}`);
 }

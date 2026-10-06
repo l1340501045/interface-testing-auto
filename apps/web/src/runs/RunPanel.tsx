@@ -13,14 +13,17 @@ import { Button, Collapse, Descriptions, Empty, Space, Table, Tag } from "antd";
 
 import { ApiError, apiSend, projectPath } from "../api/client";
 import type { CaseVersion, RunReport, RunSummary } from "../api/types";
+import { toResolutionPreview } from "../api/guards";
 import { ErrorText, Hint, Loading, StatusTag } from "../components/Feedback";
-import { describeValue } from "../api/literals";
+import { describeValue, literalToInput } from "../api/literals";
 import { isTerminal, runOutcomeLabel, runReasonLabel, runStateLabel, runTimeLabel, stepOutcomeLabel, stepStateLabel, uncheckedReasonLabel, useRunReport, useRuns } from "./useRuns";
+import { isInitialRunRejection } from "./runAcceptance";
 
 /** 一次版本提交的执行配置依据：提交**之前**冻结，受理后原样登记。 */
 export interface RunProvenance {
   environmentId: string;
   configEpoch: number;
+  contextFingerprint?: string | null;
 }
 
 function toRunId(raw: unknown): string | null {
@@ -30,20 +33,12 @@ function toRunId(raw: unknown): string | null {
   return id;
 }
 
-/** 后端在创建 Run 记录前就会返回的稳定准入拒绝码；仅首次提交可据此结束本地操作。 */
-const INITIAL_RUN_REJECTIONS = new Map<string, number>([
-  ["target_required", 400],
-  ["case_invalid", 400],
-  ["environment_url_invalid", 400],
-  ["target_not_allowed", 400],
-  ["production_blocked", 403],
-  ["pool_unavailable", 400],
-  ["pool_not_granted", 403],
-  ["pool_config_invalid", 400],
-  ["not_found", 404],
-  ["forbidden", 403],
-  ["client_contract_required", 409],
-]);
+function sourceValueLabel(value: import("../api/types").ValueLiteral | null): string {
+  if (value === null) return "（受保护或不可用）";
+  const parsed = literalToInput(value);
+  if (parsed === null) return "（无法显示）";
+  return parsed.type === "null" ? "null" : parsed.text;
+}
 
 export function ReportView({ report }: { report: RunReport }) {
   return (
@@ -106,6 +101,21 @@ export function ReportView({ report }: { report: RunReport }) {
             { title: "期望", render: (_: unknown, item: RunReport["assertions"][number]) => describeValue(item.expected) },
             { title: "实际", render: (_: unknown, item: RunReport["assertions"][number]) => describeValue(item.actual) },
             { title: "说明", render: (_: unknown, item: RunReport["assertions"][number]) => item.reason_code ?? "" },
+          ]}
+        />
+      )}
+
+      <h4>冻结变量来源</h4>
+      {report.resolution == null ? <Hint>该运行没有记录 S1 变量来源；不会用当前配置补造历史。</Hint> : (
+        <Table
+          size="small"
+          pagination={false}
+          rowKey="name"
+          dataSource={report.resolution.variable_sources}
+          columns={[
+            { title: "变量", dataIndex: "name" },
+            { title: "实际来源", render: (_: unknown, item: NonNullable<RunReport["resolution"]>["variable_sources"][number]) => `${item.source.level === "environment" ? "环境" : "项目"}第 ${item.source.revision} 版：${sourceValueLabel(item.source.value)}` },
+            { title: "被覆盖来源", render: (_: unknown, item: NonNullable<RunReport["resolution"]>["variable_sources"][number]) => item.overridden_sources.length === 0 ? "无" : item.overridden_sources.map((source) => `${source.level === "environment" ? "环境" : "项目"}第 ${source.revision} 版：${sourceValueLabel(source.value)}`).join("；") },
           ]}
         />
       )}
@@ -202,7 +212,7 @@ export function RunPanel({
   const [accepted, setAccepted] = useState<string | null>(null);
   const [unknown, setUnknown] = useState<{
     key: string;
-    payload: { environment_id: string; case_version_id: string };
+    payload: { environment_id: string; case_version_id: string; resolution_context: string };
     version: CaseVersion;
     provenance: RunProvenance;
   } | null>(null);
@@ -260,11 +270,30 @@ export function RunPanel({
         setError("保存或版本准备期间执行环境／配置已变化；已保存成果保留，本次没有继续提交运行。");
         return;
       }
+      const preview = await apiSend(
+        projectPath(workspaceId, projectId, "/resolution-preview"),
+        "POST",
+        { environment_id: environmentId, case_version_id: version.id },
+        toResolutionPreview,
+      );
+      if (!preview.ready || preview.ordinary_resolution !== "ready" || preview.resolution_context === null) {
+        setError(preview.issues[0]?.message ?? "该已发布版本未取得可提交的解析依据；请修正环境或变量配置后重试。");
+        return;
+      }
+      const afterPreview = captureProvenance();
+      if (
+        afterPreview === null ||
+        afterPreview.environmentId !== provenance.environmentId ||
+        afterPreview.configEpoch !== provenance.configEpoch
+      ) {
+        setError("解析预览期间执行环境／配置已变化；本次没有提交运行，请按当前配置重试。");
+        return;
+      }
       const pending = {
         key: typeof crypto !== "undefined" && typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
-        payload: { environment_id: environmentId, case_version_id: version.id },
+        payload: { environment_id: environmentId, case_version_id: version.id, resolution_context: preview.resolution_context },
         version,
-        provenance,
+        provenance: { ...provenance, contextFingerprint: preview.context_fingerprint },
       };
       keepOperation = await submitPending(pending, "initial");
     } catch (cause) {
@@ -305,8 +334,7 @@ export function RunPanel({
     } catch (cause) {
       if (
         mode === "initial" &&
-        cause instanceof ApiError &&
-        INITIAL_RUN_REJECTIONS.get(cause.code) === cause.status
+        isInitialRunRejection(cause)
       ) {
         setUnknown(null);
         setError(cause.message);

@@ -26,6 +26,8 @@ const ENVIRONMENT: Environment = {
   pool_id: null,
   variables: {},
   status: "active",
+  rev: 1,
+  config_version: 1,
 };
 
 const REQUEST: RawRequest = {
@@ -47,7 +49,7 @@ function blockedPreflight(code: string, action: DebugPreflight["issues"][number]
   };
 }
 
-function renderSendBar(preflight: DebugPreflight | null, request: RawRequest = REQUEST) {
+function renderSendBar(preflight: DebugPreflight | null, request: RawRequest = REQUEST, onLocateIssue = vi.fn()) {
   const onOpenAdmin = vi.fn();
   const onOpenEnvironment = vi.fn();
   const onRestoreCase = vi.fn();
@@ -78,9 +80,10 @@ function renderSendBar(preflight: DebugPreflight | null, request: RawRequest = R
       onSubmitAuthorization={vi.fn()}
       onCancelAuthorization={vi.fn()}
       authorization={null}
+      onLocateIssue={onLocateIssue}
     />,
   );
-  return { onOpenAdmin, onOpenEnvironment, onRestoreCase, onOrganizeCase };
+  return { onOpenAdmin, onOpenEnvironment, onRestoreCase, onOrganizeCase, onLocateIssue };
 }
 
 describe("环境地址无效时的发送栏", () => {
@@ -109,8 +112,9 @@ describe("环境地址无效时的发送栏", () => {
 
     expect(screen.getByText("建议：修改请求内容")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "修改请求内容" })).toBeNull();
-    // 地址本身没被判为不合法，预览照常显示。
-    expect(screen.getByText(/实际目标：target-service:8080\/orders/)).toBeTruthy();
+    // 没有权威解析时不把客户端拼接冒充实际目标；本地值只作为配置预览。
+    expect(screen.getByText(/实际目标：尚未取得权威解析结果/)).toBeTruthy();
+    expect(screen.getByText(/配置预览：target-service:8080\/orders/)).toBeTruthy();
   });
 
   it("归档和目录异常预检给出真实用例库纠错入口", () => {
@@ -132,5 +136,27 @@ describe("环境地址无效时的发送栏", () => {
       query_params: [{ row_id: "11111111-1111-7111-8111-111111111111", name: "disabled", value: "{{missing}}", enabled: false, description: "" }],
     });
     expect(screen.queryByText(/含 \{\{变量\}\}/)).toBeNull();
+  });
+
+  it("解析问题用稳定 issue 定位到重复行，而不是只按 code 找第一行", () => {
+    const preflight: DebugPreflight = {
+      ...blockedPreflight("variable_undefined", "edit_request"),
+      resolution: {
+        schema_version: 1,
+        scope: { workspace_id: "w1", project_id: "p1", environment_id: ENV_ID },
+        ready: false,
+        ordinary_resolution: "invalid",
+        masked_target: null,
+        bindings: [],
+        issues: [{ issue_id: "issue-second", code: "variable_undefined", message: "环境地址必须以 http:// 或 https:// 开头。", action: "edit_request", location: { kind: "query", field: "value", row_id: "row-second" } }],
+        auth: { required: false, status: "none", injection_slots: [], requires_worker_verification: false },
+        config_basis: { project_variables_version: 1, project_config_version_id: null, environment_rev: 1, environment_config_version: 1, environment_config_version_id: "cfg" },
+        context_fingerprint: "fp",
+        resolution_context: null,
+      },
+    };
+    const { onLocateIssue } = renderSendBar(preflight);
+    fireEvent.click(screen.getByRole("button", { name: "定位修正" }));
+    expect(onLocateIssue).toHaveBeenCalledWith({ kind: "query", field: "value", row_id: "row-second" });
   });
 });

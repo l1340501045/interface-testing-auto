@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import uuid
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from ..kernel.target_policy import TargetGuard, TargetPolicyError
 from ..models import (
     Case,
     CaseVersion,
+    CredentialSet,
     Environment,
     IdempotencyRecord,
     Job,
@@ -33,9 +35,15 @@ from ..models import (
     RunnerPoolProjectGrant,
 )
 from . import asset_lifecycle
+from .credentials import CredentialError, available_profiles, parse_auth_slot, set_auth_slots
 from .debug_context import build_context_binding
 from .folder_graph import blocked_folder_ids, invalid_folder_ids
 from .permissions import require
+from .resolution import (
+    ResolutionError,
+    build_resolution,
+    verify_resolution_context,
+)
 from .variable_inputs import merged_variables
 
 _IDEMPOTENCY_TTL_HOURS = 24
@@ -57,6 +65,7 @@ class RunRequest:
     debug_snapshot: dict | None = None
     idempotency_key: str | None = None
     source_case_id: uuid.UUID | None = None
+    resolution_context: str | None = None
 
 
 @dataclass
@@ -155,6 +164,28 @@ def _merged_variables(session: Session, environment: Environment) -> dict:
     两处各写一遍会让授权绑定的是一个值、执行用的是另一个值。
     """
     return merged_variables(session, environment)
+
+
+def _auth_slot_metadata(session: Session, environment: Environment) -> list[dict]:
+    """只读投影当前唯一身份的槽位；不读秘密、不检查/消费用途授权。"""
+    profiles = available_profiles(session, environment.id)
+    if len(profiles) != 1 or profiles[0].current_set_id is None:
+        return []
+    credential_set = session.get(CredentialSet, profiles[0].current_set_id)
+    if credential_set is None or credential_set.status != "active":
+        return []
+    result: list[dict] = []
+    for slot in sorted(set_auth_slots(session, credential_set)):
+        try:
+            kind, name = parse_auth_slot(slot)
+        except CredentialError:
+            # 持久认证配置的具体错误仍由凭证责任层在 worker 给出；普通解析只跳过
+            # 无法安全投影的槽位，不能泄露底层数据或伪造成用户行冲突。
+            continue
+        result.append(
+            {"kind": kind, "name": name, "status": "pending_worker_verification"}
+        )
+    return result
 
 
 def resolve_target(
@@ -324,9 +355,64 @@ def create_run(
         debug_snapshot_digest(request, assertions) if target_type == "debug_snapshot" else None
     )
 
+    try:
+        resolution = build_resolution(
+            session,
+            settings,
+            environment=environment,
+            principal_id=scope.principal.user_id,
+            request=request,
+            assertions=assertions,
+            source_kind=target_type,
+            source_id=case_version_id or debug_source_case_id,
+            # 首次受理这里只做普通绑定与槽位占用早拒；身份/用途授权仍沿既有 worker
+            # 权威链处理，不能因客户端未先预览就改变旧合法调用的受理边界。
+            auth={
+                "required": bool(request.get("auth_required")),
+                "status": "none",
+                "injection_slots": _auth_slot_metadata(session, environment),
+                "requires_worker_verification": True,
+            },
+        )
+    except ResolutionError as error:
+        raise RunRejected(error.code, error.message) from error
+    blocking_issue = next(
+        (
+            item
+            for item in resolution["issues"]
+            if item["code"]
+            in {"variable_undefined", "binding_invalid", "credential_slot_conflict"}
+        ),
+        None,
+    )
+    if blocking_issue is not None:
+        raise RunRejected(blocking_issue["code"], blocking_issue["message"])
+    if payload.resolution_context is not None:
+        try:
+            verified_fingerprint = verify_resolution_context(
+                payload.resolution_context,
+                settings,
+                environment=environment,
+                principal_id=scope.principal.user_id,
+                request=request,
+                assertions=assertions,
+                source_kind=target_type,
+                source_id=case_version_id or debug_source_case_id,
+                basis=resolution["config_basis"],
+            )
+            if not hmac.compare_digest(
+                verified_fingerprint, resolution["context_fingerprint"]
+            ):
+                raise ResolutionError(
+                    "resolution_context_changed",
+                    "解析来源或绑定依据已变化，请重新预览后发送。",
+                )
+        except ResolutionError as error:
+            raise RunRejected(error.code, error.message) from error
+
     now = datetime.now(UTC)
     business_deadline = now + timedelta(seconds=settings.business_deadline_seconds)
-    frozen_variables = _merged_variables(session, environment)
+    frozen_variables = resolution["_merged_variables"]
     # 来源关联标记与运行快照同事务冻结：报告按它回答“这份结果是按哪份内容与输入
     # 产生的”。标记用受保护主密钥做 HMAC，不落内容摘要，详见 debug_context。
     context_binding = build_context_binding(
@@ -368,6 +454,7 @@ def create_run(
             "assertions": assertions,
             "debug_snapshot_hash": snapshot_digest,
             "context_binding": context_binding.as_dict(),
+            "resolution": resolution["_snapshot"],
         },
     )
     session.add(run)

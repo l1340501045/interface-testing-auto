@@ -777,16 +777,15 @@ def test_unresolved_variable_fails_before_send(
         request=_echo_case_request(query_params=[{"name": "tag", "value": "{{未定义变量}}"}]),
     )
     version = publish_case(client, account, project, case["id"])
-    run = start_run(client, account, project, {
-        "environment_id": environment["id"],
-        "case_version_id": version["id"],
-    })
-
-    assert _run_once(project["pool_id"]) == "error"
-    report = get_report(client, account, project, run["id"])
-    assert report["run"]["reason_category"] == "configuration"
-    assert report["response"] is None
-    assert report["steps"][-1]["error_code"] == "request_invalid"
+    rejected = client.post(
+        f"{project_base(account, project)}/runs",
+        json={"environment_id": environment["id"], "case_version_id": version["id"]},
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert rejected.json()["code"] == "variable_undefined"
+    listed = client.get(f"{project_base(account, project)}/runs")
+    assert listed.status_code == 200
+    assert listed.json() == [], "普通变量缺失必须在创建 Run/Job 前确定拒绝"
 
 
 def test_environment_variable_is_resolved_into_request(
@@ -798,6 +797,7 @@ def test_environment_variable_is_resolved_into_request(
     updated = client.patch(
         f"{project_base(account, project)}/environments/{environment['id']}",
         json={"variables": {"租户": {"type": "string", "text": "alpha"}}},
+        headers={"If-Match": str(environment["rev"])},
     )
     assert updated.status_code == 200, updated.text
 
@@ -846,6 +846,7 @@ def _run_with_variables(
     updated = client.patch(
         f"{project_base(account, project)}/environments/{environment['id']}",
         json={"variables": variables},
+        headers={"If-Match": str(environment["rev"])},
     )
     assert updated.status_code == 200, updated.text
     case = create_case(
@@ -1028,6 +1029,7 @@ def test_an_unequal_object_in_the_request_body_sends_nothing(
     updated = client.patch(
         f"{project_base(account, project)}/environments/{environment['id']}",
         json={"variables": {"obj": {"type": "json", "text": '{"name":"x","value":1,"enabled":false}'}}},
+        headers={"If-Match": str(environment["rev"])},
     )
     assert updated.status_code == 200, updated.text
     case = create_case(
@@ -1220,19 +1222,21 @@ def test_an_unknown_variable_in_the_body_sends_nothing(
 
     monkeypatch.setattr(executor, "_send", counting_send)
 
-    outcome, report = _run_with_variables(
+    environment = create_environment(client, account, project, name="正文未知变量用例-环境")
+    case = create_case(
         client,
         account,
         project,
-        {},
         name="正文未知变量用例",
         request=_echo_case_request(body='{"a":"{{未定义变量}}"}'),
     )
-
-    assert outcome == "error"
-    assert report["run"]["reason_category"] == "configuration"
-    assert report["steps"][-1]["error_code"] == "request_invalid"
-    assert report["response"] is None
+    version = publish_case(client, account, project, case["id"])
+    rejected = client.post(
+        f"{project_base(account, project)}/runs",
+        json={"environment_id": environment["id"], "case_version_id": version["id"]},
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert rejected.json()["code"] == "variable_undefined"
     assert sent == [], "变量未解析的正文不得发出任何请求"
 
 
@@ -1252,6 +1256,7 @@ def test_path_assertion_is_evaluated_against_the_prepared_path(
     updated = client.patch(
         f"{project_base(account, project)}/environments/{environment['id']}",
         json={"variables": {"operation": {"type": "string", "text": "echo"}}},
+        headers={"If-Match": str(environment["rev"])},
     )
     assert updated.status_code == 200, updated.text
 
@@ -1331,6 +1336,7 @@ def test_same_case_runs_against_two_environments_and_each_target_responds(
         updated = client.patch(
             f"{project_base(account, project)}/environments/{environment['id']}",
             json={"variables": {"租户": {"type": "string", "text": tenant}}},
+            headers={"If-Match": str(environment["rev"])},
         )
         assert updated.status_code == 200, updated.text
 

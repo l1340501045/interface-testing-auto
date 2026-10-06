@@ -31,6 +31,7 @@ interface Call {
   path: string;
   method: string;
   body: unknown;
+  headers?: Record<string, string>;
 }
 
 let calls: Call[] = [];
@@ -41,8 +42,8 @@ function url(suffix: string): string {
 
 /** 每个用例只声明自己关心的路由；未声明的请求直接失败，避免悄悄漏测。 */
 function router(handlers: Record<string, unknown | Error>) {
-  return (async (path: string, method: string, body: unknown, parse: (raw: unknown) => unknown) => {
-    calls.push({ path, method, body });
+  return (async (path: string, method: string, body: unknown, parse: (raw: unknown) => unknown, options?: { headers?: Record<string, string> }) => {
+    calls.push({ path, method, body, ...(options?.headers ? { headers: options.headers } : {}) });
     const handler = handlers[`${method} ${path}`];
     if (handler === undefined) throw new Error(`测试未覆盖的请求：${method} ${path}`);
     if (handler instanceof Error) throw handler;
@@ -73,6 +74,8 @@ const environments: Environment[] = [
     pool_id: POOL_ID,
     variables: {},
     status: "active",
+    rev: 1,
+    config_version: 1,
   },
 ];
 
@@ -223,6 +226,25 @@ describe("管理页面", () => {
     expect(put?.body).toEqual({
       variables: [{ name: "base_url", value: { type: "string", text: "http://echo:8080" } }],
     });
+    expect(put?.headers?.["If-Match"]).toBe("0");
+  });
+
+  it("项目变量修订冲突保留输入并继续使用原 If-Match", async () => {
+    apiSendMock.mockImplementation(router({
+      [`GET ${url("/variables")}`]: EMPTY_VARIABLES,
+      [`GET ${url("/pools")}`]: [],
+      [`PUT ${url("/variables")}`]: new ApiError(409, "config_revision_conflict", "项目变量已更新", null),
+      ...EMPTY_CREDENTIALS,
+    }));
+    renderPanel("admin");
+    await screen.findByText("项目还没有普通变量。");
+    fireEvent.click(screen.getByRole("button", { name: "＋添加变量" }));
+    fireEvent.change(screen.getByLabelText("名称"), { target: { value: "region" } });
+    fireEvent.change(screen.getByLabelText("值"), { target: { value: "cn" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存为新版本" }));
+    expect(await screen.findByText(/你的输入已保留/)).toBeTruthy();
+    expect((screen.getByLabelText("名称") as HTMLInputElement).value).toBe("region");
+    expect(calls.find((call) => call.method === "PUT")?.headers?.["If-Match"]).toBe("0");
   });
 
   it("保存秘密后不回显明文，输入框立即清空", async () => {
@@ -279,6 +301,8 @@ describe("管理页面", () => {
       pool_id: POOL_ID,
       variables: {},
       status: "active",
+      rev: 1,
+      config_version: 1,
     };
     const OTHER_PROFILE = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",

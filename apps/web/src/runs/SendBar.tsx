@@ -14,14 +14,16 @@
  * 地址预览只是预览：变量未解析、认证未注入，它可能不等于最终实际地址，因此含变量时
  * 明确标注，不冒充最终目标。
  */
-import type { ReactNode } from "react";
+import { useRef, type ReactNode } from "react";
 import { Alert, Button, Checkbox, Collapse, Descriptions, Input, Select, Space } from "antd";
+import type { InputRef } from "antd";
 
-import type { DebugPreflight, Environment, PreflightIssue } from "../api/types";
+import type { DebugPreflight, Environment, PreflightIssue, ResolutionIssue, ResolutionLocation } from "../api/types";
 import type { AuthorizationView } from "./useDebugRun";
 import { Hint } from "../components/Feedback";
-import { METHODS } from "../cases/RequestParts";
+import { METHODS, type VariablePickerState } from "../cases/RequestParts";
 import { ltrimPath, type RawRequest } from "../cases/requestDraft";
+import { insertReference, VariablePicker, VariableSourceDrawer } from "../cases/VariablePicker";
 
 /** 变量占位 `{{name}}`；存在它时地址预览与最终地址可能不同。 */
 const VARIABLE_PATTERN = /\{\{[^}]+\}\}/;
@@ -81,6 +83,14 @@ function actionLabel(action: PreflightIssue["action"]): string {
   }
 }
 
+function isResolutionIssue(issue: PreflightIssue): issue is ResolutionIssue {
+  return "issue_id" in issue && "location" in issue;
+}
+
+function locateResolutionIssue(issue: PreflightIssue, onLocate: (location: ResolutionLocation) => void) {
+  if (isResolutionIssue(issue) && issue.location !== null) onLocate(issue.location);
+}
+
 export function SendBar({
   request,
   environments,
@@ -108,6 +118,10 @@ export function SendBar({
   authorization,
   tools,
   idPrefix,
+  variablePicker,
+  variableOwnerRevision = "",
+  onReloadVariables = () => undefined,
+  onLocateIssue,
 }: {
   request: RawRequest;
   environments: Environment[];
@@ -157,12 +171,34 @@ export function SendBar({
    */
   tools?: ReactNode;
   idPrefix?: string;
+  variablePicker?: VariablePickerState;
+  variableOwnerRevision?: string;
+  onReloadVariables?: () => void;
+  onLocateIssue?: (location: ResolutionLocation) => void;
 }) {
   const methodId = idPrefix ? `${idPrefix}-method` : "request-method";
   const pathId = idPrefix ? `${idPrefix}-path` : "request-path";
   const environmentId = idPrefix ? `${idPrefix}-environment` : "send-environment";
   const environment = environments.find((item) => item.id === selectedEnvironmentId) ?? null;
   const preview = environment === null ? null : addressPreview(environment.base_url, request);
+  const pathRef = useRef<InputRef>(null);
+  const pathSelectionRef = useRef({ start: request.path.length, end: request.path.length, ownerRevision: variableOwnerRevision });
+  function capturePathSelection() {
+    const input = pathRef.current?.input;
+    if (!input) return;
+    pathSelectionRef.current = { start: input.selectionStart ?? input.value.length, end: input.selectionEnd ?? input.value.length, ownerRevision: variableOwnerRevision };
+  }
+  function insertPath(reference: string, capturedOwnerRevision: string) {
+    const selection = pathSelectionRef.current;
+    if (readOnly || capturedOwnerRevision !== variableOwnerRevision || selection.ownerRevision !== variableOwnerRevision) return;
+    const inserted = insertReference(request.path, reference, selection.start, selection.end);
+    onPatch({ path: ltrimPath(inserted.value) });
+    pathSelectionRef.current = { start: inserted.cursor, end: inserted.cursor, ownerRevision: variableOwnerRevision };
+    requestAnimationFrame(() => {
+      pathRef.current?.focus({ cursor: "start" });
+      pathRef.current?.input?.setSelectionRange(inserted.cursor, inserted.cursor);
+    });
+  }
   const methods = METHODS.includes(request.method) ? METHODS : [request.method, ...METHODS];
   const hasVariables =
     VARIABLE_PATTERN.test(request.path) ||
@@ -180,11 +216,18 @@ export function SendBar({
    * 只影响**下一次发送**，因此用紧凑说明呈现，并放回认证相关的位置。
    */
   const authorizationActions = new Set(["authorize", "contact_admin", "manage_credentials"]);
+  // 顶层仍是旧预检合同的完整结论；resolution 只补稳定位置，不能覆盖身份/环境问题。
+  const visibleIssues: PreflightIssue[] = [...(preflight?.issues ?? [])];
+  for (const issue of preflight?.resolution?.issues ?? []) {
+    const legacyIndex = visibleIssues.findIndex((current) => current.code === issue.code && current.message === issue.message && current.action === issue.action);
+    if (legacyIndex >= 0) visibleIssues[legacyIndex] = issue;
+    else visibleIssues.push(issue);
+  }
   const contentIssues = preflight !== null && !preflight.ready
-    ? preflight.issues.filter((issue) => !authorizationActions.has(issue.action))
+    ? visibleIssues.filter((issue) => !authorizationActions.has(issue.action))
     : [];
   const authorizationIssues = preflight !== null && !preflight.ready
-    ? preflight.issues.filter((issue) => authorizationActions.has(issue.action))
+    ? visibleIssues.filter((issue) => authorizationActions.has(issue.action))
     : [];
 
   /**
@@ -194,7 +237,7 @@ export function SendBar({
    * 目标。此时仍写着“实际目标：echo:8080/orders”，等于给用户一个不存在的结论。
    */
   const invalidEnvironment =
-    preflight?.issues.some((issue) => issue.code === "environment_url_invalid") ?? false;
+    visibleIssues.some((issue) => issue.code === "environment_url_invalid");
   const openEnvironment = onOpenEnvironment ?? onOpenAdmin;
 
   return (
@@ -215,12 +258,18 @@ export function SendBar({
         <span className="param grow">
           <label htmlFor={pathId}>路径</label>
           <Input
+            ref={pathRef}
             id={pathId}
             value={request.path}
             readOnly={readOnly}
             placeholder="/orders"
             onChange={(event) => onPatch({ path: ltrimPath(event.target.value) })}
+            onSelect={capturePathSelection}
+            onClick={capturePathSelection}
+            onKeyUp={capturePathSelection}
+            onBlur={capturePathSelection}
           />
+          {variablePicker?.context ? <VariablePicker label="路径" location="path" context={variablePicker.context} loading={variablePicker.loading} error={variablePicker.error} disabled={readOnly} ownerRevision={variableOwnerRevision} onInsert={insertPath} /> : null}
         </span>
         <span className="param">
           <label htmlFor={environmentId}>执行环境</label>
@@ -249,10 +298,17 @@ export function SendBar({
       <p className="caption address-preview">
         {invalidEnvironment
           ? "实际目标：环境地址不合法，暂时无法确定（请先在环境设置里修正该环境的地址）。"
-          : `实际目标：${preview === null ? "尚未选择执行环境" : preview}${
-              hasVariables ? "（含 {{变量}}，解析后的地址可能不同，这里只是预览）" : ""
-            }`}
+          : preflight?.resolution?.masked_target
+            ? `实际目标：${preflight.resolution.masked_target.url}`
+            : preflighting
+              ? "实际目标：正在按当前配置解析…"
+              : preflightError
+                ? "实际目标：未能确认，请重试预检。"
+                : selectedEnvironmentId === null
+                  ? "实际目标：尚未选择执行环境"
+                  : "实际目标：尚未取得权威解析结果"}
       </p>
+      {preview !== null ? <p className="caption">配置预览：{preview}{hasVariables ? "（含变量，不能作为实际目标）" : ""}</p> : null}
       {request.imported_origin && environment !== null ? (
         <Hint>
           导入来源为 {request.imported_origin}，与会选择的环境地址不一定相同；实际目标
@@ -269,9 +325,11 @@ export function SendBar({
       {contentIssues.length > 0 && !awaitingAuthorization ? (
         <Alert type="error" showIcon title="当前请求暂时不能发送" description={<ul className="issue-list">
           {contentIssues.map((issue) => (
-            <li key={issue.code}>
+            <li key={("issue_id" in issue && typeof issue.issue_id === "string") ? issue.issue_id : issue.code}>
               <span>{issue.message}</span>
-              {issue.action === "configure_environment" || issue.action === "restore_case" || issue.action === "organize_case" ? (
+              {issue.action === "edit_request" && isResolutionIssue(issue) && issue.location !== null && onLocateIssue ? (
+                <Button htmlType="button" type="link" onClick={() => locateResolutionIssue(issue, onLocateIssue)}>定位修正</Button>
+              ) : issue.action === "configure_environment" || issue.action === "restore_case" || issue.action === "organize_case" ? (
                 /*
                   环境类问题给**真能点的下一步**：只写一句“建议：前往环境设置”，用户还得自己
                   去侧栏里找那一段。按钮复用外壳已有的展开入口，不新建第二套管理界面。
@@ -309,6 +367,7 @@ export function SendBar({
       {/* 工具与管理入口同排：管理入口留在地址行里可及，但不为它单独占一整行。 */}
       <div className="toolbar-row">
         {tools}
+        {variablePicker ? <VariableSourceDrawer context={variablePicker.context} loading={variablePicker.loading} error={variablePicker.error} onReload={onReloadVariables} /> : null}
         <Button htmlType="button" type="link" onClick={onOpenAdmin}>
           环境与凭证管理
         </Button>

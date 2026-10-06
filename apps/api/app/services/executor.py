@@ -73,7 +73,11 @@ from .credentials import (
     recheck_grant_authority,
     resolve_injection,
 )
-from .debug_context import stamp_guard_semantics
+from .debug_context import (
+    build_resolution_proof,
+    stamp_guard_semantics,
+    stamp_resolution_proof,
+)
 from .permissions import can
 from .variable_inputs import frozen_snapshot_digest
 
@@ -1330,12 +1334,21 @@ def _execute(session: Session, settings: Settings, claim: JobClaim) -> str:
     ctx.sensitive_paths |= paths_containing(
         _build_request_roots(prepared, request), secrets
     )
-    request_evidence = {
-        "method": prepared.method,
-        "url": _evidence_url(prepared, secrets),
-        "headers": redact_pairs(prepared.headers_as_pairs(), secrets),
-        "body": redact_text(prepared.body_text(), secrets),
-    }
+    request_evidence = stamp_resolution_proof(
+        {
+            "method": prepared.method,
+            "url": _evidence_url(prepared, secrets),
+            "headers": redact_pairs(prepared.headers_as_pairs(), secrets),
+            "body": redact_text(prepared.body_text(), secrets),
+        },
+        build_resolution_proof(
+            settings.load_secret_key(),
+            workspace_id=run.workspace_id,
+            project_id=run.project_id,
+            principal_id=run.created_by,
+            snapshot=snapshot,
+        ),
+    )
 
     pre_records = _evaluate_assertions(
         assertions, "pre_request", _build_request_roots(prepared, request), ctx

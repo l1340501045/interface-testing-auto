@@ -36,10 +36,11 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { ApiError, NetworkError, apiSend, projectPath } from "../api/client";
+import { ApiError, apiSend, projectPath } from "../api/client";
 import { toDebugPreflight, toDebugSnapshotDigest, toRunReport, toRunSummary } from "../api/guards";
 import type { CaseAssertion, DebugPreflight, RequestSpec, RunReport, RunSummary } from "../api/types";
 import { isTerminal } from "./useRuns";
+import { isInitialRunRejection } from "./runAcceptance";
 
 /** 本次编辑实例里已受理的一次调试；按受理顺序倒序展示。 */
 export interface DebugRecord {
@@ -47,6 +48,8 @@ export interface DebugRecord {
   /** 提交时的环境与内容摘要，仅用于在本页说明“这条记录对应哪一次发送”。 */
   environmentId: string;
   submittedAt: number;
+  inputKey: string;
+  configEpoch: number;
 }
 
 export interface DebugSubmission {
@@ -86,6 +89,8 @@ interface Operation {
   environmentLabel: string;
   /** 预检确认可用且本次用途尚未授权时的身份坐标；只有一次预检能写入它。 */
   profileId: string | null;
+  /** 本次权威解析返回的不透明依据；unknown 确认继续复用这一份。 */
+  resolutionContext: string | null;
 }
 
 /**
@@ -163,20 +168,6 @@ export function submissionKey(submission: DebugSubmission): string {
     request: submission.request,
     assertions: submission.assertions,
   });
-}
-
-/**
- * 请求是否“根本没得到服务端应答”。
- *
- * 只有这类情况才可能是“已受理但不知道结果”。服务端明确回绝（ApiError 且是 4xx 语义的
- * 确定性拒绝）说明请求被处理过、结果是确定的失败，不占用一次性幂等键。
- *
- * 5xx 不能算确定失败：网关或上游在写库之后才出错时，运行可能已经建好。
- */
-function isAcceptanceUnknown(cause: unknown): boolean {
-  if (cause instanceof NetworkError) return true;
-  if (cause instanceof ApiError) return cause.status >= 500;
-  return true;
 }
 
 export function useDebugRun(
@@ -345,6 +336,7 @@ export function useDebugRun(
    */
   const displayGenerationRef = useRef(0);
   const displayAbortRef = useRef<AbortController | null>(null);
+  const displayReadRef = useRef<{ generation: number; stamp: InputStamp | null } | null>(null);
   const checkGenerationRef = useRef(0);
   const checkAbortRef = useRef<AbortController | null>(null);
 
@@ -374,6 +366,7 @@ export function useDebugRun(
     async (submission: DebugSubmission): Promise<PreflightOutcome> => {
       const stamp = stampFor(submissionKey(submission));
       const generation = ++displayGenerationRef.current;
+      displayReadRef.current = { generation, stamp };
       displayAbortRef.current?.abort();
       const controller = new AbortController();
       displayAbortRef.current = controller;
@@ -430,6 +423,26 @@ export function useDebugRun(
     },
     [fetchPreflight],
   );
+
+  /**
+   * 发送专用预检也是本次发送采用的权威依据；仍属于原输入时，将它同步接纳为展示/比较依据。
+   * 这只统一结果接纳顺序，不合并展示读取与发送检查的取消/决策门闩。
+   */
+  const acceptCheckPreview = useCallback((op: Operation, result: DebugPreflight): boolean => {
+    if (!canStartNewWrite(op)) return false;
+    // `canStartNewWrite` 已按实时 owner / input / config 证明 B 就是当前依据。这里残留的
+    // 异 stamp 可能只是输入 A 的旧展示读取，不能把“不同”直接解释成更新的 C；真正的 C
+    // 会先改变 live stamp，使上面的实时校验失败。
+    const generation = ++displayGenerationRef.current;
+    displayAbortRef.current?.abort();
+    displayReadRef.current = { generation, stamp: op.inputStamp };
+    if (mountedRef.current) {
+      setPreview({ value: result, stamp: op.inputStamp });
+      setPreviewError(null);
+      setChecking(false);
+    }
+    return true;
+  }, [canStartNewWrite]);
 
 
   /** 报告读取世代；同一个 run 的多次读取按它排除迟到者。 */
@@ -581,6 +594,11 @@ export function useDebugRun(
     setPreviewError(null);
     setNotice(null);
     setError(null);
+    displayGenerationRef.current += 1;
+    displayReadRef.current = null;
+    displayAbortRef.current?.abort();
+    checkAbortRef.current?.abort();
+    setChecking(false);
     for (const controller of reportAbortRef.current.values()) controller.abort();
     reportAbortRef.current.clear();
   }, [ownerKey]);
@@ -609,6 +627,7 @@ export function useDebugRun(
         sourceCaseId,
         environmentLabel,
         profileId: null,
+        resolutionContext: null,
       };
       if (!replace(current, { phase: "preflighting", op })) return;
       setError(null);
@@ -634,6 +653,19 @@ export function useDebugRun(
         return;
       }
       const result = outcome.value;
+      if (!canStartNewWrite(op)) {
+        toIdle();
+        setNotice("当前依据暂未确认；发送前检查返回时输入、范围或配置已变化，请按当前内容重试。");
+        return;
+      }
+      acceptCheckPreview(op, result);
+      const resolutionContext = result.resolution?.resolution_context ?? null;
+      if (result.resolution === null || result.resolution === undefined || result.resolution.ordinary_resolution !== "ready" || resolutionContext === null) {
+        toIdle();
+        setError("当前请求未取得可提交的变量解析依据；输入已保留，请按定位提示修正或重试预检。");
+        return;
+      }
+      op.resolutionContext = resolutionContext;
       if (result.ready) {
         await submitForward(op, "initial");
         return;
@@ -649,7 +681,7 @@ export function useDebugRun(
       // 保留原因，由界面按动作给出下一步，不创建运行。
       toIdle();
     },
-    [checkPreflight, owns, replace, stampFor, toIdle],
+    [acceptCheckPreview, canStartNewWrite, checkPreflight, owns, replace, stampFor, toIdle],
   );
 
   /** attempt 世代：每个新的提交尝试独立编号，旧尝试的迟到回调无权改阶段。 */
@@ -707,6 +739,7 @@ export function useDebugRun(
             environment_id: op.submission.environmentId,
             debug_snapshot: { request: op.submission.request, assertions: op.submission.assertions },
             ...(op.sourceCaseId === undefined ? {} : { source_case_id: op.sourceCaseId }),
+            ...(op.resolutionContext === null ? {} : { resolution_context: op.resolutionContext }),
           },
           (raw) => (raw === null || raw === undefined ? null : toRunSummary(raw)),
           { headers: { "Idempotency-Key": op.key }, signal: controller.signal },
@@ -725,7 +758,7 @@ export function useDebugRun(
           // 记录与锁都在这里建立：即使期间配置变了，这次受理也是真实的。
           setRecords((previous) =>
             [
-              { runId, environmentId: op.submission.environmentId, submittedAt: Date.now() },
+              { runId, environmentId: op.submission.environmentId, submittedAt: Date.now(), inputKey: op.inputStamp.inputKey, configEpoch: op.inputStamp.configEpoch },
               ...previous.filter((item) => item.runId !== runId),
             ].slice(0, 20),
           );
@@ -744,11 +777,10 @@ export function useDebugRun(
         return runId;
       } catch (cause) {
         if (!mountedRef.current) return null;
-        if (isAcceptanceUnknown(cause)) {
-          // 受理结果不明：保留原键与原内容，只允许用同一个键再确认一次。
+        if (mode === "initial" && isInitialRunRejection(cause)) {
           if (stillMine()) {
-            replace(stateRef.current, { phase: "acceptance_unknown", op });
-            setNotice("受理结果不明。请求可能已经到达服务端，请用「确认受理结果」核对；这里不会重发。");
+            toIdle();
+            setError(cause.message);
           }
           return null;
         }
@@ -766,11 +798,10 @@ export function useDebugRun(
           }
           return null;
         }
-        // 初次提交收到服务端明确拒绝（非 5xx 的 ApiError）：请求被处理过，结果是确定的
-        // 失败，不占用幂等键。5xx 与损坏的成功信封都已在上面按“受理不明”处理。
+        // 未列入稳定首次拒绝表的状态/code、网络错误和未知信封都不能证明没有受理。
         if (stillMine()) {
-          toIdle();
-          setError(cause instanceof Error ? cause.message : "提交调试失败");
+          replace(stateRef.current, { phase: "acceptance_unknown", op });
+          setNotice("受理结果不明。请求可能已经到达服务端，请用「确认受理结果」核对；这里不会重发。");
         }
         return null;
       }

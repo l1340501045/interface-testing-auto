@@ -73,12 +73,27 @@ function submission(environmentId = ENV_ID) {
   return { environmentId, request: REQUEST, assertions: [] };
 }
 
+const RESOLUTION = {
+  schema_version: 1 as const,
+  scope: { workspace_id: WORKSPACE_ID, project_id: PROJECT_ID, environment_id: ENV_ID },
+  ready: true,
+  ordinary_resolution: "ready" as const,
+  masked_target: { url: "http://echo.test/echo", method: "GET" },
+  bindings: [],
+  issues: [],
+  auth: { required: false, status: "none" as const, injection_slots: [], requires_worker_verification: false },
+  config_basis: { project_variables_version: 1, project_config_version_id: null, environment_rev: 1, environment_config_version: 1, environment_config_version_id: "config-1" },
+  context_fingerprint: "context-fingerprint-1",
+  resolution_context: "resolution-context-1",
+};
+
 const NEEDS_AUTH = {
   ready: false,
   issues: [{ code: "credential_not_granted", message: "当前身份未获授权。", action: "authorize" }],
   can_authorize: true,
   auth: { required: false, state: "needs_authorization", profile_id: "88888888-8888-4888-8888-888888888888" },
   context: null,
+  resolution: { ...RESOLUTION, ready: false, auth: { ...RESOLUTION.auth, status: "needs_authorization" as const } },
 };
 
 const READY = {
@@ -91,7 +106,15 @@ const READY = {
     environment: { id: ENV_ID, name: "测试环境", kind: "test", base_url: "http://echo.test" },
     input_fingerprint: "in-1",
   },
+  resolution: RESOLUTION,
 };
+
+function readyWith(fingerprint: string, token: string) {
+  return {
+    ...READY,
+    resolution: { ...RESOLUTION, context_fingerprint: fingerprint, resolution_context: token },
+  };
+}
 
 function runSummary(id: string, state = "queued") {
   return {
@@ -121,11 +144,14 @@ function report(id: string, state = "finished", outcome: string | null = "passed
 let runCount = 0;
 /** 预检是否要求授权。 */
 let needsAuth = false;
+let preflightOverride: unknown = null;
+let preflightSequence: unknown[] = [];
 
 function route(method: string, path: string, body: unknown, headers?: Record<string, string>): unknown {
   calls.push({ method, path, headers, body });
   if (method === "POST" && path.endsWith("/debug-preflight")) {
-    return maybeGate("preflight", needsAuth ? NEEDS_AUTH : READY);
+    const next = preflightSequence.length > 0 ? preflightSequence.shift() : preflightOverride ?? (needsAuth ? NEEDS_AUTH : READY);
+    return maybeGate("preflight", next);
   }
   if (method === "POST" && path.endsWith("/debug-snapshot-digest")) {
     return maybeGate("digest", "digest-1");
@@ -149,7 +175,7 @@ function runs(): Call[] {
   return calls.filter((c) => c.method === "POST" && c.path === projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"));
 }
 /** 同步配置时钟：模拟“时钟已变、React props 尚未更新”的窗口。 */
-const epochClock = { current: 0 };
+const epochClock: { current: number | null } = { current: 0 };
 
 function preflightCalls(): Call[] {
   return calls.filter((c) => c.method === "POST" && c.path.endsWith("/debug-preflight"));
@@ -178,7 +204,7 @@ function mount(principalId = USER_ID, configEpoch = 0) {
     ({ epoch, principal, inputKey, editorKey, sourceCaseId }: MountProps) => {
       // 真实 App 里这是同一个时钟：props 渲染时会读到当前值。测试需要单独制造
       // “时钟已变、props 仍旧”的窗口，因此时钟放在外面，由用例自行推进。
-      if (epoch === epochClock.current + 1) epochClock.current = epoch;
+      if (epochClock.current !== null && epoch === epochClock.current + 1) epochClock.current = epoch;
       return useDebugRun(
         WORKSPACE_ID,
         PROJECT_ID,
@@ -209,6 +235,8 @@ beforeEach(() => {
   gated = new Set();
   runCount = 0;
   needsAuth = false;
+  preflightOverride = null;
+  preflightSequence = [];
   epochClock.current = 0;
   apiSendMock.mockReset();
   apiSendMock.mockImplementation((async (
@@ -221,6 +249,10 @@ beforeEach(() => {
 });
 
 describe("R3-02 同帧二次确认授权", () => {
+  it("真实 needs_authorization 组合普通解析有效、总ready为false且token已冻结", () => {
+    expect(NEEDS_AUTH).toMatchObject({ ready: false, auth: { state: "needs_authorization" } });
+    expect(NEEDS_AUTH.resolution).toMatchObject({ ready: false, ordinary_resolution: "ready", resolution_context: "resolution-context-1", auth: { status: "needs_authorization" } });
+  });
   it("同一帧里确认两次：只发一次摘要、一次授权、一次受理", async () => {
     // 主审复现的问题是：确认入口没有在第一个 await 之前完成阶段迁移，同帧的第二次调用
     // 会各自走完一遍，于是签发两份授权、提交两次运行。
@@ -242,6 +274,7 @@ describe("R3-02 同帧二次确认授权", () => {
     expect(digests()).toHaveLength(1);
     expect(grants()).toHaveLength(1);
     expect(runs()).toHaveLength(1);
+    expect(runs()[0]?.body).toMatchObject({ resolution_context: "resolution-context-1" });
   });
 
   it("授权请求挂起期间再次确认不新增授权，也不新增运行", async () => {
@@ -271,6 +304,19 @@ describe("R3-02 同帧二次确认授权", () => {
     await waitFor(() => expect(runs()).toHaveLength(1));
     expect(digests()).toHaveLength(1);
     expect(grants()).toHaveLength(1);
+  });
+
+  it("等待授权时 owner 变化，旧确认不能签发或提交", async () => {
+    needsAuth = true;
+    const { result, rerender } = mount();
+    await act(async () => result.current.start(submission(), "测试环境"));
+    expect(result.current.phase).toBe("awaiting_authorization");
+    rerender({ epoch: 0, principal: "other-user", inputKey: submissionKey(submission()), editorKey: "instance-1", sourceCaseId: undefined });
+    await act(async () => {});
+    expect(result.current.phase).toBe("idle");
+    await act(async () => { await result.current.confirmAuthorization(); });
+    expect(grants()).toEqual([]);
+    expect(runs()).toEqual([]);
   });
 });
 
@@ -389,6 +435,12 @@ describe("R4 F2 确认受理失败不证明未受理", () => {
     });
     expect(result.current.phase).toBe("acceptance_unknown");
 
+    // 展示读取可以前进到 C，但 unknown 的确认仍绑定发送检查 B 的原 payload/token/key。
+    preflightOverride = readyWith("fingerprint-c", "token-c");
+    await act(async () => { await result.current.runPreflight(submission()); });
+    expect(result.current.preflight?.resolution?.context_fingerprint).toBe("fingerprint-c");
+    const preflightCountBeforeConfirm = preflightCalls().length;
+
     // 配置变化：unknown 必须保留（改动草稿不证明上一次没被受理）。
     rerender({ epoch: 1, principal: USER_ID, inputKey: submissionKey(submission()), editorKey: "instance-1", sourceCaseId: undefined });
     await act(async () => {});
@@ -422,6 +474,8 @@ describe("R4 F2 确认受理失败不证明未受理", () => {
     await waitFor(() => expect(runs()).toHaveLength(3));
     expect(keys()[2]).toBe(originalKey);
     expect(runs()[2].body).toEqual(runs()[0].body);
+    expect((runs()[2].body as { resolution_context?: string }).resolution_context).toBe("resolution-context-1");
+    expect(preflightCalls()).toHaveLength(preflightCountBeforeConfirm);
   });
 });
 
@@ -559,6 +613,7 @@ describe("R3-04 受理不明在配置变化后仍然保留", () => {
     await waitFor(() => expect(runs()).toHaveLength(2));
     expect(keys()[1]).toBe(original);
     expect(runs()[1].body).toEqual(runs()[0].body);
+    expect((runs()[1].body as { resolution_context?: string }).resolution_context).toBe("resolution-context-1");
   });
 
   it("5xx 也算受理不明：运行可能已经建好", async () => {
@@ -693,5 +748,145 @@ describe("R3-15 主体变化使旧操作失效", () => {
     await act(async () => {});
     expect(result.current.phase).not.toBe("preflighting");
     expect(result.current.operationActive).toBe(false);
+  });
+});
+
+describe("S1 普通变量问题优先于授权", () => {
+  it("普通解析失败且身份待授权时先保留输入纠错，零授权零运行", async () => {
+    preflightOverride = {
+      ...NEEDS_AUTH,
+      resolution: {
+        ...RESOLUTION,
+        ready: false,
+        ordinary_resolution: "invalid",
+        issues: [{ issue_id: "missing-1", code: "variable_undefined", message: "变量缺失", action: "edit_request", location: { kind: "path", field: "path" } }],
+        resolution_context: null,
+      },
+    };
+    const { result } = mount();
+    await act(async () => result.current.start(submission(), "测试环境"));
+    expect(result.current.phase).toBe("idle");
+    expect(result.current.error).toMatch(/未取得可提交的变量解析依据/);
+    expect(grants()).toEqual([]);
+    expect(runs()).toEqual([]);
+  });
+});
+
+describe("R11 发送预检接纳为当前比较依据", () => {
+  it("展示A完成后输入切到B立即发送，直接以B为比较依据并提交B token", async () => {
+    const submissionA = submission();
+    const submissionB = {
+      ...submissionA,
+      request: { ...submissionA.request, path: "/echo-b" },
+    };
+    preflightSequence = [
+      readyWith("fingerprint-a", "token-a"),
+      readyWith("fingerprint-b", "token-b"),
+    ];
+    const { result, rerender } = mount();
+
+    await act(async () => { await result.current.runPreflight(submissionA); });
+    expect(result.current.preflight?.resolution?.context_fingerprint).toBe("fingerprint-a");
+
+    rerender({
+      epoch: 0,
+      principal: USER_ID,
+      inputKey: submissionKey(submissionB),
+      editorKey: "instance-1",
+      sourceCaseId: undefined,
+    });
+    expect(result.current.preflight).toBeNull();
+
+    await act(async () => { await result.current.start(submissionB, "测试环境"); });
+
+    expect(preflightCalls()).toHaveLength(2);
+    expect(preflightCalls()[1]?.body).toMatchObject({ debug_snapshot: { request: { path: "/echo-b" } } });
+    expect(result.current.preflightFor).toBe(submissionKey(submissionB));
+    expect(result.current.preflight?.resolution?.context_fingerprint).toBe("fingerprint-b");
+    expect(runs()).toHaveLength(1);
+    expect(runs()[0]?.body).toMatchObject({
+      debug_snapshot: { request: { path: "/echo-b" } },
+      resolution_context: "token-b",
+    });
+  });
+
+  it("同输入旧epoch1展示仍残留时，epoch2立即发送接纳epoch2依据", async () => {
+    preflightSequence = [
+      readyWith("fingerprint-epoch-1", "token-epoch-1"),
+      readyWith("fingerprint-epoch-2", "token-epoch-2"),
+    ];
+    epochClock.current = 1;
+    const { result, rerender } = mount(USER_ID, 1);
+
+    await act(async () => { await result.current.runPreflight(submission()); });
+    expect(result.current.preflight?.resolution?.context_fingerprint).toBe("fingerprint-epoch-1");
+
+    rerender({
+      epoch: 2,
+      principal: USER_ID,
+      inputKey: submissionKey(submission()),
+      editorKey: "instance-1",
+      sourceCaseId: undefined,
+    });
+    expect(epochClock.current).toBe(2);
+    expect(result.current.preflight).toBeNull();
+
+    await act(async () => { await result.current.start(submission(), "测试环境"); });
+
+    expect(preflightCalls()).toHaveLength(2);
+    expect(result.current.preflightFor).toBe(submissionKey(submission()));
+    expect(result.current.preflight?.resolution?.context_fingerprint).toBe("fingerprint-epoch-2");
+    expect(runs()).toHaveLength(1);
+    expect(runs()[0]?.body).toMatchObject({ resolution_context: "token-epoch-2" });
+  });
+
+  it("同输入展示A后发送B，立即以B展示且Run携B token", async () => {
+    const preflightA = readyWith("fingerprint-a", "token-a");
+    const preflightB = readyWith("fingerprint-b", "token-b");
+    preflightSequence = [preflightA, preflightB];
+    const { result } = mount();
+    await act(async () => { await result.current.runPreflight(submission()); });
+    expect(result.current.preflight?.resolution?.context_fingerprint).toBe("fingerprint-a");
+    await act(async () => { await result.current.start(submission(), "测试环境"); });
+    expect(result.current.preflight?.resolution?.context_fingerprint).toBe("fingerprint-b");
+    expect(runs()[0]?.body).toMatchObject({ resolution_context: "token-b" });
+  });
+
+  it.each(["success", "error"] as const)("发送B接纳后迟到展示A的%s/finally不能覆盖B", async (outcome) => {
+    let resolveA!: (value: unknown) => void;
+    let rejectA!: (cause: unknown) => void;
+    const delayedA = new Promise((resolve, reject) => { resolveA = resolve; rejectA = reject; });
+    const preflightB = readyWith("fingerprint-b", "token-b");
+    preflightSequence = [delayedA, preflightB];
+    const { result } = mount();
+    let pending!: Promise<unknown>;
+    act(() => { pending = result.current.runPreflight(submission()); });
+    await waitFor(() => expect(preflightCalls()).toHaveLength(1));
+    await act(async () => { await result.current.start(submission(), "测试环境"); });
+    expect(result.current.preflight?.resolution?.context_fingerprint).toBe("fingerprint-b");
+    await act(async () => {
+      if (outcome === "success") resolveA(readyWith("fingerprint-a", "token-a"));
+      else rejectA(new Error("迟到A失败"));
+      await pending;
+    });
+    expect(result.current.preflight?.resolution?.context_fingerprint).toBe("fingerprint-b");
+    expect(result.current.preflightError).toBeNull();
+    expect(result.current.preflighting).toBe(false);
+    expect(runs()).toHaveLength(1);
+  });
+
+  it("发送B返回时实时配置getter为null，不接纳B也不提交", async () => {
+    let resolveB!: (value: unknown) => void;
+    const delayedB = new Promise((resolve) => { resolveB = resolve; });
+    preflightSequence = [delayedB];
+    const { result } = mount();
+    act(() => { void result.current.start(submission(), "测试环境"); });
+    await waitFor(() => expect(preflightCalls()).toHaveLength(1));
+    epochClock.current = null;
+    await act(async () => { resolveB(readyWith("fingerprint-b", "token-b")); });
+    await waitFor(() => expect(result.current.phase).toBe("idle"));
+    expect(result.current.preflight).toBeNull();
+    expect(result.current.notice).toMatch(/当前依据暂未确认/);
+    expect(runs()).toEqual([]);
   });
 });

@@ -53,6 +53,14 @@ interface Call {
 }
 
 let calls: Call[] = [];
+const TEST_RESOLUTION = {
+  schema_version: 1, scope: { workspace_id: WORKSPACE_ID, project_id: PROJECT_ID, environment_id: ENV_ID },
+  ready: true, ordinary_resolution: "ready", masked_target: { url: "http://echo.test/echo", method: "GET" },
+  bindings: [], issues: [], auth: { required: false, status: "none", injection_slots: [], requires_worker_verification: false },
+  config_basis: { project_variables_version: 1, project_config_version_id: null, environment_rev: 1, environment_config_version: 1, environment_config_version_id: "cfg-1" },
+  context_fingerprint: "context-fingerprint-1",
+  resolution_context: "context-1",
+};
 /** 预检结果：由用例决定“可以发送”“缺授权”还是“环境歧义”。 */
 let preflightBody: unknown = {
   ready: true,
@@ -64,6 +72,7 @@ let preflightBody: unknown = {
     environment: { id: ENV_ID, name: "测试环境", kind: "test", base_url: "http://echo.test" },
     input_fingerprint: "in-current",
   },
+  resolution: TEST_RESOLUTION,
 };
 let reportBody: unknown = null;
 let curlPreviewGate: { promise: Promise<unknown>; resolve: (value: unknown) => void } | null = null;
@@ -119,7 +128,14 @@ function route(method: string, path: string, body: unknown, headers?: Record<str
       auth_hint: null,
     };
   }
-  if (method === "POST" && path.endsWith("/debug-preflight")) return preflightBody;
+  if (method === "POST" && path.endsWith("/debug-preflight")) {
+    const requestPath = (body as { debug_snapshot?: { request?: { path?: string } } })?.debug_snapshot?.request?.path ?? "/";
+    if (typeof preflightBody === "object" && preflightBody !== null && "resolution" in preflightBody) {
+      const resolution = (preflightBody as { resolution?: typeof TEST_RESOLUTION }).resolution;
+      return resolution ? { ...preflightBody, resolution: { ...resolution, masked_target: { url: `http://echo.test${requestPath}`, method: "GET" } } } : preflightBody;
+    }
+    return preflightBody;
+  }
   if (method === "POST" && path.endsWith("/runs")) return { id: RUN_ID, target_type: "debug_snapshot", case_version_id: null, environment_id: ENV_ID, state: "queued", outcome: null, reason_category: null, pool_id: null, created_at: "2026-09-14T00:00:00Z" };
   // 替身绕过 parse：这里直接返回解析后的值（服务端返回的是 {"hash": ...}，
   // 组件用 toDebugSnapshotDigest 取 hash，因此替身要给出字符串）。
@@ -136,7 +152,7 @@ function editorNode(props: Omit<EditorTestProps, "strict"> = {}) {
       workspaceId={WORKSPACE_ID}
       projectId={PROJECT_ID}
       caseSummaryId={CASE_ID}
-      environments={[{ id: ENV_ID, name: "测试环境", kind: "test", base_url: "http://echo.test", pool_id: null, variables: {}, status: "active" }]}
+      environments={[{ id: ENV_ID, name: "测试环境", kind: "test", base_url: "http://echo.test", pool_id: null, variables: {}, status: "active", rev: 1, config_version: 1 }]}
       selectedEnvironmentId={ENV_ID}
       onSelectEnvironment={() => {}}
       onSaved={() => {}}
@@ -183,6 +199,7 @@ beforeEach(() => {
       environment: { id: ENV_ID, name: "测试环境", kind: "test", base_url: "http://echo.test" },
       input_fingerprint: "in-current",
     },
+    resolution: TEST_RESOLUTION,
   };
   apiGetMock.mockReset();
   apiSendMock.mockReset();
@@ -278,6 +295,7 @@ describe("请求调试工作台", () => {
       can_authorize: true,
       auth: { required: false, state: "needs_authorization", profile_id: "profile-1" },
       context: null,
+      resolution: { ...TEST_RESOLUTION, ready: false, auth: { ...TEST_RESOLUTION.auth, status: "needs_authorization" } },
     };
     await renderLoaded();
     await screen.findByText(/当前身份未获授权使用该环境的凭证/);
@@ -314,6 +332,7 @@ describe("请求调试工作台", () => {
       can_authorize: false,
       auth: { required: false, state: "needs_authorization", profile_id: null },
       context: null,
+      resolution: { ...TEST_RESOLUTION, ready: false, auth: { ...TEST_RESOLUTION.auth, status: "needs_authorization" } },
     };
     await renderLoaded();
     await screen.findByText(/当前身份未获授权使用该环境的凭证/);
@@ -352,7 +371,8 @@ describe("请求调试工作台", () => {
 
     // 改一次路径，预览与提交都用这一份。
     fireEvent.change(screen.getByLabelText("路径"), { target: { value: "/orders" } });
-    expect(screen.getByText(/实际目标：http:\/\/echo\.test\/orders/)).toBeTruthy();
+    expect(screen.getByText(/实际目标：尚未取得权威解析结果/)).toBeTruthy();
+    expect(screen.getByText(/配置预览：http:\/\/echo\.test\/orders/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     await waitFor(() =>
       expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")).toHaveLength(1),

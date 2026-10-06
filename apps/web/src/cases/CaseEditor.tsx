@@ -14,7 +14,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button, Collapse, Modal } from "antd";
 
 import { ApiError, apiSend, apiSendWithMeta, projectPath } from "../api/client";
-import { toAssertionTypes, toCaseDetail, toCaseVersion, toCurlPreview } from "../api/guards";
+import { toAssertionTypes, toCaseDetail, toCaseVersion, toCurlPreview, toVariableContext } from "../api/guards";
 import type {
   AssertionResult,
   AssertionType,
@@ -24,6 +24,8 @@ import type {
   Environment,
   Folder,
   RunReport,
+  ResolutionLocation,
+  VariableContext,
 } from "../api/types";
 import { ErrorText, Hint, Loading, Notice } from "../components/Feedback";
 import { trapModalTabEndpoints } from "../components/modalFocus";
@@ -45,7 +47,9 @@ import { BodyEditor, KeyValueRows } from "./RequestParts";
 import { RequestTabs } from "./RequestTabs";
 import { ResizableWorkbench } from "./ResizableWorkbench";
 import { ResponseFieldPanel } from "./ResponseFieldPanel";
+import { scheduleEditorFieldFocus } from "./resolutionFocus";
 import { RunPanel, type RunProvenance } from "../runs/RunPanel";
+import { matchesResolutionEvidence } from "../runs/runEvidence";
 import { emptyRequest, newRequestRow, rawToSpec, requestToRaw, sameRequest, upgradeRequestV2, type RawKeyValue, type RawRequest } from "./requestDraft";
 import { useFieldTree } from "./useFieldTree";
 
@@ -307,6 +311,7 @@ export function CaseEditor({
     runId: string;
     environmentId: string | null;
     configEpoch: number;
+    contextFingerprint: string | null;
   } | null>(null);
   const [creating, setCreating] = useState(false);
   const [versionOperationActive, setVersionOperationActive] = useState(false);
@@ -376,7 +381,26 @@ export function CaseEditor({
    * 没有切换。真正该失效的只有换用例／换项目／换主体／卸载。
    */
   const [editorKey] = useState(() => newEditorInstance());
+  const editorRootRef = useRef<HTMLElement>(null);
   const editRevisionRef = useRef(0);
+  const variableContext = useResource<VariableContext>(
+    active && selectedEnvironmentId !== null
+      ? `${workspaceId}/${projectId}/${currentUserId ?? ""}/${editorKey}/${selectedEnvironmentId}/${configEpoch}`
+      : null,
+    (signal) => apiSend(
+      projectPath(workspaceId, projectId, `/variable-context?environment_id=${encodeURIComponent(selectedEnvironmentId ?? "")}`),
+      "GET",
+      undefined,
+      toVariableContext,
+      { signal },
+    ),
+  );
+  const variablePicker = {
+    context: variableContext.data,
+    loading: variableContext.loading,
+    error: variableContext.error?.message ?? null,
+  };
+  const variableOwnerRevision = `${workspaceId}:${projectId}:${currentUserId ?? ""}:${editorKey}:${selectedEnvironmentId ?? ""}:${editRevisionRef.current}`;
   const saveInFlightRef = useRef<Promise<CaseDetail | null> | null>(null);
   const editorWriteGateRef = useRef(false);
   const shortcutLockRef = useRef(false);
@@ -588,6 +612,35 @@ export function CaseEditor({
   }, [request, assertions, stableUpgradeV1]);
   const presentedRequest = request.schema_version === 2 ? request : presentedUpgrade.request;
   const presentedAssertions = request.schema_version === 2 ? assertions : presentedUpgrade.assertions;
+
+  function focusResolutionIssue(location: ResolutionLocation) {
+    const startedOwner = confirmOwnerRef.current;
+    const startedRevision = editRevisionRef.current;
+    let elementId: string | null = null;
+    let ariaLabel: string | null = null;
+    if (location.kind === "path") {
+      elementId = domIdPrefix ? `${domIdPrefix}-send-path` : "request-path";
+    } else if (location.kind === "body") {
+      setActiveTab("body");
+      elementId = `${domIdPrefix ? `${domIdPrefix}-request` : "request"}-body`;
+    } else {
+      setActiveTab(location.kind === "query" ? "params" : "headers");
+      const rows = location.kind === "query" ? presentedRequest.query_params : presentedRequest.headers;
+      const index = "row_id" in location
+        ? rows.findIndex((row) => row.row_id === location.row_id)
+        : location.index;
+      if (index >= 0) ariaLabel = `${location.kind === "query" ? "查询参数" : "请求头"}值 ${index + 1}`;
+    }
+    const root = editorRootRef.current;
+    if (root === null) return;
+    scheduleEditorFieldFocus({
+      root,
+      elementId,
+      ariaLabel,
+      span: location.utf16_span,
+      isCurrent: () => aliveRef.current && activeRef.current && confirmOwnerRef.current === startedOwner && editRevisionRef.current === startedRevision,
+    });
+  }
 
   /**
    * 当前值指向的目录是否已经不在可选清单里（被归档、被删、或不属于这个项目）。
@@ -901,12 +954,21 @@ export function CaseEditor({
     displayedReport.context !== null &&
     preflightIsCurrent &&
     debug.preflight?.context != null &&
+    matchesResolutionEvidence(displayedReport, debug.preflight.resolution?.context_fingerprint) &&
     // 两个标记都要比：snapshot 覆盖请求与断言，input 覆盖普通变量；环境除了 id 还要比
     // 地址——同一条环境记录被改了 base_url，运行就不再是打到同一个目标。
     displayedReport.context.snapshot_fingerprint === debug.preflight.context.snapshot_fingerprint &&
     displayedReport.context.input_fingerprint === debug.preflight.context.input_fingerprint &&
     displayedReport.context.environment.id === debug.preflight.context.environment.id &&
     displayedReport.context.environment.base_url === debug.preflight.context.environment.base_url;
+  const debugEvidencePending =
+    displayedReport !== null &&
+    selection?.source === "debug" &&
+    displayedReport.run.target_type === "debug_snapshot" &&
+    selectedDebugRecord?.environmentId === selectedEnvironmentId &&
+    selectedDebugRecord?.inputKey === currentSnapshotKey &&
+    selectedDebugRecord?.configEpoch === configEpoch &&
+    (!preflightIsCurrent || debug.preflight === null || debug.preflighting);
 
   /**
    * 已发布版本运行的匹配判断。
@@ -930,6 +992,7 @@ export function CaseEditor({
     selection?.source === "history" &&
     displayedReport.run.target_type === "case_version" &&
     displayedReport.run.environment_id === selectedEnvironmentId &&
+    matchesResolutionEvidence(displayedReport, versionProvenance?.contextFingerprint) &&
     versionProvenanceMatches &&
     !dirty &&
     draftSnapshotHash !== null &&
@@ -972,7 +1035,7 @@ export function CaseEditor({
     const epoch = getConfigEpoch === undefined ? configEpoch : getConfigEpoch();
     if (epoch === null) return null;
     if (selectedEnvironmentId === null) return null;
-    return { environmentId: selectedEnvironmentId, configEpoch: epoch };
+    return { environmentId: selectedEnvironmentId, configEpoch: epoch, contextFingerprint: null };
   }, [getConfigEpoch, configEpoch, selectedEnvironmentId]);
 
   /**
@@ -981,7 +1044,7 @@ export function CaseEditor({
    * **不在此刻读取时钟**：到这里时配置可能已经变了，而这次运行用的仍是提交时的配置。
    */
   const handleRunSubmitted = useCallback((runId: string, provenance: RunProvenance) => {
-    setVersionProvenance({ runId, ...provenance });
+    setVersionProvenance({ runId, ...provenance, contextFingerprint: provenance.contextFingerprint ?? null });
   }, []);
 
   /** 用户点选项目／环境历史里的某条运行：这是**显式**的来源切换。 */
@@ -1480,7 +1543,7 @@ export function CaseEditor({
 
   return (
     <>
-    <section className="pane workbench">
+    <section ref={editorRootRef} className="pane workbench" data-editor-key={editorKey}>
       <CaseHeading
         idPrefix={domIdPrefix ? `${domIdPrefix}-case` : "case"}
         name={name}
@@ -1547,6 +1610,10 @@ export function CaseEditor({
               onCancelAuthorization={cancelAuthorization}
               tools={<CurlImport idPrefix={domIdPrefix ? `${domIdPrefix}-request` : ""} pendingKey={leaveKey ? `${leaveKey}:curl` : undefined} onImport={importCurl} disabled={readOnly} loading={busy} />}
               authorization={debug.authorizationView}
+              variablePicker={variablePicker}
+              variableOwnerRevision={variableOwnerRevision}
+              onReloadVariables={variableContext.reload}
+              onLocateIssue={focusResolutionIssue}
             />
             {sendError ? <ErrorText message={sendError} /> : null}
             {debug.error ? <ErrorText message={debug.error} /> : null}
@@ -1588,6 +1655,7 @@ export function CaseEditor({
                       const first = item.selector[0];
                       return item.target_source === "request.query" && first?.kind === "row" && presentedRequest.query_params.some((row) => row.row_id === first.row_id);
                     }).length}
+                    variablePicker={variableContext.data === null ? undefined : variablePicker}
                     assertionSlot={(row) => row.row_id ? (
                       <AssertionColumn
                         types={types.data ?? []}
@@ -1653,6 +1721,7 @@ export function CaseEditor({
                       const first = item.selector[0];
                       return item.target_source === "request.header" && first?.kind === "row" && presentedRequest.headers.some((row) => row.row_id === first.row_id);
                     }).length}
+                    variablePicker={variableContext.data === null ? undefined : variablePicker}
                     assertionSlot={(row) => row.row_id ? (
                       <AssertionColumn
                         types={types.data ?? []}
@@ -1684,6 +1753,8 @@ export function CaseEditor({
                     idPrefix={domIdPrefix ? `${domIdPrefix}-request` : "request"}
                     request={request}
                     readOnly={readOnly}
+                    variablePicker={variableContext.data === null ? undefined : variablePicker}
+                    ownerRevision={variableOwnerRevision}
                     onChange={(body) => patchRequest({ body })}
                     onTypeChange={(body_type) => patchRequest({ body_type })}
                   />
@@ -1733,7 +1804,9 @@ export function CaseEditor({
       */}
       {displayedReport !== null && isTerminal(displayedReport.run) && !activeMatches ? (
         <Hint>
-          字段行旁显示的是最近一次运行的结论，但当前内容或执行环境已与那次运行不同，因此统一标为“未执行”；
+          {debugEvidencePending
+            ? "当前依据暂未确认，字段行暂不贴用这次结论；"
+            : "字段行旁显示的是最近一次运行的结论，但当前内容或执行环境已与那次运行不同，因此统一标为“未执行”；"}
           {separateHistory
             ? "那次运行的完整报告仍可在“本次记录”或顶部“测试报告”中查看。"
             : "那次运行的完整报告仍可在“本次记录”或本页“项目／环境历史”中查看。"}
@@ -1749,6 +1822,7 @@ export function CaseEditor({
         reportError={displayedReportError}
         loading={debug.phase === "submitting"}
         matchesCurrent={activeMatches}
+        evidencePending={debugEvidencePending}
         selectedRunId={selection?.runId ?? null}
         onCancel={(runId) => void debug.cancel(runId)}
         canCancel={!roleReadOnly}

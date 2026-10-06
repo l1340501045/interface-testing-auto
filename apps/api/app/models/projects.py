@@ -5,10 +5,12 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    CheckConstraint,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
     Integer,
+    SmallInteger,
     String,
     UniqueConstraint,
     func,
@@ -92,12 +94,81 @@ class ProjectConfigVersion(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), comment="创建时间")
 
 
+class EnvironmentConfigVersion(Base):
+    """环境普通配置的不可变快照；版本从本迁移时的当前事实开始。"""
+
+    __tablename__ = "environment_config_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id", "project_id", "environment_id", "version",
+            name="uq_environment_config_versions_version",
+        ),
+        UniqueConstraint(
+            "workspace_id", "project_id", "environment_id", "id",
+            name="uq_environment_config_versions_scope_id",
+        ),
+        project_fk("fk_environment_config_versions_project"),
+        project_object_fk(
+            ["environment_id"], "environments", "fk_environment_config_versions_environment"
+        ),
+        CheckConstraint("version > 0", name="ck_environment_config_versions_version_positive"),
+        CheckConstraint(
+            "schema_version > 0", name="ck_environment_config_versions_schema_positive"
+        ),
+        {"comment": "环境普通配置的不可变版本快照；不保存身份秘密"},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+        server_default=func.gen_random_uuid(), comment="配置快照主键",
+    )
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False, comment="工作空间范围"
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False, comment="所属项目"
+    )
+    environment_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False, comment="本配置所属环境"
+    )
+    version: Mapped[int] = mapped_column(
+        Integer, nullable=False, comment="该环境自版本化启用后的递增配置版本"
+    )
+    schema_version: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, default=1, server_default="1",
+        comment="配置快照结构版本；S1固定为1",
+    )
+    snapshot: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, comment="普通环境配置快照；不含解密身份值"
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("app.users.id", ondelete="RESTRICT"), nullable=True,
+        comment="保存主体；迁移初始化为空",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), comment="创建时间"
+    )
+
+
 class Environment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "environments"
     __table_args__ = (
         UniqueConstraint("workspace_id", "project_id", "id", name="uq_environments_ws_project_id"),
         project_fk("fk_environments_project"),
         workspace_object_fk(["pool_id"], "runner_pools", "fk_environments_pool", ondelete="SET NULL"),
+        ForeignKeyConstraint(
+            ["workspace_id", "project_id", "id", "current_config_version_id"],
+            [
+                "app.environment_config_versions.workspace_id",
+                "app.environment_config_versions.project_id",
+                "app.environment_config_versions.environment_id",
+                "app.environment_config_versions.id",
+            ],
+            name="fk_environments_current_config_version",
+            use_alter=True,
+            deferrable=True,
+            initially="DEFERRED",
+        ),
         {"comment": "项目可配置执行环境，绑定服务地址与执行池"},
     )
 
@@ -113,6 +184,10 @@ class Environment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     variables: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}", comment="环境级普通变量，不接收秘密")
     rev: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1", comment="乐观锁修订号")
+    current_config_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True,
+        comment="当前环境普通配置快照；迁移完成后非空",
+    )
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="active", server_default="active", comment="状态：active/archived"
     )

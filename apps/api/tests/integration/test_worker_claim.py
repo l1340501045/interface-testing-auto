@@ -21,7 +21,9 @@ def _connect(url: str) -> psycopg.Connection:
 def _seed_tenant(connection: psycopg.Connection, name: str) -> dict:
     """写入一个工作空间、项目、执行池、环境与一个排队工作项。"""
     workspace_id, user_id = uuid.uuid4(), uuid.uuid4()
-    project_id, pool_id, environment_id, run_id, job_id = (uuid.uuid4() for _ in range(5))
+    project_id, pool_id, environment_id, config_version_id, run_id, job_id = (
+        uuid.uuid4() for _ in range(6)
+    )
     with connection.cursor() as cursor:
         cursor.execute(
             "INSERT INTO app.workspaces (id, name, status) VALUES (%s, %s, 'active')",
@@ -45,9 +47,30 @@ def _seed_tenant(connection: psycopg.Connection, name: str) -> dict:
         )
         cursor.execute(
             "INSERT INTO app.environments"
-            " (id, workspace_id, project_id, name, kind, base_url, pool_id, variables, status)"
-            " VALUES (%s, %s, %s, %s, 'test', %s, %s, '{}'::jsonb, 'active')",
-            (environment_id, workspace_id, project_id, "测试环境", "http://echo:8080", pool_id),
+            " (id, workspace_id, project_id, name, kind, base_url, pool_id, variables, status,"
+            "  current_config_version_id)"
+            " VALUES (%s, %s, %s, %s, 'test', %s, %s, '{}'::jsonb, 'active', %s)",
+            (
+                environment_id,
+                workspace_id,
+                project_id,
+                "测试环境",
+                "http://echo:8080",
+                pool_id,
+                config_version_id,
+            ),
+        )
+        cursor.execute(
+            "INSERT INTO app.environment_config_versions"
+            " (id, workspace_id, project_id, environment_id, version, schema_version, snapshot)"
+            " VALUES (%s, %s, %s, %s, 1, 1, %s::jsonb)",
+            (
+                config_version_id,
+                workspace_id,
+                project_id,
+                environment_id,
+                '{"schema_version":1,"variables":{}}',
+            ),
         )
         now = datetime.now(UTC)
         cursor.execute(

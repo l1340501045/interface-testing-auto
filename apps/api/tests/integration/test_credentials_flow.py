@@ -1098,9 +1098,15 @@ def _set_environment_variables(
     client: TestClient, account: dict, project: dict, environment_id: str, variables: dict
 ) -> None:
     """按界面同样的入口写入环境普通变量；这是请求模板 `{{...}}` 的真正输入。"""
+    environments = client.get(
+        f"{project_base(account, project)}/environments"
+    )
+    assert environments.status_code == 200, environments.text
+    rev = next(item["rev"] for item in environments.json() if item["id"] == environment_id)
     response = client.patch(
         f"{project_base(account, project)}/environments/{environment_id}",
         json={"variables": variables},
+        headers={"If-Match": str(rev)},
     )
     assert response.status_code == 200, response.text
 

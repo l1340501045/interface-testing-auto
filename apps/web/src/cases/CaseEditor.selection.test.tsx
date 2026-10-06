@@ -54,6 +54,14 @@ interface Call {
 let calls: Call[] = [];
 /** 让某条运行的报告读取失败（用于验证“读不到报告也要能取消已知运行”）。 */
 let failReportFor: string | null = null;
+const RESOLUTION = {
+  schema_version: 1, scope: { workspace_id: WORKSPACE_ID, project_id: PROJECT_ID, environment_id: ENV_ID }, ready: true,
+  ordinary_resolution: "ready", masked_target: { url: "http://echo.test/echo", method: "GET" }, bindings: [], issues: [],
+  auth: { required: false, status: "none", injection_slots: [], requires_worker_verification: false },
+  config_basis: { project_variables_version: 1, project_config_version_id: null, environment_rev: 1, environment_config_version: 1, environment_config_version_id: "cfg" },
+  context_fingerprint: "source-fp", resolution_context: "resolution-context",
+};
+const FROZEN_RESOLUTION = { schema_version: 1, config_basis: RESOLUTION.config_basis, variable_sources: [], bindings: [], context_fingerprint: "source-fp" };
 
 const READY = {
   ready: true,
@@ -65,6 +73,7 @@ const READY = {
     environment: { id: ENV_ID, name: "测试环境", kind: "test", base_url: "http://echo.test" },
     input_fingerprint: "in-1",
   },
+  resolution: RESOLUTION,
 };
 
 const CASE_DETAIL = {
@@ -122,8 +131,10 @@ function reportBody(runId: string, targetType: string, status: number, state = "
             snapshot_fingerprint: "fp-1",
             environment: { id: ENV_ID, name: "测试环境", kind: "test", base_url: "http://echo.test" },
             input_fingerprint: "in-1",
+            resolution: { schema_version: 1, guard: "ordinary_binding_enforced_v1", context_fingerprint: "source-fp", binding_fingerprint: "binding-fp" },
           }
         : null,
+    resolution: FROZEN_RESOLUTION,
   };
 }
 
@@ -148,6 +159,7 @@ function route(rawPath: string, method: string, body: unknown, headers?: Record<
   }
   if (method === "GET" && path.endsWith(`/cases/${CASE_ID}`)) return CASE_DETAIL;
   if (method === "POST" && path.endsWith("/debug-preflight")) return READY;
+  if (method === "POST" && path.endsWith("/resolution-preview")) return RESOLUTION;
   if (method === "POST" && path.endsWith("/runs")) {
     return reportBody(DEBUG_RUN, "debug_snapshot", 200, "queued").run;
   }
@@ -187,6 +199,8 @@ function renderEditor(
           pool_id: null,
           variables: {},
           status: "active",
+          rev: 1,
+          config_version: 1,
         },
       ]}
       selectedEnvironmentId={ENV_ID}

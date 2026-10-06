@@ -255,6 +255,8 @@ describe("配置变更后旧运行结论的时效性", () => {
             pool_id: null,
             variables: {},
             status: "active",
+            rev: 1,
+            config_version: 1,
           },
         ]}
         selectedEnvironmentId={ENV_ID}
@@ -297,6 +299,8 @@ describe("配置变更后旧运行结论的时效性", () => {
             pool_id: null,
             variables: {},
             status: "active",
+            rev: 1,
+            config_version: 1,
           },
         ]}
         selectedEnvironmentId={ENV_ID}
@@ -348,6 +352,8 @@ describe("配置变更后旧运行结论的时效性", () => {
             pool_id: null,
             variables: {},
             status: "active",
+            rev: 1,
+            config_version: 1,
           },
         ]}
         selectedEnvironmentId={ENV_ID}
@@ -381,6 +387,8 @@ describe("配置变更后旧运行结论的时效性", () => {
             pool_id: null,
             variables: {},
             status: "active",
+            rev: 1,
+            config_version: 1,
           },
         ]}
         selectedEnvironmentId={ENV_ID}

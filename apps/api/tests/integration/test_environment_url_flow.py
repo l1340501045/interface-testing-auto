@@ -144,6 +144,7 @@ def test_patch_rejects_bad_address_without_touching_the_record(
             "base_url": "echo:8080",
             "variables": {"count": {"type": "number", "text": "1"}},
         },
+        headers={"If-Match": str(environment["rev"])},
     )
     assert response.status_code == 400, response.text
     assert response.json()["code"] == "environment_url_invalid"
@@ -256,7 +257,9 @@ def test_fixing_the_environment_makes_the_same_draft_sendable(
     assert _preflight(client, account, project, environment["id"], snapshot)["ready"] is False
 
     fixed = client.patch(
-        f"{base}/environments/{environment['id']}", json={"base_url": ALLOWED_BASE_URL}
+        f"{base}/environments/{environment['id']}",
+        json={"base_url": ALLOWED_BASE_URL},
+        headers={"If-Match": str(environment["rev"])},
     )
     assert fixed.status_code == 200, fixed.text
     assert fixed.json()["base_url"] == ALLOWED_BASE_URL

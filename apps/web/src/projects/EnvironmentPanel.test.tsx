@@ -34,6 +34,7 @@ interface Call {
   path: string;
   method: string;
   body: unknown;
+  headers?: Record<string, string>;
 }
 
 let calls: Call[] = [];
@@ -47,6 +48,8 @@ function environment(overrides: Partial<Environment> = {}): Environment {
     pool_id: null,
     variables: {},
     status: "active",
+    rev: 1,
+    config_version: 1,
     ...overrides,
   };
 }
@@ -60,13 +63,13 @@ function LeaveProbe() {
 function renderPanel(list: Environment[], options: { canEdit?: boolean } = {}) {
   const onChanged = vi.fn();
   const onOpenChange = vi.fn();
-  render(
+  const node = (items: Environment[]) => (
     <LeaveGuardProvider>
       <LeaveProbe />
       <EnvironmentPanel
         workspaceId={WS}
         projectId={PROJECT}
-        environments={list}
+        environments={items}
         loading={false}
         error={null}
         selectedId={null}
@@ -77,10 +80,10 @@ function renderPanel(list: Environment[], options: { canEdit?: boolean } = {}) {
         open
         onOpenChange={onOpenChange}
       />
-    </LeaveGuardProvider>,
-    { wrapper: AppProviders },
+    </LeaveGuardProvider>
   );
-  return { onChanged, onOpenChange };
+  const view = render(node(list), { wrapper: AppProviders });
+  return { onChanged, onOpenChange, rerenderList: (items: Environment[]) => view.rerender(node(items)) };
 }
 
 function leaveState(): string {
@@ -93,8 +96,9 @@ function mockSave(result: unknown | Error) {
     method: string,
     body: unknown,
     parse: (raw: unknown) => unknown,
+    options?: { headers?: Record<string, string> },
   ) => {
-    calls.push({ path, method, body });
+    calls.push({ path, method, body, ...(options?.headers ? { headers: options.headers } : {}) });
     if (result instanceof Error) throw result;
     return parse(result);
   }) as never);
@@ -127,6 +131,7 @@ describe("环境编辑", () => {
       `/workspaces/${WS}/projects/${PROJECT}/environments/${ENV_ID}`,
     );
     expect(calls[0].method).toBe("PATCH");
+    expect(calls[0].headers?.["If-Match"]).toBe("1");
     expect(calls[0].body).toEqual({
       name: "灰度环境",
       base_url: "http://gray:9000",
@@ -146,6 +151,40 @@ describe("环境编辑", () => {
 
     expect(await screen.findByText("环境名称已存在")).toBeTruthy();
     expect((screen.getByLabelText("环境名称") as HTMLInputElement).value).toBe("本地测试环境");
+  });
+
+  it("修订冲突保留整份草稿并提示刷新，不把旧值覆盖回表单", async () => {
+    mockSave(new ApiError(409, "config_revision_conflict", "环境配置已被其他人更新", null));
+    renderPanel([environment({ rev: 7 })]);
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    fireEvent.change(screen.getByLabelText("环境名称"), { target: { value: "我的未保存环境" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存环境" }));
+    expect(await screen.findByText(/输入均已保留/)).toBeTruthy();
+    expect((screen.getByLabelText("环境名称") as HTMLInputElement).value).toBe("我的未保存环境");
+    expect(calls[0]?.headers?.["If-Match"]).toBe("7");
+  });
+
+  it("列表刷新不偷换编辑基线，明确采纳后才使用新修订", async () => {
+    let saves = 0;
+    apiSendMock.mockImplementation((async (path: string, method: string, body: unknown, parse: (raw: unknown) => unknown, options?: { headers?: Record<string, string> }) => {
+      calls.push({ path, method, body, ...(options?.headers ? { headers: options.headers } : {}) });
+      saves += 1;
+      if (saves === 1) throw new ApiError(409, "config_revision_conflict", "环境已更新", null);
+      return parse(environment({ rev: 3, name: "我的草稿" }));
+    }) as never);
+    const first = environment({ rev: 1 });
+    const { rerenderList } = renderPanel([first]);
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    fireEvent.change(screen.getByLabelText("环境名称"), { target: { value: "我的草稿" } });
+    rerenderList([environment({ rev: 2, name: "别人保存的名称" })]);
+    expect(screen.getByText(/仍基于旧修订/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "保存环境" }));
+    await screen.findByText(/输入均已保留/);
+    expect(calls[0]?.headers?.["If-Match"]).toBe("1");
+    fireEvent.click(screen.getByRole("button", { name: "保留输入并采用修订 2 作为新基线" }));
+    fireEvent.click(screen.getByRole("button", { name: "保存环境" }));
+    await screen.findByText("环境「我的草稿」已保存。");
+    expect(calls[1]?.headers?.["If-Match"]).toBe("2");
   });
 
   it("变量名重复在本地挡住，不发请求", async () => {
@@ -415,8 +454,8 @@ describe("服务端地址错误的字段归属", () => {
       resolve = resolveFn;
       reject = rejectFn;
     });
-    apiSendMock.mockImplementation(async (path, method, body, parse) => {
-      calls.push({ path, method, body });
+    apiSendMock.mockImplementation(async (path, method, body, parse, options) => {
+      calls.push({ path, method, body, ...(options?.headers ? { headers: options.headers } : {}) });
       return parse(await response);
     });
     return {
@@ -553,6 +592,7 @@ describe("服务端地址错误的字段归属", () => {
       path: `/workspaces/${WS}/projects/${PROJECT}/environments/${first.id}`,
       method: "PATCH",
       body: { name: "环境 A 草稿", base_url: "http://[1]/health", status: "active", variables: {} },
+      headers: { "If-Match": "1" },
     }]);
     expect(onChanged).not.toHaveBeenCalled();
 
