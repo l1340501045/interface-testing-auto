@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from ..config import Settings
 from ..kernel.assertion_spec import AssertionSpecError, validate_assertions
-from ..kernel.request_spec import RequestSpecError, validate_request
+from ..kernel.request_spec import RequestSpecError, ServiceSpecError, validate_request
 from ..models import CredentialSet, Environment
 from .credentials import (
     CREDENTIAL_AMBIGUOUS,
@@ -28,6 +28,7 @@ from .credentials import (
     CredentialError,
     available_profiles,
     check_usable_grant,
+    parse_auth_slot,
     set_auth_slots,
 )
 from .debug_context import build_context_binding
@@ -59,6 +60,8 @@ class PreflightResult:
     auth_state: str = "none"
     profile_id: uuid.UUID | None = None
     context: dict | None = None
+    injection_slots: list[dict] = field(default_factory=list)
+    requires_worker_verification: bool = False
 
 
 # 需要管理员调整环境／执行池配置的问题码；其余归到“改请求”。
@@ -85,6 +88,7 @@ def preflight(
     role: str,
     environment_id: uuid.UUID,
     snapshot: dict,
+    base_url: str | None = None,
 ) -> PreflightResult:
     """检查当前主体能否发送这份调试快照。"""
     can_authorize = can(role, "manage_secrets")
@@ -111,6 +115,12 @@ def preflight(
     request_payload = snapshot.get("request", {})
     try:
         request = validate_request(request_payload)
+    except ServiceSpecError as error:
+        return PreflightResult(
+            ready=False,
+            issues=[PreflightIssue("service_invalid", str(error), "edit_request")],
+            can_authorize=can_authorize,
+        )
     except RequestSpecError as error:
         return PreflightResult(
             ready=False,
@@ -153,7 +163,7 @@ def preflight(
             "id": str(environment.id),
             "name": environment.name,
             "kind": environment.kind,
-            "base_url": environment.base_url,
+            "base_url": base_url or environment.base_url,
         },
         "input_fingerprint": binding.input_fingerprint,
     }
@@ -167,7 +177,9 @@ def preflight(
 
     try:
         resolved = resolve_pool(session, settings, environment)
-        _request, target_origin = resolve_target(request, environment, resolved.guard)
+        _request, target_origin = resolve_target(
+            request, environment, resolved.guard, base_url=base_url
+        )
     except RunRejected as error:
         result.ready = False
         result.issues.append(
@@ -179,7 +191,7 @@ def preflight(
         )
         return result
 
-    state, profile_id, issues = _inspect_credentials(
+    state, profile_id, issues, injection_slots = _inspect_credentials(
         session,
         environment=environment,
         principal_id=principal_id,
@@ -188,10 +200,13 @@ def preflight(
         # 授权匹配仍用原有的内部快照摘要：它是已签发授权的键，换成 HMAC 会让所有
         # 既有授权失配。对外返回的是上面那份绑定主体的不透明标记，两者互不替代。
         internal_snapshot_digest=internal_snapshot_digest,
+        case_version_id=None,
         can_authorize=can_authorize,
     )
     result.auth_state = state
     result.profile_id = profile_id
+    result.injection_slots = injection_slots
+    result.requires_worker_verification = bool(injection_slots)
     if issues:
         result.ready = False
         result.issues.extend(issues)
@@ -206,8 +221,9 @@ def _inspect_credentials(
     target_origin: str,
     auth_required: bool,
     internal_snapshot_digest: str,
+    case_version_id: uuid.UUID | None,
     can_authorize: bool,
-) -> tuple[str, uuid.UUID | None, list[PreflightIssue]]:
+) -> tuple[str, uuid.UUID | None, list[PreflightIssue], list[dict]]:
     """检查环境身份与本次用途授权；返回（认证状态, 可返回的 profile_id, 问题）。
 
     只读元数据：秘密值、凭证集合里的秘密版本内容都不读取，也不解密。`profile_id`
@@ -227,8 +243,9 @@ def _inspect_credentials(
                         _credential_action(can_authorize),
                     )
                 ],
+                [],
             )
-        return "none", None, []
+        return "none", None, [], []
 
     if len(profiles) > 1:
         return (
@@ -242,6 +259,7 @@ def _inspect_credentials(
                     _credential_action(can_authorize),
                 )
             ],
+            [],
         )
 
     profile = profiles[0]
@@ -258,11 +276,22 @@ def _inspect_credentials(
                     "manage_credentials",
                 )
             ],
+            [],
         )
 
     set_issue, required_slots = _inspect_credential_set(session, profile)
     if set_issue is not None:
-        return "unavailable", exposed_profile_id, [set_issue]
+        return "unavailable", exposed_profile_id, [set_issue], []
+
+    slot_metadata = []
+    for slot in sorted(required_slots):
+        try:
+            kind, name = parse_auth_slot(slot)
+        except CredentialError:
+            continue
+        slot_metadata.append(
+            {"kind": kind, "name": name, "status": "pending_worker_verification"}
+        )
 
     try:
         check_usable_grant(
@@ -270,8 +299,8 @@ def _inspect_credentials(
             profile,
             environment,
             principal_id=principal_id,
-            case_version_id=None,
-            debug_snapshot_hash=internal_snapshot_digest,
+            case_version_id=case_version_id,
+            debug_snapshot_hash=(internal_snapshot_digest if case_version_id is None else None),
             # 目标与槽位都取自本次真正要执行的配置：少了它们，预检会选中一条实际
             # 不允许本次目标或槽位的授权并报“可以发送”，与实际执行不一致。
             target_origin=target_origin,
@@ -282,8 +311,39 @@ def _inspect_credentials(
             "needs_authorization",
             exposed_profile_id,
             [PreflightIssue(error.code, error.message, _credential_action(can_authorize))],
+            slot_metadata,
         )
-    return "ready", exposed_profile_id, []
+    return "ready", exposed_profile_id, [], slot_metadata
+
+
+def inspect_auth_metadata(
+    session: Session,
+    *,
+    environment: Environment,
+    principal_id: uuid.UUID,
+    target_origin: str,
+    auth_required: bool,
+    case_version_id: uuid.UUID | None,
+    debug_snapshot_hash: str | None,
+    can_authorize: bool,
+) -> tuple[dict, list[PreflightIssue]]:
+    """供固定版本/调试解析预览共用的只读认证元数据检查。"""
+    state, _profile_id, issues, slots = _inspect_credentials(
+        session,
+        environment=environment,
+        principal_id=principal_id,
+        target_origin=target_origin,
+        auth_required=auth_required,
+        internal_snapshot_digest=debug_snapshot_hash or "",
+        case_version_id=case_version_id,
+        can_authorize=can_authorize,
+    )
+    return {
+        "required": auth_required,
+        "status": state,
+        "injection_slots": slots,
+        "requires_worker_verification": bool(slots),
+    }, issues
 
 
 def _inspect_credential_set(
@@ -330,4 +390,4 @@ def _credential_action(can_authorize: bool) -> str:
     return "authorize" if can_authorize else "contact_admin"
 
 
-__all__ = ["PreflightIssue", "PreflightResult", "preflight"]
+__all__ = ["PreflightIssue", "PreflightResult", "inspect_auth_metadata", "preflight"]

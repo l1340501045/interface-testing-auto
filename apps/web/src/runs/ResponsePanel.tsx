@@ -82,6 +82,7 @@ export function ResponsePanel({
   loading,
   /** 当前内容与这份报告是否同源；false 时只作为“上次响应”保留。 */
   matchesCurrent,
+  evidencePending = false,
   selectedRunId,
   onCancel,
   canCancel,
@@ -91,6 +92,7 @@ export function ResponsePanel({
   reportError: string | null;
   loading: boolean;
   matchesCurrent: boolean;
+  evidencePending?: boolean;
   /**
    * 当前明确选中的运行 id。
    *
@@ -177,8 +179,12 @@ export function ResponsePanel({
           ) : null}
           {isTerminal(report.run) && !matchesCurrent ? (
             <Hint>
-              下面显示的是<strong>上一次发送</strong>的结果，当前编辑内容或执行环境已与它不同，
-              因此字段行旁不会贴用这次结论。继续编辑不受影响。
+              {evidencePending ? (
+                <>当前依据暂未确认；下面保留该运行的历史结果，确认完成前字段行旁不会贴用这次结论。</>
+              ) : (
+                <>下面显示的是<strong>上一次发送</strong>的结果，当前编辑内容或执行环境已与它不同，
+                  因此字段行旁不会贴用这次结论。继续编辑不受影响。</>
+              )}
             </Hint>
           ) : null}
 

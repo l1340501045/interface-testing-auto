@@ -635,8 +635,12 @@ describe("新建项目入口", () => {
 
   async function renderShell(): Promise<void> {
     render(<App />);
-    await screen.findByLabelText("项目");
-    await waitFor(() => expect(antSelectedValue("项目")).toBe(PROJECT_A));
+    await waitFor(() => {
+      const project = document.getElementById("scope-project");
+      if (project === null) throw new Error("项目选择器未挂载");
+      expect(project.getAttribute("aria-label")).toBe("项目");
+      expect(project.closest<HTMLElement>("[data-selected-value]")?.dataset.selectedValue).toBe(PROJECT_A);
+    });
     await act(async () => {});
   }
 
@@ -701,9 +705,12 @@ describe("新建项目入口", () => {
     fixtures.workspaces = [{ id: WORKSPACE_ID, name: "默认工作空间", role: "viewer" }];
     await renderShell();
 
-    expect(screen.queryByRole("button", { name: "＋新建项目" })).toBeNull();
-    expect(screen.queryByLabelText(KEY_LABEL)).toBeNull();
-    expect(screen.queryByRole("button", { name: "创建项目" })).toBeNull();
+    const scope = document.querySelector<HTMLElement>(".app-head .scope");
+    if (scope === null) throw new Error("工作空间与项目选择区未挂载");
+    expect(scope.querySelector('label[for="scope-project"]')?.textContent?.trim()).toBe("项目");
+    expect(scope.querySelector('button[aria-label="＋新建项目"]')).toBeNull();
+    expect(document.querySelector(".project-create")).toBeNull();
+    expect(document.getElementById("project-inline-key")).toBeNull();
   });
 
   it("查看者在还没有项目的工作空间里只看到提示，没有可提交的表单", async () => {

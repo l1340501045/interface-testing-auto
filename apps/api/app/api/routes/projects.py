@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import re
 import uuid
 
 from fastapi import APIRouter, Depends, Header, Response
@@ -18,9 +19,13 @@ from ...kernel.target_policy import TargetPolicyError, normalize_origin
 from ...kernel.valueliteral import ValueLiteral, ValueLiteralError
 from ...models import (
     Environment,
+    EnvironmentConfigVersion,
+    EnvironmentServiceMapping,
+    EnvironmentServiceVersion,
     Folder,
     Project,
     ProjectConfigVersion,
+    ProjectService,
     RunnerPool,
     RunnerPoolProjectGrant,
     WorkspaceMembership,
@@ -33,8 +38,17 @@ from ...services.folder_graph import (
     invalid_folder_ids,
 )
 from ...services.permissions import require
+from ...services.resolution import ResolutionError, variable_context
+from ...services.service_targets import (
+    ServiceTargetError,
+    append_environment_schema2,
+    append_mapping_version,
+    ensure_default_service,
+    inspect_selected_target,
+)
 from .. import deps
 from ..errors import ApiError, bad_request, conflict, not_found
+from ..request_contract import require_service_capability
 from ..schemas import (
     EnvironmentCreate,
     EnvironmentOut,
@@ -46,6 +60,7 @@ from ..schemas import (
     ProjectOut,
     RunnerPoolOut,
     RunnerPoolTargetsUpdate,
+    VariableContextOut,
     VariableItem,
     VariablesOut,
     VariablesUpdate,
@@ -230,6 +245,7 @@ def create_project(
     session.add(project)
     session.flush()
     pool = _ensure_default_pool(session, settings, workspace_id, project.id, principal.user_id)
+    ensure_default_service(session, workspace_id=workspace_id, project_id=project.id)
     deps.commit(session)
     return ProjectOut(
         id=project.id,
@@ -245,7 +261,13 @@ def create_project(
 # —— 环境 ——
 
 
-def _environment_out(item: Environment) -> EnvironmentOut:
+def _environment_out(session: Session, item: Environment) -> EnvironmentOut:
+    config_version = session.scalar(
+        select(EnvironmentConfigVersion.version).where(
+            EnvironmentConfigVersion.id == item.current_config_version_id,
+            EnvironmentConfigVersion.environment_id == item.id,
+        )
+    )
     return EnvironmentOut(
         id=item.id,
         name=item.name,
@@ -254,6 +276,8 @@ def _environment_out(item: Environment) -> EnvironmentOut:
         pool_id=item.pool_id,
         variables=item.variables,
         status=item.status,
+        rev=item.rev,
+        config_version=config_version,
     )
 
 
@@ -267,7 +291,45 @@ def list_environments(
     items = session.scalars(
         select(Environment).where(Environment.project_id == scope.project_id).order_by(Environment.name)
     )
-    return [_environment_out(item) for item in items]
+    return [_environment_out(session, item) for item in items]
+
+
+def _config_precondition(if_match: str | None) -> int:
+    """解析配置修订条件；S1 明确拒绝无条件覆盖及通配符。"""
+    if if_match is None:
+        raise conflict("config_revision_required", "请先读取最新配置修订再保存。")
+    value = if_match.strip()
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        value = value[1:-1]
+    if not value.isascii() or not value.isdecimal():
+        raise conflict("config_revision_conflict", "配置修订条件无效，请刷新后重试。")
+    return int(value)
+
+
+def _append_environment_config_version(
+    session: Session,
+    environment: Environment,
+    *,
+    created_by: uuid.UUID | None,
+) -> EnvironmentConfigVersion:
+    current = session.scalar(
+        select(func.max(EnvironmentConfigVersion.version)).where(
+            EnvironmentConfigVersion.environment_id == environment.id
+        )
+    )
+    version = EnvironmentConfigVersion(
+        workspace_id=environment.workspace_id,
+        project_id=environment.project_id,
+        environment_id=environment.id,
+        version=(current or 0) + 1,
+        schema_version=1,
+        snapshot={"schema_version": 1, "variables": dict(environment.variables or {})},
+        created_by=created_by,
+    )
+    session.add(version)
+    session.flush()
+    environment.current_config_version_id = version.id
+    return version
 
 
 def _checked_base_url(raw: str) -> str:
@@ -314,6 +376,7 @@ def create_environment(
     scope: deps.ProjectScope = _EDIT_SCOPE,
     session: Session = Depends(get_db),
 ) -> EnvironmentOut:
+    scope = _asset_gate(session, scope)
     if payload.kind == "production":
         raise bad_request("production_not_enabled", "本阶段不启用生产环境执行，请先创建测试环境。")
     base_url = _checked_base_url(payload.base_url)
@@ -327,7 +390,14 @@ def create_environment(
     # 环境在服务端绑定执行池；调用方不能指定池，避免自选网络出口。
     pool_id = _granted_pool_id(session, scope)
     variables = _validate_variables(list((payload.variables or {}).items()))
+    environment_id = uuid.uuid4()
+    config_version_id = uuid.uuid4()
+    mapping_id, mapping_version_id = uuid.uuid4(), uuid.uuid4()
+    default_service = ensure_default_service(
+        session, workspace_id=scope.workspace_id, project_id=scope.project_id
+    )
     environment = Environment(
+        id=environment_id,
         workspace_id=scope.workspace_id,
         project_id=scope.project_id,
         name=payload.name,
@@ -335,10 +405,52 @@ def create_environment(
         base_url=base_url,
         pool_id=pool_id,
         variables=variables,
+        current_config_version_id=config_version_id,
     )
-    session.add(environment)
+    mapping = EnvironmentServiceMapping(
+        id=mapping_id,
+        workspace_id=scope.workspace_id,
+        project_id=scope.project_id,
+        environment_id=environment_id,
+        service_id=default_service.id,
+        rev=1,
+        status="active",
+        current_version_id=mapping_version_id,
+    )
+    mapping_version = EnvironmentServiceVersion(
+        id=mapping_version_id,
+        workspace_id=scope.workspace_id,
+        project_id=scope.project_id,
+        environment_id=environment_id,
+        service_id=default_service.id,
+        mapping_id=mapping_id,
+        version=1,
+        base_url=base_url,
+        status="active",
+        created_by=scope.principal.user_id,
+    )
+    config_version = EnvironmentConfigVersion(
+        id=config_version_id,
+        workspace_id=scope.workspace_id,
+        project_id=scope.project_id,
+        environment_id=environment_id,
+        version=1,
+        schema_version=2,
+        snapshot={
+            "schema_version": 2,
+            "variables": dict(variables),
+            "service_versions": {
+                str(default_service.id): {
+                    "mapping_id": str(mapping_id),
+                    "mapping_version_id": str(mapping_version_id),
+                }
+            },
+        },
+        created_by=scope.principal.user_id,
+    )
+    session.add_all([environment, mapping, mapping_version, config_version])
     deps.commit(session)
-    return _environment_out(environment)
+    return _environment_out(session, environment)
 
 
 @router.patch(
@@ -348,25 +460,63 @@ def create_environment(
 def update_environment(
     environment_id: uuid.UUID,
     payload: EnvironmentUpdate,
+    if_match: str | None = Header(default=None, alias="If-Match"),
     scope: deps.ProjectScope = _EDIT_SCOPE,
     session: Session = Depends(get_db),
 ) -> EnvironmentOut:
-    environment = _get_environment(session, scope, environment_id)
+    expected_rev = _config_precondition(if_match)
+    scope = _asset_gate(session, scope)
+    environment = session.scalar(
+        select(Environment)
+        .where(Environment.id == environment_id, Environment.project_id == scope.project_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if environment is None:
+        raise not_found("环境不存在")
+    if environment.rev != expected_rev:
+        raise conflict("config_revision_conflict", "环境配置已被其他操作更新，请刷新后重试。")
     # 地址先校验再改任何字段：非法地址必须整条 PATCH 失败，不能留下“地址没改、变量改了”
     # 这种改到一半的记录，也不能推进 rev。
     base_url = _checked_base_url(payload.base_url) if payload.base_url is not None else None
     if payload.name is not None:
         environment.name = payload.name
-    if base_url is not None:
-        environment.base_url = base_url
+    default_mapping = session.scalar(
+        select(EnvironmentServiceMapping)
+        .where(EnvironmentServiceMapping.environment_id == environment.id)
+        .join(
+            ProjectService,
+            ProjectService.id == EnvironmentServiceMapping.service_id,
+        )
+        .where(ProjectService.is_default.is_(True))
+        .with_for_update()
+    )
+    if default_mapping is None:
+        raise conflict("config_inconsistent", "默认服务映射缺失")
+    current_default = session.get(EnvironmentServiceVersion, default_mapping.current_version_id)
     if payload.variables is not None:
         # 环境级普通变量与项目级走同一校验：非法字面量与秘密都不能从这条入口进来。
         environment.variables = _validate_variables(list(payload.variables.items()))
     if payload.status is not None:
         environment.status = payload.status
+    if base_url is not None or payload.status is not None:
+        if current_default is None:
+            raise conflict("config_inconsistent", "默认服务映射当前版本缺失")
+        try:
+            version = append_mapping_version(
+                session,
+                default_mapping,
+                base_url=base_url or current_default.base_url,
+                status="archived" if environment.status == "archived" else "active",
+                created_by=scope.principal.user_id,
+            )
+        except ServiceTargetError as error:
+            raise ApiError(error.status_code, error.code, error.message) from error
+        environment.base_url = version.base_url
     environment.rev += 1
+    append_environment_schema2(session, environment, created_by=scope.principal.user_id)
     deps.commit(session)
-    return _environment_out(environment)
+    return _environment_out(session, environment)
 
 
 def _get_environment(session: Session, scope: deps.ProjectScope, environment_id: uuid.UUID) -> Environment:
@@ -552,21 +702,81 @@ def get_variables(
     return VariablesOut(version=latest.version, variables=_variables_payload(latest.variables))
 
 
+@router.get(
+    "/workspaces/{workspace_id}/projects/{project_id}/variable-context",
+    response_model=VariableContextOut,
+)
+def get_variable_context(
+    environment_id: uuid.UUID,
+    service_key: str | None = None,
+    service_contract: str | None = Header(default=None, alias="X-Service-Contract"),
+    scope: deps.ProjectScope = _VIEW_SCOPE,
+    session: Session = Depends(get_db),
+) -> VariableContextOut:
+    scope = begin_consistent_read(session, scope)
+    environment = session.scalar(
+        select(Environment).where(
+            Environment.id == environment_id,
+            Environment.project_id == scope.project_id,
+            Environment.status == "active",
+        )
+    )
+    if environment is None:
+        raise not_found("环境不存在或已归档")
+    request: dict = {}
+    if service_key is not None:
+        if re.fullmatch(r"svc_[0-9a-f]{32}", service_key) is None:
+            raise bad_request("service_invalid", "service_key不是合法命名服务标识")
+        request = {"service_contract": 1, "service_key": service_key}
+    capable = require_service_capability(service_contract, needed=service_key is not None)
+    try:
+        value = variable_context(
+            session,
+            workspace_id=scope.workspace_id,
+            project_id=scope.project_id,
+            environment=environment,
+        )
+        summary, _selected, target_error = inspect_selected_target(
+            session, environment, request
+        )
+        if target_error is not None and target_error.global_basis:
+            raise ApiError(
+                target_error.status_code, target_error.code, target_error.message
+            )
+        if capable:
+            value["schema_version"] = 2
+            value["selected_target"] = summary
+    except ResolutionError as error:
+        raise conflict(error.code, error.message) from error
+    except ServiceTargetError as error:
+        raise ApiError(error.status_code, error.code, error.message) from error
+    return VariableContextOut(**value)
+
+
 @router.put(
     "/workspaces/{workspace_id}/projects/{project_id}/variables", response_model=VariablesOut
 )
 def put_variables(
     payload: VariablesUpdate,
+    if_match: str | None = Header(default=None, alias="If-Match"),
     scope: deps.ProjectScope = _EDIT_SCOPE,
     session: Session = Depends(get_db),
 ) -> VariablesOut:
+    expected_version = _config_precondition(if_match)
     table = _validate_variable_items(payload.variables)
-    current = session.scalar(
-        select(func.max(ProjectConfigVersion.version)).where(
-            ProjectConfigVersion.project_id == scope.project_id
-        )
+    scope = _asset_gate(session, scope)
+    latest = session.scalar(
+        select(ProjectConfigVersion)
+        .where(ProjectConfigVersion.project_id == scope.project_id)
+        .order_by(ProjectConfigVersion.version.desc())
+        .limit(1)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
-    version = (current or 0) + 1
+    current_version = latest.version if latest is not None else 0
+    if current_version != expected_version:
+        raise conflict("config_revision_conflict", "项目变量已被其他操作更新，请刷新后重试。")
+    version = current_version + 1
     session.add(
         ProjectConfigVersion(
             workspace_id=scope.workspace_id,

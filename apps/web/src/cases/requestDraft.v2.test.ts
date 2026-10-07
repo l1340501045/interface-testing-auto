@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { toRequestSpec } from "../api/guards";
 import type { CaseAssertion } from "../api/types";
-import { rawToSpec, requestToRaw, sameRequest, upgradeRequestV2 } from "./requestDraft";
+import { preserveServiceTarget, rawToSpec, requestToRaw, sameRequest, upgradeRequestV2 } from "./requestDraft";
 
 const V1 = {
   method: "GET",
@@ -92,5 +92,30 @@ describe("RequestSpec v1/v2 草稿", () => {
     const baseline = requestToRaw(V1);
     expect(() => sameRequest(baseline, { ...baseline, query_params: [{ name: "", value: "先填值" }] })).not.toThrow();
     expect(sameRequest(baseline, { ...baseline, query_params: [{ name: "", value: "先填值" }] })).toBe(false);
+  });
+
+  it("命名服务与行v1/v2正交往返，切回default时不补服务字段", () => {
+    const serviceKey = "svc_11111111111111111111111111111111";
+    const named = toRequestSpec({ ...V1, service_contract: 1, service_key: serviceKey });
+    expect(rawToSpec(requestToRaw(named))).toEqual({ ...V1, service_contract: 1, service_key: serviceKey });
+    const upgraded = upgradeRequestV2(requestToRaw(named), []).request;
+    expect(rawToSpec(upgraded)).toMatchObject({ schema_version: 2, service_contract: 1, service_key: serviceKey });
+    const defaultRaw = { ...requestToRaw(named), service_contract: undefined, service_key: undefined };
+    expect(rawToSpec(defaultRaw)).toEqual(V1);
+  });
+
+  it("严格拒绝服务字段缺一、null、default显式目标和非法能力版本", () => {
+    const serviceKey = "svc_11111111111111111111111111111111";
+    expect(() => toRequestSpec({ ...V1, service_key: serviceKey })).toThrow("同时存在");
+    expect(() => toRequestSpec({ ...V1, service_contract: 1, service_key: null })).toThrow("文本");
+    expect(() => toRequestSpec({ ...V1, service_contract: 1, service_key: "default" })).toThrow("命名服务标识");
+    expect(() => toRequestSpec({ ...V1, service_contract: 2, service_key: serviceKey })).toThrow("仅支持 1");
+  });
+
+  it("cURL应用保留现标签named选择，新独立default不猜服务", () => {
+    const serviceKey = "svc_11111111111111111111111111111111";
+    const imported = { ...requestToRaw(V1), method: "POST", path: "/from-curl" };
+    expect(preserveServiceTarget({ ...requestToRaw(V1), service_contract: 1, service_key: serviceKey }, imported)).toMatchObject({ method: "POST", service_contract: 1, service_key: serviceKey });
+    expect(preserveServiceTarget(requestToRaw(V1), { ...imported, service_contract: 1, service_key: serviceKey })).not.toHaveProperty("service_key");
   });
 });

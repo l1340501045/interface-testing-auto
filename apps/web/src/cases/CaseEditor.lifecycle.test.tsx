@@ -156,6 +156,15 @@ function maybeGate(name: string, value: unknown): unknown {
 let preflightBody: unknown;
 let runCount = 0;
 
+const TEST_RESOLUTION = {
+  schema_version: 1, scope: { workspace_id: WORKSPACE_ID, project_id: PROJECT_ID, environment_id: ENV_ID },
+  ready: true, ordinary_resolution: "ready", masked_target: { url: "http://echo.test/echo", method: "GET" },
+  bindings: [], issues: [], auth: { required: false, status: "none", injection_slots: [], requires_worker_verification: false },
+  config_basis: { project_variables_version: 1, project_config_version_id: null, environment_rev: 1, environment_config_version: 1, environment_config_version_id: "cfg-1" },
+  context_fingerprint: "context-fingerprint-1",
+  resolution_context: "context-1",
+};
+
 const OK_PREFLIGHT = {
   ready: true,
   issues: [],
@@ -166,6 +175,7 @@ const OK_PREFLIGHT = {
     environment: { id: ENV_ID, name: "测试环境", kind: "test", base_url: "http://echo.test" },
     input_fingerprint: "in-current",
   },
+  resolution: TEST_RESOLUTION,
 };
 
 const AMBIGUOUS_PREFLIGHT = {
@@ -176,6 +186,7 @@ const AMBIGUOUS_PREFLIGHT = {
   can_authorize: true,
   auth: { required: false, state: "ambiguous", profile_id: null },
   context: null,
+  resolution: TEST_RESOLUTION,
 };
 
 const NEEDS_AUTH_PREFLIGHT = {
@@ -184,6 +195,7 @@ const NEEDS_AUTH_PREFLIGHT = {
   can_authorize: true,
   auth: { required: false, state: "needs_authorization", profile_id: PROFILE_ID },
   context: null,
+  resolution: { ...TEST_RESOLUTION, ready: false, auth: { ...TEST_RESOLUTION.auth, status: "needs_authorization" } },
 };
 
 function runSummary(id: string, environmentId = ENV_ID) {
@@ -298,6 +310,8 @@ function editorElement(props: EditorProps = {}) {
             pool_id: null,
             variables: {},
             status: "active",
+            rev: 1,
+            config_version: 1,
           },
           {
             id: ENV_ALT_ID,
@@ -307,6 +321,8 @@ function editorElement(props: EditorProps = {}) {
             pool_id: null,
             variables: {},
             status: "active",
+            rev: 1,
+            config_version: 1,
           },
         ]}
         selectedEnvironmentId={ENV_ID}

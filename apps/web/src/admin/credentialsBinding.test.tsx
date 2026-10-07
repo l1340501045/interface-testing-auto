@@ -94,6 +94,8 @@ const environments: Environment[] = [
     pool_id: null,
     variables: {},
     status: "active",
+    rev: 1,
+    config_version: 1,
   },
 ];
 

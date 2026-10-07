@@ -8,6 +8,7 @@
  * 调试与“保存并执行”两条路互不干扰。
  */
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { StrictMode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -16,6 +17,7 @@ const PROJECT_ID = "22222222-2222-4222-8222-222222222222";
 const CASE_ID = "44444444-4444-4444-8444-444444444444";
 const ENV_ID = "55555555-5555-4555-8555-555555555555";
 const RUN_ID = "77777777-7777-4777-8777-777777777777";
+const SERVICE_KEY = "svc_11111111111111111111111111111111";
 
 vi.mock("../session/useSession", () => ({
   useSession: () => ({
@@ -53,6 +55,14 @@ interface Call {
 }
 
 let calls: Call[] = [];
+const TEST_RESOLUTION = {
+  schema_version: 1, scope: { workspace_id: WORKSPACE_ID, project_id: PROJECT_ID, environment_id: ENV_ID },
+  ready: true, ordinary_resolution: "ready", masked_target: { url: "http://echo.test/echo", method: "GET" },
+  bindings: [], issues: [], auth: { required: false, status: "none", injection_slots: [], requires_worker_verification: false },
+  config_basis: { project_variables_version: 1, project_config_version_id: null, environment_rev: 1, environment_config_version: 1, environment_config_version_id: "cfg-1" },
+  context_fingerprint: "context-fingerprint-1",
+  resolution_context: "context-1",
+};
 /** 预检结果：由用例决定“可以发送”“缺授权”还是“环境歧义”。 */
 let preflightBody: unknown = {
   ready: true,
@@ -64,6 +74,7 @@ let preflightBody: unknown = {
     environment: { id: ENV_ID, name: "测试环境", kind: "test", base_url: "http://echo.test" },
     input_fingerprint: "in-current",
   },
+  resolution: TEST_RESOLUTION,
 };
 let reportBody: unknown = null;
 let curlPreviewGate: { promise: Promise<unknown>; resolve: (value: unknown) => void } | null = null;
@@ -93,6 +104,13 @@ const TYPES: unknown[] = [];
 function route(method: string, path: string, body: unknown, headers?: Record<string, string>): unknown {
   calls.push({ method, path, body, headers });
   if (method === "GET" && path.endsWith("/assertion-types")) return TYPES;
+  if (method === "GET" && path.endsWith("/services")) return {
+    schema_version: 1,
+    items: [
+      { id: "service-default", service_key: "default", name: "默认服务", is_default: true, status: "active", rev: 1, created_at: "t", updated_at: "t" },
+      { id: "service-orders", service_key: SERVICE_KEY, name: "订单服务", is_default: false, status: "active", rev: 1, created_at: "t", updated_at: "t" },
+    ],
+  };
   if (method === "GET" && path.endsWith(`/cases/${CASE_ID}/versions`)) return [];
   if (method === "GET" && path.endsWith(`/cases/${CASE_ID}`)) return CASE_DETAIL;
   if (method === "GET" && path.includes("/runs/") && path.endsWith("/report")) return reportBody;
@@ -119,8 +137,16 @@ function route(method: string, path: string, body: unknown, headers?: Record<str
       auth_hint: null,
     };
   }
-  if (method === "POST" && path.endsWith("/debug-preflight")) return preflightBody;
+  if (method === "POST" && path.endsWith("/debug-preflight")) {
+    const requestPath = (body as { debug_snapshot?: { request?: { path?: string } } })?.debug_snapshot?.request?.path ?? "/";
+    if (typeof preflightBody === "object" && preflightBody !== null && "resolution" in preflightBody) {
+      const resolution = (preflightBody as { resolution?: typeof TEST_RESOLUTION }).resolution;
+      return resolution ? { ...preflightBody, resolution: { ...resolution, masked_target: { url: `http://echo.test${requestPath}`, method: "GET" } } } : preflightBody;
+    }
+    return preflightBody;
+  }
   if (method === "POST" && path.endsWith("/runs")) return { id: RUN_ID, target_type: "debug_snapshot", case_version_id: null, environment_id: ENV_ID, state: "queued", outcome: null, reason_category: null, pool_id: null, created_at: "2026-09-14T00:00:00Z" };
+  if (method === "PATCH" && path.endsWith(`/cases/${CASE_ID}`)) return { ...CASE_DETAIL, ...(body as object), rev: 4 };
   // 替身绕过 parse：这里直接返回解析后的值（服务端返回的是 {"hash": ...}，
   // 组件用 toDebugSnapshotDigest 取 hash，因此替身要给出字符串）。
   if (method === "POST" && path.endsWith("/debug-snapshot-digest")) return "digest-1";
@@ -136,7 +162,7 @@ function editorNode(props: Omit<EditorTestProps, "strict"> = {}) {
       workspaceId={WORKSPACE_ID}
       projectId={PROJECT_ID}
       caseSummaryId={CASE_ID}
-      environments={[{ id: ENV_ID, name: "测试环境", kind: "test", base_url: "http://echo.test", pool_id: null, variables: {}, status: "active" }]}
+      environments={[{ id: ENV_ID, name: "测试环境", kind: "test", base_url: "http://echo.test", pool_id: null, variables: {}, status: "active", rev: 1, config_version: 1 }]}
       selectedEnvironmentId={ENV_ID}
       onSelectEnvironment={() => {}}
       onSaved={() => {}}
@@ -167,6 +193,8 @@ function callsTo(path: string, method: string): Call[] {
 }
 
 beforeEach(() => {
+  delete (CASE_DETAIL.request as Record<string, unknown>).service_contract;
+  delete (CASE_DETAIL.request as Record<string, unknown>).service_key;
   CASE_DETAIL.request.query_params = [{ name: "tag", value: "a" }];
   CASE_DETAIL.request.headers = [];
   CASE_DETAIL.assertions = [];
@@ -183,6 +211,7 @@ beforeEach(() => {
       environment: { id: ENV_ID, name: "测试环境", kind: "test", base_url: "http://echo.test" },
       input_fingerprint: "in-current",
     },
+    resolution: TEST_RESOLUTION,
   };
   apiGetMock.mockReset();
   apiSendMock.mockReset();
@@ -202,6 +231,14 @@ beforeEach(() => {
 });
 
 describe("请求调试工作台", () => {
+  it("重开已有named用例只在活动标签按需确认目录，不先伪称失效", async () => {
+    Object.assign(CASE_DETAIL.request, { service_contract: 1, service_key: SERVICE_KEY });
+    await renderLoaded({ active: true });
+    await waitFor(() => expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/services"), "GET")).toHaveLength(1));
+    expect(screen.getByText("订单服务")).toBeTruthy();
+    expect(screen.queryByText(/原服务.*已失效/)).toBeNull();
+  });
+
   it("资产回执只推进名称、目录、状态与rev，保留请求和编辑器实例", async () => {
     let controller: AssetEditorController | null = null;
     await renderLoaded({ onRegisterAssetController: (next) => { controller = next; } });
@@ -245,6 +282,55 @@ describe("请求调试工作台", () => {
     expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, `/cases/${CASE_ID}/publish`), "POST")).toEqual([]);
   });
 
+  it("选择命名服务进入当前标签草稿与调试payload，不改行协议", async () => {
+    const user = userEvent.setup();
+    preflightBody = {
+      ...(preflightBody as Record<string, unknown>),
+      context: {
+        ...(preflightBody as { context: Record<string, unknown> }).context,
+        environment: { id: ENV_ID, name: "测试环境", kind: "test", base_url: "http://orders.test" },
+      },
+      resolution: {
+        ...TEST_RESOLUTION,
+        schema_version: 2,
+        selected_target: {
+          kind: "service", service_id: "service-orders", service_key: SERVICE_KEY, service_name: "订单服务", service_rev: 1,
+          service_status: "active", availability: "ready",
+          mapping: { id: "mapping-orders", rev: 1, status: "active", base_url: "http://orders.test", version: 1, version_id: "mapping-version-orders" },
+        },
+        target_ref: {
+          kind: "service", service_id: "service-orders", service_key: SERVICE_KEY, service_rev: 1,
+          mapping_id: "mapping-orders", mapping_rev: 1, mapping_version_id: "mapping-version-orders", mapping_version: 1, environment_id: ENV_ID,
+        },
+      },
+    };
+    await renderLoaded();
+    await user.click(screen.getByRole("button", { name: "请求服务" }));
+    const service = await screen.findByRole("combobox", { name: "请求服务" });
+    await waitFor(() => expect((service as HTMLInputElement).disabled).toBe(false));
+    await user.click(service);
+    await user.click(await screen.findByText("订单服务"));
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")).toHaveLength(1));
+    const request = (callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")[0].body as { debug_snapshot: { request: Record<string, unknown> } }).debug_snapshot.request;
+    expect(request).toMatchObject({ service_contract: 1, service_key: SERVICE_KEY });
+    expect(request).not.toHaveProperty("schema_version");
+  });
+
+  it("命名服务选择参与dirty并随草稿保存，默认v1行形态不被升级", async () => {
+    const user = userEvent.setup();
+    await renderLoaded();
+    await user.click(screen.getByRole("button", { name: "请求服务" }));
+    await user.click(await screen.findByRole("combobox", { name: "请求服务" }));
+    await user.click(await screen.findByText("订单服务"));
+    expect(screen.getByText("有未保存修改")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "保存草稿" }));
+    await waitFor(() => expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, `/cases/${CASE_ID}`), "PATCH")).toHaveLength(1));
+    const saved = callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, `/cases/${CASE_ID}`), "PATCH")[0].body as { request: Record<string, unknown> };
+    expect(saved.request).toMatchObject({ service_contract: 1, service_key: SERVICE_KEY });
+    expect(saved.request).not.toHaveProperty("schema_version");
+  });
+
   it("每次发送都带幂等键，双击不会产生两次受理", async () => {
     // 同一个写请求在目标上产生两次副作用是最难收拾的一类问题，因此两次点击只允许一次
     // 受理；幂等键必须存在，服务端才有依据把重复请求收敛到同一次运行。
@@ -278,6 +364,7 @@ describe("请求调试工作台", () => {
       can_authorize: true,
       auth: { required: false, state: "needs_authorization", profile_id: "profile-1" },
       context: null,
+      resolution: { ...TEST_RESOLUTION, ready: false, auth: { ...TEST_RESOLUTION.auth, status: "needs_authorization" } },
     };
     await renderLoaded();
     await screen.findByText(/当前身份未获授权使用该环境的凭证/);
@@ -314,6 +401,7 @@ describe("请求调试工作台", () => {
       can_authorize: false,
       auth: { required: false, state: "needs_authorization", profile_id: null },
       context: null,
+      resolution: { ...TEST_RESOLUTION, ready: false, auth: { ...TEST_RESOLUTION.auth, status: "needs_authorization" } },
     };
     await renderLoaded();
     await screen.findByText(/当前身份未获授权使用该环境的凭证/);
@@ -352,7 +440,8 @@ describe("请求调试工作台", () => {
 
     // 改一次路径，预览与提交都用这一份。
     fireEvent.change(screen.getByLabelText("路径"), { target: { value: "/orders" } });
-    expect(screen.getByText(/实际目标：http:\/\/echo\.test\/orders/)).toBeTruthy();
+    expect(screen.getByText(/实际目标：尚未取得权威解析结果/)).toBeTruthy();
+    expect(screen.getByText(/配置预览：http:\/\/echo\.test\/orders/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     await waitFor(() =>
       expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")).toHaveLength(1),

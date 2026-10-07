@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 
-import { KeyValueRows } from "./RequestParts";
+import { KeyValueRows, jsonReferenceFragment } from "./RequestParts";
 import type { RawKeyValue } from "./requestDraft";
 import { LeaveGuardProvider, useLeaveAggregate } from "../hooks/leaveGuard";
 import { AppProviders } from "../theme/AppProviders";
@@ -71,6 +71,9 @@ function openBatch(raw: string) {
 }
 
 describe("参数表格浏览器输入边界", () => {
+  it("JSON 字符串内只转义变量引用片段中的引号与反斜杠", () => {
+    expect(jsonReferenceFragment('{{a"b\\c}}')).toBe('{{a\\"b\\\\c}}');
+  });
   it("窄分栏为编辑列保留最小宽度并由框架表格提供局部横向滚动", () => {
     render(
       <KeyValueRows

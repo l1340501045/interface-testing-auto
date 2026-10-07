@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from .lossless_json import NumberNode
@@ -20,6 +21,40 @@ class VariableResolutionError(ValueError):
 # 产品面向中文用户，环境变量名（如“租户”）必须可用；限制 ASCII 标识符会让界面
 # 上的合法名字在发送前才失败。花括号与空白仍然排除，避免模板嵌套歧义。
 _VAR_PATTERN = re.compile(r"\{\{\s*([^{}\s]+?)\s*\}\}")
+
+
+@dataclass(frozen=True)
+class VariableReference:
+    """原模板中的一次变量引用及 Python 字符索引范围。"""
+
+    name: str
+    start: int
+    end: int
+    text: str
+
+
+def variable_references(text: str) -> list[VariableReference]:
+    """按原文顺序返回引用；定位转换由调用边界决定。"""
+    return [
+        VariableReference(
+            name=match.group(1), start=match.start(), end=match.end(), text=match.group(0)
+        )
+        for match in _VAR_PATTERN.finditer(text)
+    ]
+
+
+def variable_reference_for_name(name: str) -> str | None:
+    """返回能按旧扁平语法唯一还原原名的引用；不可表达则返回 None。"""
+    reference = "{{" + name + "}}"
+    matches = variable_references(reference)
+    if (
+        len(matches) != 1
+        or matches[0].start != 0
+        or matches[0].end != len(reference)
+        or matches[0].name != name
+    ):
+        return None
+    return reference
 
 
 def has_variable_reference(text: str) -> bool:

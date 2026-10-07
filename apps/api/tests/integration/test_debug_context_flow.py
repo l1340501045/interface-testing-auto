@@ -167,10 +167,18 @@ def test_input_fingerprint_changes_when_variables_change(
     request = {"method": "GET", "path": "/echo?mark={{shared}}", "body_type": "none", "body": ""}
     snapshot = {"request": request, "assertions": []}
 
+    initialized = client.patch(
+        f"{base}/environments/{environment['id']}",
+        json={"variables": {"shared": {"type": "string", "text": "first"}}},
+        headers={"If-Match": str(environment["rev"])},
+    )
+    assert initialized.status_code == 200, initialized.text
+    environment = initialized.json()
     first = _debug_run(client, account, project, environment["id"], snapshot)
     updated = client.patch(
         f"{base}/environments/{environment['id']}",
         json={"variables": {"shared": {"type": "string", "text": "second"}}},
+        headers={"If-Match": str(environment["rev"])},
     )
     assert updated.status_code == 200, updated.text
     second = _debug_run(client, account, project, environment["id"], snapshot)

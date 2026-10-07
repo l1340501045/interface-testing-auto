@@ -554,3 +554,20 @@ body { background: #f5f7fa; }
   .layout-toolbar { justify-content: flex-start; }
   .report-table { min-width: 640px; }
 }
+.variable-picker {
+  min-width: 9rem;
+}
+
+.variable-input {
+  display: flex;
+  align-items: center;
+}
+
+.variable-input > .ant-input {
+  min-width: 0;
+}
+
+.raw-text-editor .variable-picker,
+.body-editor .variable-picker {
+  margin-top: 0.35rem;
+}

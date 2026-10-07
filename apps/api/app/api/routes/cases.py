@@ -29,12 +29,17 @@ from ...kernel.field_tree import FieldTreeError, build_field_tree
 from ...kernel.lossless_json import LosslessJSONError, loads
 from ...kernel.target_policy import TargetPolicyError, normalize_origin
 from ...kernel.valueliteral import ValueLiteral, ValueLiteralError
-from ...models import Case, CaseAssertion, CaseVersion, Folder
+from ...models import Case, CaseAssertion, CaseVersion, Folder, ProjectService
 from ...services import asset_lifecycle
 from ...services.folder_graph import blocked_folder_ids, invalid_folder_ids
 from .. import deps
 from ..errors import ApiError, bad_request, conflict, not_found
-from ..request_contract import is_v2, require_v2_capability
+from ..request_contract import (
+    is_named_service,
+    is_v2,
+    require_service_capability,
+    require_v2_capability,
+)
 from ..schemas import (
     AssertionPreviewOut,
     AssertionPreviewRequest,
@@ -178,6 +183,23 @@ def _case_out(session: Session, case: Case) -> CaseOut:
     )
 
 
+def _service_id_for_request(
+    session: Session, scope: deps.ProjectScope, request: dict
+) -> uuid.UUID | None:
+    key = request.get("service_key")
+    if key is None:
+        return None
+    service = session.scalar(
+        select(ProjectService).where(
+            ProjectService.project_id == scope.project_id,
+            ProjectService.service_key == key,
+        )
+    )
+    if service is None or service.is_default:
+        raise bad_request("service_invalid", "服务不存在或不属于本项目")
+    return service.id
+
+
 # —— 用例列表与草稿 ——
 
 
@@ -222,23 +244,27 @@ def create_case(
     payload: CaseCreate,
     response: Response,
     request_contract: str | None = Header(default=None, alias="X-Request-Contract"),
+    service_contract: str | None = Header(default=None, alias="X-Service-Contract"),
     scope: deps.ProjectScope = _EDIT_SCOPE,
     session: Session = Depends(get_db),
 ) -> CaseOut:
     scope = _gate(session, scope)
     require_v2_capability(request_contract, needed=is_v2(payload.request))
+    require_service_capability(service_contract, needed=is_named_service(payload.request))
     if payload.folder_id is not None:
         _resolve_folder(session, scope, payload.folder_id)
     try:
         spec = request_spec.validate_request(payload.request)
         assertions = validate_assertions(payload.assertions, spec)
     except (request_spec.RequestSpecError, AssertionSpecError) as error:
-        raise bad_request("invalid_case", str(error)) from error
+        code = "service_invalid" if isinstance(error, request_spec.ServiceSpecError) else "invalid_case"
+        raise bad_request(code, str(error)) from error
 
     case = Case(
         workspace_id=scope.workspace_id,
         project_id=scope.project_id,
         folder_id=payload.folder_id,
+        service_id=_service_id_for_request(session, scope, spec),
         name=payload.name,
         request=spec,
         assertions=assertions,
@@ -256,11 +282,13 @@ def get_case(
     case_id: uuid.UUID,
     response: Response,
     request_contract: str | None = Header(default=None, alias="X-Request-Contract"),
+    service_contract: str | None = Header(default=None, alias="X-Service-Contract"),
     scope: deps.ProjectScope = _VIEW_SCOPE,
     session: Session = Depends(get_db),
 ) -> CaseOut:
     case = _get_case(session, scope, case_id)
     require_v2_capability(request_contract, needed=is_v2(case.request))
+    require_service_capability(service_contract, needed=is_named_service(case.request))
     response.headers["ETag"] = _etag(case.rev)
     return _case_out(session, case)
 
@@ -274,6 +302,7 @@ def update_case(
     response: Response,
     if_match: str | None = Header(default=None, alias="If-Match"),
     request_contract: str | None = Header(default=None, alias="X-Request-Contract"),
+    service_contract: str | None = Header(default=None, alias="X-Service-Contract"),
     scope: deps.ProjectScope = _EDIT_SCOPE,
     session: Session = Depends(get_db),
 ) -> CaseOut:
@@ -286,6 +315,11 @@ def update_case(
     existing_v2 = is_v2(case.request)
     submitted_v2 = payload.request is not None and is_v2(payload.request)
     require_v2_capability(request_contract, needed=existing_v2 or submitted_v2)
+    require_service_capability(
+        service_contract,
+        needed=is_named_service(case.request)
+        or (payload.request is not None and is_named_service(payload.request)),
+    )
     if existing_v2 and payload.request is not None and not submitted_v2:
         raise conflict(
             "request_contract_downgrade",
@@ -304,7 +338,8 @@ def update_case(
             else validate_assertions(case.assertions, next_request)
         )
     except request_spec.RequestSpecError as error:
-        raise bad_request("invalid_case", str(error)) from error
+        code = "service_invalid" if isinstance(error, request_spec.ServiceSpecError) else "invalid_case"
+        raise bad_request(code, str(error)) from error
     except AssertionSpecError as error:
         raise bad_request("invalid_assertion", str(error)) from error
 
@@ -321,6 +356,7 @@ def update_case(
             case.folder_id = _resolve_folder(session, scope, payload.folder_id).id
     if payload.request is not None:
         case.request = next_request
+        case.service_id = _service_id_for_request(session, scope, next_request)
     if payload.assertions is not None:
         case.assertions = next_assertions
 
@@ -365,6 +401,7 @@ def publish_case(
     case_id: uuid.UUID,
     payload: CasePublish,
     request_contract: str | None = Header(default=None, alias="X-Request-Contract"),
+    service_contract: str | None = Header(default=None, alias="X-Service-Contract"),
     scope: deps.ProjectScope = _EDIT_SCOPE,
     session: Session = Depends(get_db),
 ) -> CaseVersionOut:
@@ -378,6 +415,7 @@ def publish_case(
         raise conflict("asset_unavailable", "归档用例必须恢复后才能发布。")
     _ensure_source_folder_available(session, scope, case.folder_id)
     require_v2_capability(request_contract, needed=is_v2(case.request))
+    require_service_capability(service_contract, needed=is_named_service(case.request))
     if case.rev != payload.draft_rev:
         raise conflict(
             "draft_rev_conflict",
@@ -388,13 +426,15 @@ def publish_case(
         spec = request_spec.validate_request(case.request)
         assertions = validate_assertions(case.assertions, spec)
     except (request_spec.RequestSpecError, AssertionSpecError) as error:
-        raise bad_request("invalid_case", str(error)) from error
+        code = "service_invalid" if isinstance(error, request_spec.ServiceSpecError) else "invalid_case"
+        raise bad_request(code, str(error)) from error
 
     version = (_latest_version(session, case.id) or 0) + 1
     snapshot = CaseVersion(
         workspace_id=scope.workspace_id,
         project_id=scope.project_id,
         case_id=case.id,
+        service_id=_service_id_for_request(session, scope, spec),
         version=version,
         request=spec,
         schema_version=2 if is_v2(spec) else 1,

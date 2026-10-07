@@ -5,7 +5,14 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 
 class ApiModel(BaseModel):
@@ -64,6 +71,8 @@ class EnvironmentOut(ApiModel):
     pool_id: uuid.UUID | None
     variables: dict[str, Any]
     status: str
+    rev: int
+    config_version: int | None
 
 
 class EnvironmentCreate(ApiModel):
@@ -92,6 +101,108 @@ class VariablesOut(ApiModel):
 
 class VariablesUpdate(ApiModel):
     variables: list[VariableItem]
+
+
+class ProjectServiceCreate(ApiModel):
+    name: str = Field(min_length=1, max_length=200)
+
+
+class ProjectServiceUpdate(ApiModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    status: Literal["active", "archived"] | None = None
+
+    @model_validator(mode="after")
+    def require_change(self) -> ProjectServiceUpdate:
+        if not self.model_fields_set or any(getattr(self, name) is None for name in self.model_fields_set):
+            raise ValueError("至少提供一个非空服务字段")
+        return self
+
+
+class ProjectServiceOut(ApiModel):
+    id: uuid.UUID
+    service_key: str
+    name: str
+    is_default: bool
+    status: str
+    rev: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProjectServiceListOut(ApiModel):
+    schema_version: Literal[1] = 1
+    items: list[ProjectServiceOut]
+
+
+class ServiceMappingPatchItem(ApiModel):
+    service_key: str = Field(min_length=1, max_length=64)
+    base_url: str | None = Field(default=None, min_length=1, max_length=500)
+    status: Literal["active", "disabled"] | None = None
+    expected_mapping_rev: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def reject_nulls(self) -> ServiceMappingPatchItem:
+        if any(getattr(self, name) is None for name in self.model_fields_set):
+            raise ValueError("映射字段显式出现时不能为空")
+        if self.base_url is None and self.status is None:
+            raise ValueError("映射至少提供base_url或status")
+        if self.service_key == "default" and (
+            self.base_url is None
+            or self.status is not None
+            or self.expected_mapping_rev is None
+        ):
+            raise ValueError("默认服务必须提供base_url和expected_mapping_rev且不能带status")
+        return self
+
+
+class ServiceConfigUpdate(ApiModel):
+    items: list[ServiceMappingPatchItem] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def unique_keys(self) -> ServiceConfigUpdate:
+        keys = [item.service_key for item in self.items]
+        if len(keys) != len(set(keys)):
+            raise ValueError("service_key 不能重复")
+        return self
+
+
+class EnvironmentConfigSummaryOut(ApiModel):
+    id: uuid.UUID
+    name: str
+    kind: str
+    status: str
+    rev: int
+    config_version: int | None
+
+
+class ServiceMappingSummaryOut(ApiModel):
+    id: uuid.UUID
+    rev: int
+    status: Literal["active", "disabled", "archived"]
+    base_url: str
+    version: int
+    version_id: uuid.UUID
+
+
+class ServiceConfigItemOut(ApiModel):
+    service_id: uuid.UUID
+    service_key: str
+    service_name: str
+    is_default: bool
+    service_status: str
+    service_rev: int
+    mapping: ServiceMappingSummaryOut | None
+    availability: Literal[
+        "ready", "environment_archived", "service_archived", "mapping_disabled",
+        "mapping_missing", "config_inconsistent",
+    ]
+
+
+class ServiceConfigOut(ApiModel):
+    schema_version: Literal[1] = 1
+    environment: EnvironmentConfigSummaryOut
+    inheritance: dict[str, Any]
+    items: list[ServiceConfigItemOut]
 
 
 # —— 执行池授权与目标白名单 ——
@@ -532,9 +643,12 @@ class RunCreate(ApiModel):
     case_version_id: uuid.UUID | None = None
     debug_snapshot: DebugSnapshot | None = None
     source_case_id: uuid.UUID | None = None
+    resolution_context: str | None = Field(default=None, min_length=1, max_length=16384)
 
     @model_validator(mode="after")
     def validate_source(self) -> RunCreate:
+        if "resolution_context" in self.model_fields_set and self.resolution_context is None:
+            raise ValueError("resolution_context 显式出现时不能为空")
         if "source_case_id" in self.model_fields_set and self.source_case_id is None:
             raise ValueError("source_case_id 显式出现时不能为空")
         if self.source_case_id is not None and self.debug_snapshot is None:
@@ -591,6 +705,35 @@ class RunSourceEnvironment(ApiModel):
     base_url: str
 
 
+class RunResolutionContextOut(ApiModel):
+    schema_version: Literal[1, 2] = 1
+    guard: Literal["ordinary_binding_enforced_v1", "selected_target_binding_enforced_v1"]
+    context_fingerprint: str
+    binding_fingerprint: str
+    target_fingerprint: str | None = None
+
+    @model_validator(mode="after")
+    def validate_versioned_proof(self) -> RunResolutionContextOut:
+        if self.schema_version == 2 and (
+            self.guard != "selected_target_binding_enforced_v1"
+            or self.target_fingerprint is None
+        ):
+            raise ValueError("schema2目标证明缺少精确guard或target_fingerprint")
+        if self.schema_version == 1 and (
+            self.guard != "ordinary_binding_enforced_v1"
+            or self.target_fingerprint is not None
+        ):
+            raise ValueError("schema1普通证明形状无效")
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize_versioned_proof(self, handler: Any) -> dict[str, Any]:
+        value = handler(self)
+        if self.schema_version == 1:
+            value.pop("target_fingerprint", None)
+        return value
+
+
 class RunContextOut(ApiModel):
     """运行来源：服务端以受保护主密钥生成的**不透明**关联标记。
 
@@ -603,6 +746,7 @@ class RunContextOut(ApiModel):
     snapshot_fingerprint: str
     environment: RunSourceEnvironment
     input_fingerprint: str
+    resolution: RunResolutionContextOut | None = None
 
 
 class RunReportOut(ApiModel):
@@ -614,6 +758,7 @@ class RunReportOut(ApiModel):
     # 可证明的运行来源。缺席与 null 同义：这条记录给不出“按哪份配置产生”的结论，
     # 仍可查看原始证据，但不能把它当作当前草稿已通过的证明。
     context: RunContextOut | None = None
+    resolution: RunFrozenResolutionOut | None = None
 
 
 # —— 发送前预检 ——
@@ -647,6 +792,232 @@ class DebugPreflightRequest(ApiModel):
         return self
 
 
+class ResolutionPreviewRequest(ApiModel):
+    environment_id: uuid.UUID
+    case_version_id: uuid.UUID | None = None
+    debug_snapshot: DebugSnapshot | None = None
+    source_case_id: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def validate_source(self) -> ResolutionPreviewRequest:
+        if "case_version_id" in self.model_fields_set and self.case_version_id is None:
+            raise ValueError("case_version_id 显式出现时不能为空")
+        if "debug_snapshot" in self.model_fields_set and self.debug_snapshot is None:
+            raise ValueError("debug_snapshot 显式出现时不能为空")
+        if (self.case_version_id is None) == (self.debug_snapshot is None):
+            raise ValueError("请选择已发布用例版本或提供调试快照，二者只能有一个")
+        if "source_case_id" in self.model_fields_set and self.source_case_id is None:
+            raise ValueError("source_case_id 显式出现时不能为空")
+        if self.source_case_id is not None and self.debug_snapshot is None:
+            raise ValueError("source_case_id 只能用于调试快照")
+        return self
+
+
+class ResolutionScopeOut(ApiModel):
+    workspace_id: uuid.UUID
+    project_id: uuid.UUID
+    environment_id: uuid.UUID
+
+
+class ConfigBasisOut(ApiModel):
+    project_variables_version: int = Field(ge=0)
+    project_config_version_id: uuid.UUID | None
+    environment_rev: int = Field(ge=1)
+    environment_config_version: int = Field(ge=1)
+    environment_config_version_id: uuid.UUID
+
+
+class VariableSourceOut(ApiModel):
+    level: Literal["project", "environment"]
+    resource_id: uuid.UUID
+    revision: int = Field(ge=0)
+    value: dict[str, Any] | None
+    unavailable_reason: str | None
+
+
+class VariableContextItemOut(ApiModel):
+    name: str
+    reference: str | None
+    value: dict[str, Any] | None
+    effective_source: VariableSourceOut | None
+    overridden_sources: list[VariableSourceOut] = Field(default_factory=list)
+    available_locations: list[Literal["path", "query_value", "header_value", "body"]]
+    restricted_body_types: list[Literal["form"]] = Field(default_factory=list)
+    unavailable_reason: str | None = None
+
+
+class VariableContextOut(ApiModel):
+    schema_version: Literal[1, 2] = 1
+    scope: ResolutionScopeOut
+    config_basis: ConfigBasisOut
+    variables: list[VariableContextItemOut]
+    selected_target: SelectedTargetOut | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_versioned_context(self, handler: Any) -> dict[str, Any]:
+        value = handler(self)
+        if self.schema_version == 1:
+            value.pop("selected_target", None)
+        return value
+
+
+class Utf16SpanOut(ApiModel):
+    start: int = Field(ge=0)
+    end: int = Field(ge=0)
+
+
+class ResolutionLocationOut(ApiModel):
+    kind: Literal["path", "query", "header", "body"]
+    field: Literal["path", "value", "body"]
+    row_id: uuid.UUID | None = None
+    index: int | None = Field(default=None, ge=0)
+    occurrence: int | None = Field(default=None, ge=0)
+    input_fingerprint: str | None = None
+    selector: list[dict[str, Any]] | None = None
+    utf16_span: Utf16SpanOut | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_without_absent_coordinates(self, handler: Any) -> dict[str, Any]:
+        """只省略位置联合中不适用的坐标；其它 DTO 的 null 保持业务含义。"""
+        return {name: value for name, value in handler(self).items() if value is not None}
+
+
+class ResolutionBindingOut(ApiModel):
+    binding_id: str
+    reference: str
+    name: str
+    location: ResolutionLocationOut
+    source: VariableSourceOut
+    overridden_sources: list[VariableSourceOut] = Field(default_factory=list)
+    value_type: Literal["number", "string", "boolean", "null", "json"]
+    rendered_preview: str
+
+
+class ResolutionIssueOut(ApiModel):
+    issue_id: str
+    code: str
+    message: str
+    action: PreflightAction
+    location: ResolutionLocationOut | None
+
+
+class ResolutionMaskedTargetOut(ApiModel):
+    url: str
+    method: str
+
+
+class ResolutionInjectionSlotOut(ApiModel):
+    kind: Literal["header", "query"]
+    name: str
+    status: Literal["available", "conflict", "pending_worker_verification"]
+
+
+class ResolutionAuthOut(ApiModel):
+    required: bool
+    status: Literal[
+        "none", "ready", "needs_authorization", "unavailable", "ambiguous", "unchecked"
+    ]
+    injection_slots: list[ResolutionInjectionSlotOut] = Field(default_factory=list)
+    requires_worker_verification: bool
+
+
+class TargetMappingOut(ApiModel):
+    id: uuid.UUID
+    rev: int
+    status: str
+    base_url: str
+    version_id: uuid.UUID
+    version: int
+
+
+class SelectedTargetOut(ApiModel):
+    kind: Literal["default", "service"]
+    service_id: uuid.UUID
+    service_key: str
+    service_name: str
+    service_rev: int
+    service_status: str
+    availability: Literal[
+        "ready", "environment_archived", "service_archived", "mapping_disabled",
+        "mapping_missing", "config_inconsistent",
+    ]
+    mapping: TargetMappingOut | None
+
+
+class TargetRefOut(ApiModel):
+    kind: Literal["default", "service"]
+    service_id: uuid.UUID
+    service_key: str
+    service_rev: int
+    mapping_id: uuid.UUID
+    mapping_rev: int
+    mapping_version_id: uuid.UUID
+    mapping_version: int
+    environment_id: uuid.UUID
+
+
+class ResolutionPreviewOut(ApiModel):
+    schema_version: Literal[1, 2] = 1
+    scope: ResolutionScopeOut
+    ready: bool
+    ordinary_resolution: Literal["ready", "invalid"]
+    masked_target: ResolutionMaskedTargetOut | None
+    bindings: list[ResolutionBindingOut] = Field(default_factory=list)
+    issues: list[ResolutionIssueOut] = Field(default_factory=list)
+    auth: ResolutionAuthOut
+    config_basis: ConfigBasisOut
+    context_fingerprint: str
+    resolution_context: str | None
+    selected_target: SelectedTargetOut | None = None
+    target_ref: TargetRefOut | None = None
+
+    @model_validator(mode="after")
+    def validate_service_shape(self) -> ResolutionPreviewOut:
+        if self.schema_version == 1 and (
+            self.selected_target is not None or self.target_ref is not None
+        ):
+            raise ValueError("schema1不能包含服务目标字段")
+        if self.schema_version == 2 and self.selected_target is None:
+            raise ValueError("schema2必须包含selected_target")
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize_service_shape(self, handler: Any) -> dict[str, Any]:
+        value = handler(self)
+        if self.schema_version == 1:
+            value.pop("selected_target", None)
+            value.pop("target_ref", None)
+        return value
+
+
+class VariableResolutionSourceEntryOut(ApiModel):
+    name: str
+    source: VariableSourceOut
+    overridden_sources: list[VariableSourceOut] = Field(default_factory=list)
+
+
+class RunFrozenResolutionOut(ApiModel):
+    schema_version: Literal[1, 2] = 1
+    config_basis: ConfigBasisOut
+    variable_sources: list[VariableResolutionSourceEntryOut]
+    bindings: list[ResolutionBindingOut]
+    context_fingerprint: str
+    target_ref: TargetRefOut | None = None
+
+    @model_validator(mode="after")
+    def validate_target_ref(self) -> RunFrozenResolutionOut:
+        if (self.schema_version == 2) != (self.target_ref is not None):
+            raise ValueError("schema2冻结来源必须且只能带target_ref")
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize_frozen_target(self, handler: Any) -> dict[str, Any]:
+        value = handler(self)
+        if self.schema_version == 1:
+            value.pop("target_ref", None)
+        return value
+
+
 class PreflightIssueOut(ApiModel):
     """一条可操作的准入问题：稳定错误码、中文说明与建议动作。"""
 
@@ -669,6 +1040,7 @@ class DebugPreflightOut(ApiModel):
     can_authorize: bool
     auth: PreflightAuthOut
     context: RunContextOut | None = None
+    resolution: ResolutionPreviewOut | None = None
 
 
 # —— 身份凭证 ——

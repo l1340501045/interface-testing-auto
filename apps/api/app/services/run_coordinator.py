@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import uuid
 from dataclasses import dataclass
@@ -20,11 +21,12 @@ from ..api import deps
 from ..config import Settings
 from ..kernel.assertion_spec import AssertionSpecError, validate_assertions
 from ..kernel.environment_url import EnvironmentUrlError, check_base_url
-from ..kernel.request_spec import RequestSpecError, validate_request
+from ..kernel.request_spec import RequestSpecError, ServiceSpecError, validate_request
 from ..kernel.target_policy import TargetGuard, TargetPolicyError
 from ..models import (
     Case,
     CaseVersion,
+    CredentialSet,
     Environment,
     IdempotencyRecord,
     Job,
@@ -33,9 +35,16 @@ from ..models import (
     RunnerPoolProjectGrant,
 )
 from . import asset_lifecycle
+from .credentials import CredentialError, available_profiles, parse_auth_slot, set_auth_slots
 from .debug_context import build_context_binding
 from .folder_graph import blocked_folder_ids, invalid_folder_ids
 from .permissions import require
+from .resolution import (
+    ResolutionError,
+    build_resolution,
+    verify_resolution_context,
+)
+from .service_targets import ServiceTargetError, resolve_selected_target
 from .variable_inputs import merged_variables
 
 _IDEMPOTENCY_TTL_HOURS = 24
@@ -57,6 +66,8 @@ class RunRequest:
     debug_snapshot: dict | None = None
     idempotency_key: str | None = None
     source_case_id: uuid.UUID | None = None
+    resolution_context: str | None = None
+    service_capability: bool = False
 
 
 @dataclass
@@ -157,8 +168,30 @@ def _merged_variables(session: Session, environment: Environment) -> dict:
     return merged_variables(session, environment)
 
 
+def _auth_slot_metadata(session: Session, environment: Environment) -> list[dict]:
+    """只读投影当前唯一身份的槽位；不读秘密、不检查/消费用途授权。"""
+    profiles = available_profiles(session, environment.id)
+    if len(profiles) != 1 or profiles[0].current_set_id is None:
+        return []
+    credential_set = session.get(CredentialSet, profiles[0].current_set_id)
+    if credential_set is None or credential_set.status != "active":
+        return []
+    result: list[dict] = []
+    for slot in sorted(set_auth_slots(session, credential_set)):
+        try:
+            kind, name = parse_auth_slot(slot)
+        except CredentialError:
+            # 持久认证配置的具体错误仍由凭证责任层在 worker 给出；普通解析只跳过
+            # 无法安全投影的槽位，不能泄露底层数据或伪造成用户行冲突。
+            continue
+        result.append(
+            {"kind": kind, "name": name, "status": "pending_worker_verification"}
+        )
+    return result
+
+
 def resolve_target(
-    request: dict, environment: Environment, guard: TargetGuard
+    request: dict, environment: Environment, guard: TargetGuard, *, base_url: str | None = None
 ) -> tuple[dict, str]:
     """校验环境类型与目标来源，返回（已校验请求, 目标 origin）。
 
@@ -172,15 +205,16 @@ def resolve_target(
     except TargetPolicyError as error:
         raise RunRejected("production_blocked", str(error)) from error
 
-    # 地址本身缺协议／缺主机时，后面拼出来的目标必然解析不了；那种失败会被白名单检查
-    # 报成 target_not_allowed，把用户引向去改本来正确的用例路径。地址问题在这里单独报出，
-    # 并归到“环境配置”。按库里的**原文**校验：既不猜协议，也不用 trim 后的地址替换目标。
+    # 选中地址本身缺协议／缺主机时，后面拼出来的目标必然解析不了；那种失败会被白名单
+    # 检查报成 target_not_allowed。命名服务必须校验它自己的mapping地址，不能被未选中的
+    # default地址阻断。按库里的**原文**校验：既不猜协议，也不用trim后的地址替换目标。
+    selected_base_url = base_url or environment.base_url
     try:
-        check_base_url(environment.base_url)
+        check_base_url(selected_base_url)
     except EnvironmentUrlError as error:
         raise RunRejected("environment_url_invalid", str(error)) from error
 
-    base = environment.base_url.rstrip("/")
+    base = selected_base_url.rstrip("/")
     probe = f"{base}{request.get('path', '/')}"
     try:
         target = guard.authorize_url(probe)
@@ -211,6 +245,8 @@ def _load_source(
         _require_case_available(session, scope, version.case_id)
         try:
             request = validate_request(version.request)
+        except ServiceSpecError as error:
+            raise RunRejected("service_invalid", str(error)) from error
         except RequestSpecError as error:
             raise RunRejected("case_invalid", f"用例版本请求定义无效：{error}") from error
         try:
@@ -222,6 +258,8 @@ def _load_source(
     snapshot = payload.debug_snapshot or {}
     try:
         request = validate_request(snapshot.get("request", {}))
+    except ServiceSpecError as error:
+        raise RunRejected("service_invalid", str(error)) from error
     except RequestSpecError as error:
         raise RunRejected("case_invalid", f"调试请求定义无效：{error}") from error
     try:
@@ -314,9 +352,42 @@ def create_run(
     if environment is None:
         raise RunRejected("environment_missing", "环境不存在或已归档。")
 
-    resolved = resolve_pool(session, settings, environment)
     target_type, case_version_id, debug_source_case_id, request, assertions = _load_source(session, scope, payload)
-    _, target_origin = resolve_target(request, environment, resolved.guard)
+    if request.get("service_key") is not None and not payload.service_capability:
+        raise RunRejected("service_contract_required", "命名服务请求需要客户端服务能力声明。")
+    resolution_schema_version = 2 if payload.service_capability else 1
+    try:
+        selected = resolve_selected_target(session, environment, request)
+    except ServiceTargetError as error:
+        raise RunRejected(error.code, error.message) from error
+    if case_version_id is not None:
+        version_service_id = session.scalar(
+            select(CaseVersion.service_id).where(CaseVersion.id == case_version_id)
+        )
+        expected_service_id = None if selected.service.is_default else selected.service.id
+        if version_service_id != expected_service_id:
+            raise RunRejected(
+                "config_inconsistent", "用例版本服务引用与请求目标不一致。"
+            )
+    resolved = resolve_pool(session, settings, environment)
+    _, target_origin = resolve_target(
+        request, environment, resolved.guard, base_url=selected.base_url
+    )
+    target_ref = selected.target_ref(environment.id)
+    selected_summary = {
+        "kind": target_ref["kind"],
+        "service_id": str(selected.service.id),
+        "service_key": selected.service.service_key,
+        "service_name": selected.service.name,
+        "service_rev": selected.service.rev,
+        "service_status": selected.service.status,
+        "availability": "ready",
+        "mapping": {
+            "id": str(selected.mapping.id), "rev": selected.mapping.rev,
+            "status": selected.mapping.status, "base_url": selected.version.base_url,
+            "version_id": str(selected.version.id), "version": selected.version.version,
+        },
+    }
 
     # 调试快照没有版本号可固定，只能靠内容摘要绑定授权；摘要必须在创建事务里
     # 冻结进运行快照，执行时按同一份内容复核，避免执行阶段重新计算得到不同结果。
@@ -324,9 +395,70 @@ def create_run(
         debug_snapshot_digest(request, assertions) if target_type == "debug_snapshot" else None
     )
 
+    try:
+        resolution = build_resolution(
+            session,
+            settings,
+            environment=environment,
+            principal_id=scope.principal.user_id,
+            request=request,
+            assertions=assertions,
+            source_kind=target_type,
+            source_id=case_version_id or debug_source_case_id,
+            # 首次受理这里只做普通绑定与槽位占用早拒；身份/用途授权仍沿既有 worker
+            # 权威链处理，不能因客户端未先预览就改变旧合法调用的受理边界。
+            auth={
+                "required": bool(request.get("auth_required")),
+                "status": "none",
+                "injection_slots": _auth_slot_metadata(session, environment),
+                "requires_worker_verification": True,
+            },
+            base_url=selected.base_url,
+            resolution_schema_version=resolution_schema_version,
+            target_ref=target_ref if resolution_schema_version == 2 else None,
+            selected_target=selected_summary if resolution_schema_version == 2 else None,
+        )
+    except ResolutionError as error:
+        raise RunRejected(error.code, error.message) from error
+    blocking_issue = next(
+        (
+            item
+            for item in resolution["issues"]
+            if item["code"]
+            in {"variable_undefined", "binding_invalid", "credential_slot_conflict"}
+        ),
+        None,
+    )
+    if blocking_issue is not None:
+        raise RunRejected(blocking_issue["code"], blocking_issue["message"])
+    if payload.resolution_context is not None:
+        try:
+            verified_fingerprint = verify_resolution_context(
+                payload.resolution_context,
+                settings,
+                environment=environment,
+                principal_id=scope.principal.user_id,
+                request=request,
+                assertions=assertions,
+                source_kind=target_type,
+                source_id=case_version_id or debug_source_case_id,
+                basis=resolution["config_basis"],
+                resolution_schema_version=resolution_schema_version,
+                target_ref=target_ref if resolution_schema_version == 2 else None,
+            )
+            if not hmac.compare_digest(
+                verified_fingerprint, resolution["context_fingerprint"]
+            ):
+                raise ResolutionError(
+                    "resolution_context_changed",
+                    "解析来源或绑定依据已变化，请重新预览后发送。",
+                )
+        except ResolutionError as error:
+            raise RunRejected(error.code, error.message) from error
+
     now = datetime.now(UTC)
     business_deadline = now + timedelta(seconds=settings.business_deadline_seconds)
-    frozen_variables = _merged_variables(session, environment)
+    frozen_variables = resolution["_merged_variables"]
     # 来源关联标记与运行快照同事务冻结：报告按它回答“这份结果是按哪份内容与输入
     # 产生的”。标记用受保护主密钥做 HMAC，不落内容摘要，详见 debug_context。
     context_binding = build_context_binding(
@@ -346,6 +478,10 @@ def create_run(
         debug_snapshot=payload.debug_snapshot if target_type == "debug_snapshot" else None,
         debug_source_case_id=debug_source_case_id,
         environment_id=environment.id,
+        service_id=None if selected.service.is_default else selected.service.id,
+        environment_service_version_id=(
+            None if selected.service.is_default else selected.version.id
+        ),
         trigger="manual",
         state="queued",
         pool_id=resolved.pool.id,
@@ -359,7 +495,7 @@ def create_run(
                 "id": str(environment.id),
                 "name": environment.name,
                 "kind": environment.kind,
-                "base_url": environment.base_url,
+                "base_url": selected.base_url,
             },
             "target_origin": target_origin,
             "pool": {"id": str(resolved.pool.id), "name": resolved.pool.name},
@@ -368,6 +504,7 @@ def create_run(
             "assertions": assertions,
             "debug_snapshot_hash": snapshot_digest,
             "context_binding": context_binding.as_dict(),
+            "resolution": resolution["_snapshot"],
         },
     )
     session.add(run)

@@ -116,6 +116,7 @@ export function VariablesPanel({
         "PUT",
         { variables: toPayload(draft.rows) },
         toVariablesSet,
+        { headers: { "If-Match": String(draft.baseVersion) } },
       );
       // **先通知**：这次写入改变了请求将以哪些变量解析，工作台里基于旧变量的预检与
       // “当前通过”必须当场失效，不能等列表刷新回来（那是另一条异步链）。
@@ -126,7 +127,12 @@ export function VariablesPanel({
       setMessage(`已保存为第 ${saved.version} 版；历史版本仍可查回。`);
       variables.reload();
     } catch (cause) {
-      setFailure(cause instanceof ApiError ? cause.message : "保存变量失败");
+      if (cause instanceof ApiError && (cause.code === "config_revision_conflict" || cause.code === "config_revision_required")) {
+        setFailure(`${cause.message}；你的输入已保留，请刷新服务端版本后再决定如何处理。`);
+        variables.reload();
+      } else {
+        setFailure(cause instanceof ApiError ? cause.message : "保存变量失败");
+      }
     } finally {
       setBusy(false);
     }

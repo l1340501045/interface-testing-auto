@@ -66,10 +66,24 @@ function environment() {
     pool_id: null,
     variables: {},
     status: "active",
+    rev: 1,
+    config_version: 1,
   };
 }
 let envBaseUrl = "http://echo.test";
 let variables = { version: 1, variables: [] as { name: string; value: unknown }[] };
+const runFingerprints = new Map<string, string>();
+function currentFingerprint() { return `source:${envBaseUrl}:v${variables.version}`; }
+function resolutionPreview() {
+  const fingerprint = currentFingerprint();
+  return {
+    schema_version: 1, scope: { workspace_id: WORKSPACE_ID, project_id: PROJECT_ID, environment_id: ENV_ID }, ready: true,
+    ordinary_resolution: "ready", masked_target: { url: `${envBaseUrl}/echo`, method: "GET" }, bindings: [], issues: [],
+    auth: { required: false, status: "none", injection_slots: [], requires_worker_verification: false },
+    config_basis: { project_variables_version: variables.version, project_config_version_id: null, environment_rev: 1, environment_config_version: 1, environment_config_version_id: "cfg" },
+    context_fingerprint: fingerprint, resolution_context: `context:${fingerprint}`,
+  };
+}
 
 const CASE_DETAIL = {
   id: CASE_ID,
@@ -104,6 +118,8 @@ const CASE_DETAIL = {
 };
 
 function versionReport(runId: string) {
+  const fingerprint = runFingerprints.get(runId) ?? currentFingerprint();
+  const preview = resolutionPreview();
   return {
     run: {
       id: runId,
@@ -141,7 +157,13 @@ function versionReport(runId: string) {
       body_omitted_reason: null,
       size_bytes: 2,
     },
-    context: null,
+    context: {
+      snapshot_fingerprint: "version-snapshot",
+      environment: { id: ENV_ID, name: "测试环境", kind: "test", base_url: envBaseUrl },
+      input_fingerprint: "version-input",
+      resolution: { schema_version: 1, guard: "ordinary_binding_enforced_v1", context_fingerprint: fingerprint, binding_fingerprint: `binding:${runId}` },
+    },
+    resolution: { schema_version: 1, config_basis: preview.config_basis, variable_sources: [], bindings: [], context_fingerprint: fingerprint },
   };
 }
 
@@ -324,9 +346,11 @@ function route(rawPath: string, method: string, body?: unknown): unknown {
       },
     };
   }
+  if (method === "POST" && path.endsWith("/resolution-preview")) return resolutionPreview();
   if (method === "POST" && path.endsWith("/runs")) {
     runSeq += 1;
     lastRunId = runSeq === 1 ? RUN_V1 : RUN_V2;
+    runFingerprints.set(lastRunId, currentFingerprint());
     const payload = { ...versionReport(lastRunId).run, state: "queued", outcome: null };
     if (runGate.pending !== null) {
       return new Promise((resolve) => {
@@ -471,6 +495,7 @@ function returnWorkbench(): void {
 beforeEach(() => {
   window.history.replaceState(null, "", "#/workbench");
   runSeq = 0;
+  runFingerprints.clear();
   calls.length = 0;
   runGate.pending = null;
   secretVersionsGate.hold = false;

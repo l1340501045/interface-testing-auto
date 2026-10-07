@@ -7,12 +7,44 @@
  * 目标地址不在这里填写：路径只是相对路径，实际 origin 由所选环境决定，
  * 用例无法把请求指向环境白名单之外的目标。导入 cURL 与保存都不会发出请求。
  */
-import { useId, useRef, useState, type ClipboardEvent, type ReactNode } from "react";
+import { useId, useRef, useState, type ClipboardEvent, type ElementRef, type ReactNode } from "react";
 import { Button, Checkbox, Collapse, Input, Radio, Select, Space, Table } from "antd";
+import type { InputRef } from "antd";
 
+import type { VariableContext, VariableLocation } from "../api/types";
 import { useLeaveReport } from "../hooks/leaveGuard";
 import { decodeRawText, encodeRawText, needsRawTextEditor, parseParameterImport, type ParameterImportFormat } from "./parameterImport";
 import { ltrimPath, newRequestRow, type RawKeyValue, type RawRequest } from "./requestDraft";
+import { insertReference, VariablePicker } from "./VariablePicker";
+
+export interface VariablePickerState {
+  context: VariableContext | null;
+  loading: boolean;
+  error: string | null;
+}
+
+export function jsonReferenceFragment(reference: string): string {
+  return reference.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function jsonSelectionContext(text: string, start: number, end: number): "string" | "outside" | "uncertain" {
+  let inString = false;
+  let escaped = false;
+  let startState: boolean | null = null;
+  for (let index = 0; index <= text.length; index += 1) {
+    if (index === start) startState = inString && !escaped;
+    if (index === end) {
+      if (startState === null || escaped) return "uncertain";
+      return startState === inString ? (inString ? "string" : "outside") : "uncertain";
+    }
+    const char = text[index];
+    if (char === undefined) break;
+    if (escaped) { escaped = false; continue; }
+    if (inString && char === "\\") { escaped = true; continue; }
+    if (char === '"') inString = !inString;
+  }
+  return "uncertain";
+}
 export interface KeyValueRowProps {
   rows: RawKeyValue[];
   label: string;
@@ -28,9 +60,10 @@ export interface KeyValueRowProps {
   otherRows?: RawKeyValue[];
   ownerRevision?: string;
   relatedAssertionCount?: number;
+  variablePicker?: VariablePickerState;
 }
 
-function RawTextField({ value, label, readOnly, onChange, pendingKey }: { value: string; label: string; readOnly: boolean; onChange: (value: string) => boolean | Promise<boolean>; pendingKey?: string }) {
+function RawTextField({ value, label, readOnly, onChange, pendingKey, variablePicker, variableLocation, ownerRevision = "" }: { value: string; label: string; readOnly: boolean; onChange: (value: string) => boolean | Promise<boolean>; pendingKey?: string; variablePicker?: VariablePickerState; variableLocation?: VariableLocation; ownerRevision?: string }) {
   const localId = useId();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(() => encodeRawText(value));
@@ -39,6 +72,36 @@ function RawTextField({ value, label, readOnly, onChange, pendingKey }: { value:
   const busyRef = useRef(false);
   const revisionRef = useRef(0);
   const attemptRef = useRef(0);
+  const inputRef = useRef<InputRef>(null);
+  const selectionRef = useRef({ start: value.length, end: value.length, localRevision: 0 });
+  function captureSelection() {
+    const input = inputRef.current?.input;
+    if (input === undefined || input === null) return;
+    selectionRef.current = {
+      start: input.selectionStart ?? input.value.length,
+      end: input.selectionEnd ?? input.value.length,
+      localRevision: revisionRef.current,
+    };
+  }
+  async function insertVariable(reference: string, capturedOwnerRevision: string) {
+    if (readOnly || capturedOwnerRevision !== ownerRevision) return;
+    const selection = selectionRef.current;
+    if (selection.localRevision !== revisionRef.current) return;
+    const source = editing ? draft : value;
+    const inserted = insertReference(source, reference, selection.start, selection.end);
+    revisionRef.current += 1;
+    selectionRef.current = { start: inserted.cursor, end: inserted.cursor, localRevision: revisionRef.current };
+    if (editing) {
+      setDraft(inserted.value);
+    } else {
+      const accepted = await onChange(inserted.value);
+      if (accepted === false) return;
+    }
+    requestAnimationFrame(() => {
+      inputRef.current?.focus({ cursor: "start" });
+      inputRef.current?.input?.setSelectionRange(inserted.cursor, inserted.cursor);
+    });
+  }
   useLeaveReport(pendingKey ?? `raw-text:${localId}`, {
     dirty: editing && draft !== encodeRawText(value),
     busy,
@@ -76,7 +139,10 @@ function RawTextField({ value, label, readOnly, onChange, pendingKey }: { value:
     }
   }
   if (!needsRawTextEditor(value) && !editing) {
-    return <Input aria-label={label} value={value} readOnly={readOnly} onChange={(event) => onChange(event.target.value)} />;
+    return <span className="variable-input">
+      <Input ref={inputRef} aria-label={label} value={value} readOnly={readOnly} onSelect={captureSelection} onClick={captureSelection} onKeyUp={captureSelection} onBlur={captureSelection} onChange={(event) => onChange(event.target.value)} />
+      {variablePicker && variableLocation ? <VariablePicker label={label} location={variableLocation} context={variablePicker.context} loading={variablePicker.loading} error={variablePicker.error} disabled={readOnly} ownerRevision={ownerRevision} onInsert={insertVariable} /> : null}
+    </span>;
   }
   if (!editing) {
     return (
@@ -88,7 +154,8 @@ function RawTextField({ value, label, readOnly, onChange, pendingKey }: { value:
   }
   return (
     <span className="raw-text-editor">
-      <Input aria-label={`${label}转义文本`} value={draft} onChange={(event) => { revisionRef.current += 1; setDraft(event.target.value); }} />
+      <Input ref={inputRef} aria-label={`${label}转义文本`} value={draft} onSelect={captureSelection} onClick={captureSelection} onKeyUp={captureSelection} onBlur={captureSelection} onChange={(event) => { revisionRef.current += 1; setDraft(event.target.value); }} />
+      {variablePicker && variableLocation ? <VariablePicker label={`${label}转义文本`} location={variableLocation} context={variablePicker.context} loading={variablePicker.loading} error={variablePicker.error} disabled={readOnly || busy} ownerRevision={ownerRevision} onInsert={insertVariable} /> : null}
       <Button htmlType="button" size="small" aria-label="应用" loading={busy} onClick={() => void applyDraft()}>应用</Button>
       <Button htmlType="button" size="small" aria-label="取消" disabled={busy} onClick={() => { setError(null); setEditing(false); }}>取消</Button>
       {error ? <span className="error" role="alert">{error}</span> : null}
@@ -208,7 +275,7 @@ function BatchImport({ rows, otherRows, kind, onApply, readOnly, pendingKey, own
   );
 }
 
-export function KeyValueRows({ rows, label, onChange, readOnly, addLabel, idPrefix = "request", kind = "query", version = 1, assertionSlot, pendingPrefix = idPrefix, otherRows = [], ownerRevision = "", relatedAssertionCount = 0 }: KeyValueRowProps) {
+export function KeyValueRows({ rows, label, onChange, readOnly, addLabel, idPrefix = "request", kind = "query", version = 1, assertionSlot, pendingPrefix = idPrefix, otherRows = [], ownerRevision = "", relatedAssertionCount = 0, variablePicker }: KeyValueRowProps) {
   const legacyRowKeys = useRef(new WeakMap<RawKeyValue, string>());
   const legacyRowSequence = useRef(0);
   function displayRowKey(row: RawKeyValue): string {
@@ -246,7 +313,7 @@ export function KeyValueRows({ rows, label, onChange, readOnly, addLabel, idPref
         columns={[
           ...(version === 2 ? [{ title: "发送", width: 72, render: (_: unknown, row: RawKeyValue, index: number) => <Checkbox aria-label={`发送第 ${index + 1} 项${label}`} checked={row.enabled === true} disabled={readOnly} onChange={(event) => update(index, { enabled: event.target.checked })} /> }] : []),
           { title: "名称", width: 200, render: (_: unknown, row: RawKeyValue, index: number) => <RawTextField pendingKey={`${pendingPrefix}:raw-${kind}-${row.row_id ?? index}-name`} label={`${label}名称 ${index + 1}`} value={row.name} readOnly={readOnly} onChange={(name) => update(index, { name })} /> },
-          { title: "值", width: 240, render: (_: unknown, row: RawKeyValue, index: number) => <RawTextField pendingKey={`${pendingPrefix}:raw-${kind}-${row.row_id ?? index}-value`} label={`${label}值 ${index + 1}`} value={row.value} readOnly={readOnly} onChange={(value) => update(index, { value })} /> },
+          { title: "值", width: 240, render: (_: unknown, row: RawKeyValue, index: number) => <RawTextField pendingKey={`${pendingPrefix}:raw-${kind}-${row.row_id ?? index}-value`} label={`${label}值 ${index + 1}`} value={row.value} readOnly={readOnly} onChange={(value) => update(index, { value })} variablePicker={variablePicker} variableLocation={kind === "query" ? "query_value" : "header_value"} ownerRevision={`${ownerRevision}:${row.row_id ?? index}:${row.value}`} /> },
           ...(version === 2 ? [{ title: "说明", width: 200, render: (_: unknown, row: RawKeyValue, index: number) => <RawTextField pendingKey={`${pendingPrefix}:raw-${kind}-${row.row_id ?? index}-description`} label={`${label}说明 ${index + 1}`} value={row.description ?? ""} readOnly={readOnly} onChange={(description) => update(index, { description })} /> }] : []),
           ...(assertionSlot ? [{ title: "断言", width: 260, render: (_: unknown, row: RawKeyValue, index: number) => assertionSlot(row, index) }] : []),
           { title: "操作", width: 190, render: (_: unknown, _row: RawKeyValue, index: number) => readOnly ? null : <Space size={4}>
@@ -288,13 +355,47 @@ export function BodyEditor({
   onChange,
   onTypeChange,
   idPrefix = "request",
+  variablePicker,
+  ownerRevision = "",
 }: {
   request: RawRequest;
   readOnly: boolean;
   onChange: (body: string) => void;
   onTypeChange: (bodyType: RawRequest["body_type"]) => void;
   idPrefix?: string;
+  variablePicker?: VariablePickerState;
+  ownerRevision?: string;
 }) {
+  const bodyRef = useRef<ElementRef<typeof Input.TextArea>>(null);
+  const [variableInsertHint, setVariableInsertHint] = useState<string | null>(null);
+  const selectionRef = useRef({ start: request.body.length, end: request.body.length, ownerRevision });
+  function captureBodySelection() {
+    const input = bodyRef.current?.resizableTextArea?.textArea;
+    if (!input) return;
+    selectionRef.current = { start: input.selectionStart, end: input.selectionEnd, ownerRevision };
+  }
+  function insertBody(reference: string, capturedOwnerRevision: string) {
+    const selection = selectionRef.current;
+    if (readOnly || capturedOwnerRevision !== ownerRevision || selection.ownerRevision !== ownerRevision) return;
+    let fragment = reference;
+    if (request.body_type === "json") {
+      const context = jsonSelectionContext(request.body, selection.start, selection.end);
+      if (context === "uncertain") {
+        setVariableInsertHint(`无法安全确认当前 JSON 选区，请复制 ${reference} 后手动放入目标位置，再以权威预览检查。`);
+        return;
+      }
+      if (context === "string") fragment = jsonReferenceFragment(reference);
+    }
+    const inserted = insertReference(request.body, fragment, selection.start, selection.end);
+    setVariableInsertHint(null);
+    onChange(inserted.value);
+    selectionRef.current = { start: inserted.cursor, end: inserted.cursor, ownerRevision };
+    requestAnimationFrame(() => {
+      const input = bodyRef.current?.resizableTextArea?.textArea;
+      input?.focus();
+      input?.setSelectionRange(inserted.cursor, inserted.cursor);
+    });
+  }
   return (
     <div className="body-editor">
       <span className="param">
@@ -315,16 +416,27 @@ export function BodyEditor({
         <>
           <label htmlFor={`${idPrefix}-body`}>正文原文</label>
           <Input.TextArea
+            ref={bodyRef}
             id={`${idPrefix}-body`}
             rows={8}
             value={request.body}
             readOnly={readOnly}
             placeholder={request.body_type === "json" ? '{"name": "abc"}' : ""}
             onChange={(event) => onChange(event.target.value)}
+            onSelect={captureBodySelection}
+            onClick={captureBodySelection}
+            onKeyUp={captureBodySelection}
+            onBlur={captureBodySelection}
           />
+          {variablePicker ? <VariablePicker label="正文原文" location="body" bodyType={request.body_type} context={variablePicker.context} loading={variablePicker.loading} error={variablePicker.error} disabled={readOnly} ownerRevision={ownerRevision} onInsert={insertBody} /> : null}
+          {variableInsertHint ? <p className="hint" role="status">{variableInsertHint}</p> : null}
           {request.body_type === "json" ? (
             <p className="caption">
               正文按原文保存与发送，数字不会经过 JavaScript 解析，长整数保持原样。
+              合法 JSON 示例为 <code>{'{"n":"{{数量}}"}'}</code>；当变量占满字符串值时，后端按变量类型绑定。文本片段可写
+              <code>{'"订单-{{编号}}"'}</code>。插入只替换当前选区，不会解析或重排整份 JSON；
+              引用名里的引号与反斜杠只对当前字符串片段转义；位置无法确认时请复制后手动修正，
+              转义和类型是否适用由权威预览定位反馈。
             </p>
           ) : null}
         </>

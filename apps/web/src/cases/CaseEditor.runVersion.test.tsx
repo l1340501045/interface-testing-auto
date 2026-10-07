@@ -209,6 +209,14 @@ function route(method: string, path: string, body: unknown): unknown | Promise<u
     versions = [published, ...versions];
     return published;
   }
+  if (method === "POST" && path.endsWith("/resolution-preview")) return {
+    schema_version: 1, scope: { workspace_id: WORKSPACE_ID, project_id: PROJECT_ID, environment_id: ENV_ID }, ready: true,
+    ordinary_resolution: "ready", masked_target: { url: "http://echo.test/orders", method: "GET" }, bindings: [], issues: [],
+    auth: { required: false, status: "none", injection_slots: [], requires_worker_verification: false },
+    config_basis: { project_variables_version: 1, project_config_version_id: null, environment_rev: 1, environment_config_version: 1, environment_config_version_id: "cfg-1" },
+    context_fingerprint: `fingerprint:${(body as { case_version_id?: string }).case_version_id ?? "missing"}`,
+    resolution_context: `context:${(body as { case_version_id?: string }).case_version_id ?? "missing"}`,
+  };
   if (method === "POST" && path.endsWith("/runs")) return { id: RUN_ID };
   throw new Error(`测试未覆盖的请求：${method} ${path}`);
 }
@@ -228,6 +236,8 @@ function renderEditor() {
           pool_id: null,
           variables: {},
           status: "active",
+          rev: 1,
+          config_version: 1,
         },
       ]}
       selectedEnvironmentId={ENV_ID}
@@ -337,6 +347,7 @@ describe("执行固定在内容一致的已发布版本上", () => {
     expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")[0].body).toEqual({
       environment_id: ENV_ID,
       case_version_id: VERSION_ID,
+      resolution_context: `context:${VERSION_ID}`,
     });
   });
 
@@ -353,6 +364,7 @@ describe("执行固定在内容一致的已发布版本上", () => {
     expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")[0].body).toEqual({
       environment_id: ENV_ID,
       case_version_id: NEW_VERSION_ID,
+      resolution_context: `context:${NEW_VERSION_ID}`,
     });
   });
 
@@ -376,6 +388,7 @@ describe("执行固定在内容一致的已发布版本上", () => {
     expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")[0].body).toEqual({
       environment_id: ENV_ID,
       case_version_id: VERSION_ID,
+      resolution_context: `context:${VERSION_ID}`,
     });
   });
 
@@ -392,6 +405,7 @@ describe("执行固定在内容一致的已发布版本上", () => {
     expect(callsTo(projectPath(WORKSPACE_ID, PROJECT_ID, "/runs"), "POST")[0].body).toEqual({
       environment_id: ENV_ID,
       case_version_id: NEW_VERSION_ID,
+      resolution_context: `context:${NEW_VERSION_ID}`,
     });
   });
 

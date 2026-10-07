@@ -280,6 +280,7 @@ def test_variables_are_versioned_and_reject_secrets(
     first = client.put(
         f"{base}/variables",
         json={"variables": [{"name": "base", "value": {"type": "string", "text": "v1"}}]},
+        headers={"If-Match": "0"},
     )
     assert first.status_code == 200, first.text
     assert first.json()["version"] == 1
@@ -287,6 +288,7 @@ def test_variables_are_versioned_and_reject_secrets(
     second = client.put(
         f"{base}/variables",
         json={"variables": [{"name": "base", "value": {"type": "string", "text": "v2"}}]},
+        headers={"If-Match": "1"},
     )
     assert second.status_code == 200, second.text
     assert second.json()["version"] == 2, "普通变量按不可变版本新增"
@@ -294,6 +296,7 @@ def test_variables_are_versioned_and_reject_secrets(
     secret = client.put(
         f"{base}/variables",
         json={"variables": [{"name": "token", "value": {"type": "secret", "text": "s"}}]},
+        headers={"If-Match": "2"},
     )
     assert secret.status_code == 400, secret.text
     assert secret.json()["code"] == "secret_not_allowed"

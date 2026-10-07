@@ -46,6 +46,8 @@ const environments = [{
   pool_id: null,
   variables: {},
   status: "active",
+  rev: 1,
+  config_version: 1,
 }];
 
 describe("独立任务与报告页面", () => {

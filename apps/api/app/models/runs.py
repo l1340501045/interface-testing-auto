@@ -29,6 +29,13 @@ class Run(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         project_object_fk(["case_version_id"], "case_versions", "fk_runs_case_version", ondelete="RESTRICT"),
         project_object_fk(["debug_source_case_id"], "cases", "fk_runs_debug_source_case", ondelete="RESTRICT"),
         project_object_fk(["environment_id"], "environments", "fk_runs_environment", ondelete="RESTRICT"),
+        project_object_fk(["service_id"], "project_services", "fk_runs_service", ondelete="RESTRICT"),
+        ForeignKeyConstraint(
+            ["workspace_id", "project_id", "environment_id", "service_id", "environment_service_version_id"],
+            ["app.environment_service_versions.workspace_id", "app.environment_service_versions.project_id", "app.environment_service_versions.environment_id", "app.environment_service_versions.service_id", "app.environment_service_versions.id"],
+            name="fk_runs_environment_service_version",
+            ondelete="RESTRICT",
+        ),
         workspace_object_fk(["pool_id"], "runner_pools", "fk_runs_pool", ondelete="SET NULL"),
         CheckConstraint(
             "target_type = 'case_version' OR target_type = 'debug_snapshot'",
@@ -37,6 +44,10 @@ class Run(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         CheckConstraint(
             "debug_source_case_id IS NULL OR target_type = 'debug_snapshot'",
             name="debug_source_target",
+        ),
+        CheckConstraint(
+            "(service_id IS NULL) = (environment_service_version_id IS NULL)",
+            name="service_version_pair",
         ),
         CheckConstraint(
             "(target_type = 'case_version' AND case_version_id IS NOT NULL AND debug_snapshot IS NULL)"
@@ -58,6 +69,8 @@ class Run(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         comment="已保存用例临时调试的来源；独立调试、固定版本及历史运行为空",
     )
     environment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, comment="目标环境")
+    service_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, comment="命名服务引用；默认及历史运行为空")
+    environment_service_version_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, comment="命名服务受理时固定的映射版本；默认及历史运行为空")
     trigger: Mapped[str] = mapped_column(
         String(20), nullable=False, default="manual", server_default="manual", comment="触发方式：manual"
     )

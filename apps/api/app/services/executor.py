@@ -73,8 +73,13 @@ from .credentials import (
     recheck_grant_authority,
     resolve_injection,
 )
-from .debug_context import stamp_guard_semantics
+from .debug_context import (
+    build_resolution_proof,
+    stamp_guard_semantics,
+    stamp_resolution_proof,
+)
 from .permissions import can
+from .service_targets import ServiceTargetError, resolve_selected_target
 from .variable_inputs import frozen_snapshot_digest
 
 _MAX_STORED_BODY_BYTES = 64 * 1024
@@ -543,7 +548,9 @@ def _recheck_pool_authority(
         raise SendFailure("pool_config_invalid", str(error), "policy", False) from error
 
 
-def _recheck_frozen_environment(run: Run, environment: Environment, snapshot: dict) -> None:
+def _recheck_frozen_environment(
+    run: Run, environment: Environment, snapshot: dict, *, selected_base_url: str | None = None
+) -> None:
     """冻结的环境配置与当前配置不一致时拒绝发送。
 
     创建运行时把环境 id、类型与地址冻进了快照，但请求构造一直用的是**当前**环境：
@@ -567,7 +574,7 @@ def _recheck_frozen_environment(run: Run, environment: Environment, snapshot: di
         )
     fields = {
         "kind": (frozen.get("kind"), environment.kind),
-        "base_url": (frozen.get("base_url"), environment.base_url),
+        "base_url": (frozen.get("base_url"), selected_base_url or environment.base_url),
     }
     drifted = [
         name
@@ -584,7 +591,9 @@ def _recheck_frozen_environment(run: Run, environment: Environment, snapshot: di
         )
 
 
-def _authorized_target(guard: TargetGuard, environment: Environment, request: dict):
+def _authorized_target(
+    guard: TargetGuard, environment: Environment, request: dict, *, base_url: str | None = None
+):
     """发送前重新校验环境类型与目标来源。
 
     环境可能在入队之后被改成生产或被改到白名单之外，创建运行时的那次校验已经
@@ -596,7 +605,7 @@ def _authorized_target(guard: TargetGuard, environment: Environment, request: di
     except TargetPolicyError as error:
         raise SendFailure("target_not_allowed", str(error), "policy", False) from error
 
-    base = environment.base_url.rstrip("/")
+    base = (base_url or environment.base_url).rstrip("/")
     try:
         return guard.authorize_url(f"{base}{request.get('path', '/')}")
     except TargetPolicyError as error:
@@ -1244,11 +1253,30 @@ def _execute(session: Session, settings: Settings, claim: JobClaim) -> str:
         _recheck_current_facts(session, run, environment)
         request = validate_request(snapshot.get("request") or {})
         assertions = validate_assertions(snapshot.get("assertions") or [], request)
-        target = _authorized_target(guard, environment, request)
+        # 默认服务继续沿 legacy Environment.base_url 兼容读取。若旧 writer／人工
+        # 修复只改了环境投影，先按当前地址执行出网策略，避免较泛的镜像不一致遮住
+        # 明确的 target_not_allowed；随后仍会核 default 镜像，允许范围内的分歧不会
+        # 被放行。
+        if request.get("service_key") is None:
+            _authorized_target(guard, environment, request)
+        selected = resolve_selected_target(session, environment, request)
+        if (
+            run.environment_service_version_id is not None
+            and selected.version.id != run.environment_service_version_id
+        ):
+            raise SendFailure(
+                "mapping_changed", "所选服务映射已在入队后变化，已阻止执行。",
+                "configuration", False,
+            )
+        target = _authorized_target(
+            guard, environment, request, base_url=selected.base_url
+        )
         # 环境冻结的差异检查放在策略检查**之后**：改成生产、改到白名单之外这类拒绝
         # 比“配置和提交时不一样”具体得多，用户按提示要做的处理也不同。两者都不发
         # 请求，但报错只有一次机会，应当报最贴近原因的那一个。
-        _recheck_frozen_environment(run, environment, snapshot)
+        _recheck_frozen_environment(
+            run, environment, snapshot, selected_base_url=selected.base_url
+        )
         pinned = guard.pinned_address(target)
     except (RequestSpecError, AssertionSpecError) as error:
         return _fail_without_send(session, claim, worker_id, "configuration", "case_invalid", str(error))
@@ -1259,6 +1287,10 @@ def _execute(session: Session, settings: Settings, claim: JobClaim) -> str:
     except TargetPolicyError as error:
         return _fail_without_send(
             session, claim, worker_id, "policy", "target_not_allowed", str(error)
+        )
+    except ServiceTargetError as error:
+        return _fail_without_send(
+            session, claim, worker_id, "configuration", error.code, error.message
         )
 
     side_effect = _side_effect_of(session, run)
@@ -1296,7 +1328,7 @@ def _execute(session: Session, settings: Settings, claim: JobClaim) -> str:
         secrets = list(injection.secret_values)
         prepared = prepare(
             request,
-            environment.base_url,
+            selected.base_url,
             resolver,
             injected_headers=injection.headers,
             injected_query=injection.query,
@@ -1330,12 +1362,21 @@ def _execute(session: Session, settings: Settings, claim: JobClaim) -> str:
     ctx.sensitive_paths |= paths_containing(
         _build_request_roots(prepared, request), secrets
     )
-    request_evidence = {
-        "method": prepared.method,
-        "url": _evidence_url(prepared, secrets),
-        "headers": redact_pairs(prepared.headers_as_pairs(), secrets),
-        "body": redact_text(prepared.body_text(), secrets),
-    }
+    request_evidence = stamp_resolution_proof(
+        {
+            "method": prepared.method,
+            "url": _evidence_url(prepared, secrets),
+            "headers": redact_pairs(prepared.headers_as_pairs(), secrets),
+            "body": redact_text(prepared.body_text(), secrets),
+        },
+        build_resolution_proof(
+            settings.load_secret_key(),
+            workspace_id=run.workspace_id,
+            project_id=run.project_id,
+            principal_id=run.created_by,
+            snapshot=snapshot,
+        ),
+    )
 
     pre_records = _evaluate_assertions(
         assertions, "pre_request", _build_request_roots(prepared, request), ctx
@@ -1388,9 +1429,26 @@ def _execute(session: Session, settings: Settings, claim: JobClaim) -> str:
     try:
         admission_guard = _recheck_pool_authority(session, run, environment, settings)
         _recheck_current_facts(session, run, environment)
-        # 以真正将发送的 URL 为准：权限可以按当前策略重读，但目标不能重新构造一个
-        # 来代替实际要发的地址，否则检查与发送会指向两个不同的主机。
+        # 先检查真正准备发送的 URL。若管理员同时切换映射并撤销旧目标，最具体且
+        # 与零发送直接相关的结论是旧目标已不再获准；只有旧目标仍获准时，才继续
+        # 报映射版本漂移。
         send_target, pinned = _authorize_prepared(admission_guard, prepared)
+        admission_selected = resolve_selected_target(session, environment, request)
+        frozen_environment = snapshot.get("environment") or {}
+        if (
+            admission_selected.base_url.rstrip("/")
+            != str(frozen_environment.get("base_url") or "").rstrip("/")
+            or (
+                run.environment_service_version_id is not None
+                and admission_selected.version.id != run.environment_service_version_id
+            )
+        ):
+            raise SendFailure(
+                "mapping_changed",
+                "所选服务映射已在发送意图后变化，已阻止新的网络发送。",
+                "configuration",
+                False,
+            )
         recheck_grant_authority(
             session,
             injection,
@@ -1416,6 +1474,11 @@ def _execute(session: Session, settings: Settings, claim: JobClaim) -> str:
         return _block_after_intent(
             session, claim, worker_id, attempt.id, intent_at, request_evidence,
             "authentication", error.code, secrets,
+        )
+    except ServiceTargetError as error:
+        return _block_after_intent(
+            session, claim, worker_id, attempt.id, intent_at, request_evidence,
+            "configuration", error.code, secrets,
         )
 
     if not _lease_still_valid(session, worker_id, claim):

@@ -80,6 +80,7 @@ export function EnvironmentPanel({
   onSelect,
   canEdit,
   onChanged,
+  onReload = () => undefined,
   open,
   onOpenChange,
 }: {
@@ -92,6 +93,7 @@ export function EnvironmentPanel({
   onSelect: (environmentId: string) => void;
   canEdit: boolean;
   onChanged: () => void;
+  onReload?: () => void;
   /**
    * 面板自身的折叠状态，由外壳持有。
    *
@@ -112,6 +114,7 @@ export function EnvironmentPanel({
 
   /** 正在编辑的环境与它的草稿：名称、地址、状态与变量行。 */
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingBase, setEditingBase] = useState<Environment | null>(null);
   const [draftName, setDraftName] = useState("");
   const [draftUrl, setDraftUrl] = useState("");
   const [draftStatus, setDraftStatus] = useState("active");
@@ -122,12 +125,13 @@ export function EnvironmentPanel({
 
   // 未保存的环境编辑也是草稿：地址与变量都是别人依赖的配置，切换范围前必须问一次。
   const editingTarget = environments.find((item) => item.id === editingId) ?? null;
+  const staleEdit = editingBase !== null && editingTarget !== null && editingBase.id === editingTarget.id && editingBase.rev !== editingTarget.rev;
   const formDirty =
-    (editingTarget !== null &&
-      (draftName !== editingTarget.name ||
-        draftUrl !== editingTarget.base_url ||
-        draftStatus !== editingTarget.status ||
-        edited(editingTarget, draftRows))) ||
+    (editingBase !== null &&
+      (draftName !== editingBase.name ||
+        draftUrl !== editingBase.base_url ||
+        draftStatus !== editingBase.status ||
+        edited(editingBase, draftRows))) ||
     name.trim() !== "" ||
     baseUrl.trim() !== "";
   useLeaveReport(`environment:${workspaceId}/${projectId}`, { dirty: formDirty, busy });
@@ -182,16 +186,21 @@ export function EnvironmentPanel({
     setFailure(null);
     setDraftUrlError(null);
     setEditingId(environment.id);
+    setEditingBase(environment);
     setDraftName(environment.name);
     setDraftUrl(environment.base_url);
     setDraftStatus(environment.status);
     setDraftRows(variableRows(environment.variables));
   }
 
-  async function saveEdit(environment: Environment) {
+  async function saveEdit() {
     if (busyRef.current) return;
     setMessage(null);
     setFailure(null);
+    if (editingBase === null || editingBase.id !== editingId) {
+      setFailure("编辑基线已失效，请重新打开该环境。");
+      return;
+    }
     if (!draftName.trim() || !draftUrl.trim()) {
       setDraftUrlError(validateEnvironmentUrl(draftUrl));
       setFailure("环境名称和地址都不能为空。");
@@ -213,7 +222,7 @@ export function EnvironmentPanel({
     setBusy(true);
     try {
       await apiSend(
-        projectPath(workspaceId, projectId, `/environments/${environment.id}`),
+        projectPath(workspaceId, projectId, `/environments/${editingBase.id}`),
         "PATCH",
         {
           name: draftName.trim(),
@@ -222,14 +231,19 @@ export function EnvironmentPanel({
           variables: Object.fromEntries(toPayload(draftRows).map((item) => [item.name, item.value])),
         },
         toEnvironment,
+        { headers: { "If-Match": String(editingBase.rev) } },
       );
       setEditingId(null);
+      setEditingBase(null);
       setMessage(`环境「${draftName.trim()}」已保存。`);
       onChanged();
     } catch (cause) {
       if (cause instanceof ApiError && cause.code === "environment_url_invalid") {
         // 保存期间地址输入与编辑目标都被锁定，服务端错误只归实际提交的那份草稿。
         setDraftUrlError(cause.message);
+      } else if (cause instanceof ApiError && (cause.code === "config_revision_conflict" || cause.code === "config_revision_required")) {
+        setFailure(`${cause.message}；当前名称、地址和变量输入均已保留，请刷新环境后再决定如何处理。`);
+        onReload();
       } else {
         setFailure(cause instanceof ApiError ? cause.message : "保存环境失败");
       }
@@ -271,6 +285,14 @@ export function EnvironmentPanel({
               </Space>
               {editingId === item.id ? (
                 <Form className="env-edit" layout="vertical">
+                  {staleEdit ? (
+                    <Alert
+                      type="warning"
+                      showIcon
+                      title={`服务端环境已从修订 ${editingBase?.rev} 更新到 ${item.rev}；当前草稿仍基于旧修订。`}
+                      action={<Button htmlType="button" onClick={() => { setEditingBase(item); setFailure(null); }}>保留输入并采用修订 {item.rev} 作为新基线</Button>}
+                    />
+                  ) : null}
                   <Form.Item label="环境名称" htmlFor="env-edit-name">
                     <Input
                       id="env-edit-name"
@@ -321,13 +343,13 @@ export function EnvironmentPanel({
                     emptyHint="该环境还没有普通变量。"
                   />
                   <Space className="actions">
-                    <Button type="primary" htmlType="button" onClick={() => void saveEdit(item)} disabled={busy}>
+                    <Button type="primary" htmlType="button" onClick={() => void saveEdit()} disabled={busy}>
                       {busy ? "保存中…" : "保存环境"}
                     </Button>
                     <Button
                       htmlType="button"
                       onClick={() => {
-                        if (!busyRef.current) setEditingId(null);
+                        if (!busyRef.current) { setEditingId(null); setEditingBase(null); }
                       }}
                       disabled={busy}
                     >

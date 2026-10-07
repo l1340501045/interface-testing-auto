@@ -21,6 +21,7 @@ from .variables import (
     VariableResolver,
     has_variable_reference,
     variable_reference_count,
+    variable_references,
 )
 
 _METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
@@ -42,6 +43,10 @@ _HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 
 class RequestSpecError(ValueError):
     """请求定义非法，属于配置错误，发送前即拒绝。"""
+
+
+class ServiceSpecError(RequestSpecError):
+    """命名服务字段非法；与普通请求结构错误使用不同公开码。"""
 
 
 @dataclass
@@ -99,6 +104,26 @@ class PreparedRequest:
         自己拼在前面。若传入 `final_path`（已含环境基础路径），基础路径会被拼两次。
         """
         return join_url(self.base, path, query)
+
+
+@dataclass(frozen=True)
+class BindingEvent:
+    """prepare 在真实协议位置发现的一次普通变量引用。"""
+
+    name: str
+    reference: str
+    location: dict[str, Any]
+    event_index: int
+    defined: bool
+    value_type: str | None = None
+    rendered_preview: str | None = None
+
+
+def _utf16_span(text: str, start: int, end: int) -> dict[str, int]:
+    return {
+        "start": len(text[:start].encode("utf-16-le")) // 2,
+        "end": len(text[:end].encode("utf-16-le")) // 2,
+    }
 
 
 def encode_query(pairs: list[tuple[str, str]]) -> str:
@@ -242,6 +267,8 @@ def validate_request(spec: dict[str, Any]) -> dict[str, Any]:
         "imported_origin",
         "auth_required",
         "schema_version",
+        "service_contract",
+        "service_key",
     }
 
     extra = set(spec) - allowed
@@ -255,6 +282,26 @@ def validate_request(spec: dict[str, Any]) -> dict[str, Any]:
         or schema_version != 2
     ):
         raise RequestSpecError(f"不支持的请求协议版本：{schema_version!r}")
+
+    has_service_contract = "service_contract" in spec
+    has_service_key = "service_key" in spec
+    if has_service_contract != has_service_key:
+        raise ServiceSpecError("命名服务请求必须同时包含 service_contract 与 service_key")
+    service_key: str | None = None
+    if has_service_contract:
+        service_contract = spec.get("service_contract")
+        service_key = spec.get("service_key")
+        if (
+            not isinstance(service_contract, int)
+            or isinstance(service_contract, bool)
+            or service_contract != 1
+        ):
+            raise ServiceSpecError("service_contract 必须是严格整数 1")
+        if (
+            not isinstance(service_key, str)
+            or re.fullmatch(r"svc_[0-9a-f]{32}", service_key) is None
+        ):
+            raise ServiceSpecError("service_key 不是合法的命名服务稳定标识")
 
     method = _text(spec.get("method", "GET"), "method").upper()
     if method not in _METHODS:
@@ -305,6 +352,9 @@ def validate_request(spec: dict[str, Any]) -> dict[str, Any]:
     }
     if schema_version == 2:
         normalized["schema_version"] = 2
+    if service_key is not None:
+        normalized["service_contract"] = 1
+        normalized["service_key"] = service_key
     imported = spec.get("imported_origin")
     if imported is not None:
         normalized["imported_origin"] = _text(imported, "imported_origin")
@@ -334,18 +384,101 @@ def _auth_required(spec: dict[str, Any]) -> bool:
     return value
 
 
+def _render_with_bindings(
+    template: str,
+    resolver: VariableResolver,
+    *,
+    location: dict[str, Any],
+    structured: bool,
+    binding_events: list[BindingEvent] | None,
+) -> Any:
+    references = variable_references(template)
+    missing = [reference for reference in references if not resolver.has(reference.name)]
+    if missing:
+        if binding_events is not None:
+            start_index = len(binding_events)
+            binding_events.extend(
+                BindingEvent(
+                    name=reference.name,
+                    reference=reference.text,
+                    location={
+                        **location,
+                        **(
+                            {"utf16_span": _utf16_span(template, reference.start, reference.end)}
+                            if location.get("raw_text") is True
+                            else {}
+                        ),
+                    },
+                    event_index=start_index + offset,
+                    defined=False,
+                )
+                for offset, reference in enumerate(missing)
+            )
+        raise VariableResolutionError(f"未定义变量：{missing[0].name}")
+
+    rendered = (
+        resolver.resolve_structured(template) if structured else resolver.resolve_text(template)
+    )
+    if binding_events is not None and references:
+        preview = dumps(rendered) if structured else str(rendered)
+        start_index = len(binding_events)
+        for offset, reference in enumerate(references):
+            literal = resolver.resolve_literal(reference.name)
+            binding_events.append(
+                BindingEvent(
+                    name=reference.name,
+                    reference=reference.text,
+                    location={
+                        **location,
+                        **(
+                            {"utf16_span": _utf16_span(template, reference.start, reference.end)}
+                            if location.get("raw_text") is True
+                            else {}
+                        ),
+                    },
+                    event_index=start_index + offset,
+                    defined=True,
+                    value_type=literal.type,
+                    rendered_preview=preview,
+                )
+            )
+    return rendered
+
+
 def _resolve_pairs(
-    pairs: list[dict[str, Any]], resolver: VariableResolver
+    pairs: list[dict[str, Any]],
+    resolver: VariableResolver,
+    *,
+    kind: str,
+    binding_events: list[BindingEvent] | None,
 ) -> list[dict[str, Any]]:
-    return [
-        {
-            "name": pair["name"],
-            "value": resolver.resolve_text(pair["value"]),
-            **({"row_id": pair["row_id"]} if "row_id" in pair else {}),
-        }
-        for pair in pairs
-        if pair.get("enabled", True)
-    ]
+    result: list[dict[str, Any]] = []
+    occurrences: dict[str, int] = {}
+    for index, pair in enumerate(pairs):
+        if not pair.get("enabled", True):
+            continue
+        name = pair["name"]
+        occurrence = occurrences.get(name, 0)
+        occurrences[name] = occurrence + 1
+        location: dict[str, Any] = {"kind": kind, "field": "value", "raw_text": True}
+        if "row_id" in pair:
+            location["row_id"] = pair["row_id"]
+        else:
+            location.update({"index": index, "occurrence": occurrence})
+        result.append(
+            {
+                "name": name,
+                "value": _render_with_bindings(
+                    pair["value"],
+                    resolver,
+                    location=location,
+                    structured=False,
+                    binding_events=binding_events,
+                ),
+                **({"row_id": pair["row_id"]} if "row_id" in pair else {}),
+            }
+        )
+    return result
 
 
 # —— 正文绑定 ——
@@ -360,19 +493,32 @@ def _resolve_pairs(
 # 因为这次改动而变样。只有正文确实含变量时才走协议路径，并且那时正文会按协议重排。
 
 
-def _bind_body(body_type: str, template: str, resolver: VariableResolver) -> str:
+def _bind_body(
+    body_type: str,
+    template: str,
+    resolver: VariableResolver,
+    binding_events: list[BindingEvent] | None = None,
+) -> str:
     """按正文类型绑定变量；每种类型保持自己协议的字段语义。"""
     if body_type == "none":
         return ""
     if body_type == "json":
-        return _bind_json_body(template, resolver)
+        return _bind_json_body(template, resolver, binding_events)
     if body_type == "form":
-        return _bind_form_body(template, resolver)
+        return _bind_form_body(template, resolver, binding_events)
     # 纯文本内部没有结构可依赖，沿用既有的整段文本替换语义。
-    return resolver.resolve_text(template)
+    return _render_with_bindings(
+        template,
+        resolver,
+        location={"kind": "body", "field": "body", "selector": [], "raw_text": True},
+        structured=False,
+        binding_events=binding_events,
+    )
 
 
-def _bind_json_body(body: str, resolver: VariableResolver) -> str:
+def _bind_json_body(
+    body: str, resolver: VariableResolver, binding_events: list[BindingEvent] | None = None
+) -> str:
     """JSON 正文：无损解析 → 逐字段绑定 → 无损序列化。
 
     解析与序列化都走无损工具，数字全程以十进制原文流转，不经过 JavaScript
@@ -384,10 +530,16 @@ def _bind_json_body(body: str, resolver: VariableResolver) -> str:
         parsed = loads(body)
     except LosslessJSONError as error:
         raise RequestSpecError(f"JSON 正文无法解析：{error}") from error
-    return dumps(_bind_json_node(parsed, resolver, "$"))
+    return dumps(_bind_json_node(parsed, resolver, "$", [], binding_events))
 
 
-def _bind_json_node(value: Any, resolver: VariableResolver, path: str) -> Any:
+def _bind_json_node(
+    value: Any,
+    resolver: VariableResolver,
+    path: str,
+    selector: list[dict[str, Any]],
+    binding_events: list[BindingEvent] | None,
+) -> Any:
     """递归绑定一个 JSON 节点。
 
     `path` 只由正文自己写的键与下标组成，**不含变量取值**：渲染后的键会被变量
@@ -396,10 +548,22 @@ def _bind_json_node(value: Any, resolver: VariableResolver, path: str) -> Any:
     if isinstance(value, str):
         # 字符串位置同时覆盖两种情况：整体恰为一个变量时保留其类型，嵌在更长
         # 文本里时仍是字符串，并由序列化按 JSON 规则转义引号与反斜线。
-        return resolver.resolve_structured(value)
+        return _render_with_bindings(
+            value,
+            resolver,
+            location={"kind": "body", "field": "body", "selector": selector},
+            structured=True,
+            binding_events=binding_events,
+        )
     if isinstance(value, list):
         return [
-            _bind_json_node(item, resolver, f"{path}[{index}]")
+            _bind_json_node(
+                item,
+                resolver,
+                f"{path}[{index}]",
+                [*selector, {"kind": "index", "index": index}],
+                binding_events,
+            )
             for index, item in enumerate(value)
         ]
     if isinstance(value, dict):
@@ -407,7 +571,13 @@ def _bind_json_node(value: Any, resolver: VariableResolver, path: str) -> Any:
         # 渲染后的键 -> 正文里写的原键，报错只引用原键。
         sources: dict[str, str] = {}
         for key, item in value.items():
-            rendered = resolver.resolve_text(key)
+            rendered = _render_with_bindings(
+                key,
+                resolver,
+                location={"kind": "body", "field": "body", "selector": selector},
+                structured=False,
+                binding_events=binding_events,
+            )
             if rendered in bound:
                 raise RequestSpecError(
                     f"JSON 正文的对象键在变量渲染后重名：{sources[rendered]!r} 与 "
@@ -416,13 +586,21 @@ def _bind_json_node(value: Any, resolver: VariableResolver, path: str) -> Any:
                     "不再相同。"
                 )
             sources[rendered] = key
-            bound[rendered] = _bind_json_node(item, resolver, f"{path}.{key}")
+            bound[rendered] = _bind_json_node(
+                item,
+                resolver,
+                f"{path}.{key}",
+                [*selector, {"kind": "key", "key": key}],
+                binding_events,
+            )
         return bound
     # 数字节点、布尔与 null 不来自变量：原样保留，类型因此不会在往返中改变。
     return value
 
 
-def _bind_form_body(body: str, resolver: VariableResolver) -> str:
+def _bind_form_body(
+    body: str, resolver: VariableResolver, binding_events: list[BindingEvent] | None = None
+) -> str:
     """表单正文：按表单协议解析成有序、可重复的字段，逐字段绑定后写回。
 
     取值里的 `&`、`=`、`+`、空格与中文在写回时按协议编码，因此不会改变字段边界，
@@ -433,7 +611,22 @@ def _bind_form_body(body: str, resolver: VariableResolver) -> str:
     fields = parse_qsl(body, keep_blank_values=True)
     _reject_altered_form_references(body, fields)
     bound = [
-        (resolver.resolve_text(name), resolver.resolve_text(value))
+        (
+            _render_with_bindings(
+                name,
+                resolver,
+                location={"kind": "body", "field": "body", "selector": []},
+                structured=False,
+                binding_events=binding_events,
+            ),
+            _render_with_bindings(
+                value,
+                resolver,
+                location={"kind": "body", "field": "body", "selector": []},
+                structured=False,
+                binding_events=binding_events,
+            ),
+        )
         for name, value in fields
     ]
     # 与查询参数共用同一条编码入口：表单与查询串的转义规则必须完全一致。
@@ -497,6 +690,7 @@ def prepare(
     resolver: VariableResolver,
     injected_headers: list[tuple[str, str]] | None = None,
     injected_query: list[tuple[str, str]] | None = None,
+    binding_events: list[BindingEvent] | None = None,
 ) -> PreparedRequest:
     """把已校验的请求定义解析为可发送请求；变量未定义在此处失败。
 
@@ -505,12 +699,22 @@ def prepare(
     只改变取值来源而不发送，断言核对的会是一个根本没发出去的虚构值。
     """
     method = spec["method"]
-    path = resolver.resolve_text(spec["path"])
+    path = _render_with_bindings(
+        spec["path"],
+        resolver,
+        location={"kind": "path", "field": "path", "raw_text": True},
+        structured=False,
+        binding_events=binding_events,
+    )
     if "://" in path:
         raise RequestSpecError("变量解析后路径成为绝对地址，已阻止发送")
 
-    query = _resolve_pairs(spec["query_params"], resolver)
-    headers = _resolve_pairs(spec["headers"], resolver)
+    query = _resolve_pairs(
+        spec["query_params"], resolver, kind="query", binding_events=binding_events
+    )
+    headers = _resolve_pairs(
+        spec["headers"], resolver, kind="header", binding_events=binding_events
+    )
 
     if injected_query:
         existing = {item["name"] for item in query}
@@ -522,7 +726,7 @@ def prepare(
             query.append({"name": name, "value": value})
 
     body_type = spec["body_type"]
-    body = _bind_body(body_type, spec["body"], resolver)
+    body = _bind_body(body_type, spec["body"], resolver, binding_events)
 
     base = base_url.rstrip("/")
     query_pairs = [(item["name"], item["value"]) for item in query]
@@ -582,7 +786,9 @@ def prepare(
 
 __all__ = [
     "PreparedRequest",
+    "BindingEvent",
     "RequestSpecError",
+    "ServiceSpecError",
     "VariableResolutionError",
     "encode_query",
     "join_url",

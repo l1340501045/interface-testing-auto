@@ -10,6 +10,8 @@ const CSRF_COOKIE = "interface_csrf";
 const CSRF_HEADER = "X-CSRF-Token";
 const API_PREFIX = "/api/v1";
 export const REQUEST_CONTRACT_HEADERS = { "X-Request-Contract": "2" } as const;
+/** 新前端统一声明理解多服务目标；行协议与服务协议是两条独立能力。 */
+export const SERVICE_CONTRACT_HEADERS = { "X-Service-Contract": "1" } as const;
 
 /** v2 兼容错误统一转成用户可以直接采取行动的文案。 */
 function compatibilityMessage(code: string, fallback: string): string {
@@ -124,6 +126,7 @@ async function send(path: string, options: RequestOptions): Promise<RawResponse>
   const headers: Record<string, string> = {
     Accept: "application/json",
     ...REQUEST_CONTRACT_HEADERS,
+    ...SERVICE_CONTRACT_HEADERS,
     ...options.headers,
   };
   if (method !== "GET" && method !== "HEAD") {
