@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from ..config import Settings
 from ..kernel.assertion_spec import AssertionSpecError, validate_assertions
-from ..kernel.request_spec import RequestSpecError, validate_request
+from ..kernel.request_spec import RequestSpecError, ServiceSpecError, validate_request
 from ..models import CredentialSet, Environment
 from .credentials import (
     CREDENTIAL_AMBIGUOUS,
@@ -88,6 +88,7 @@ def preflight(
     role: str,
     environment_id: uuid.UUID,
     snapshot: dict,
+    base_url: str | None = None,
 ) -> PreflightResult:
     """检查当前主体能否发送这份调试快照。"""
     can_authorize = can(role, "manage_secrets")
@@ -114,6 +115,12 @@ def preflight(
     request_payload = snapshot.get("request", {})
     try:
         request = validate_request(request_payload)
+    except ServiceSpecError as error:
+        return PreflightResult(
+            ready=False,
+            issues=[PreflightIssue("service_invalid", str(error), "edit_request")],
+            can_authorize=can_authorize,
+        )
     except RequestSpecError as error:
         return PreflightResult(
             ready=False,
@@ -156,7 +163,7 @@ def preflight(
             "id": str(environment.id),
             "name": environment.name,
             "kind": environment.kind,
-            "base_url": environment.base_url,
+            "base_url": base_url or environment.base_url,
         },
         "input_fingerprint": binding.input_fingerprint,
     }
@@ -170,7 +177,9 @@ def preflight(
 
     try:
         resolved = resolve_pool(session, settings, environment)
-        _request, target_origin = resolve_target(request, environment, resolved.guard)
+        _request, target_origin = resolve_target(
+            request, environment, resolved.guard, base_url=base_url
+        )
     except RunRejected as error:
         result.ready = False
         result.issues.append(

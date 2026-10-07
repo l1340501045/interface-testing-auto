@@ -36,6 +36,9 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from ..kernel.request_spec import RequestSpecError, prepare, validate_request
+from ..kernel.variables import VariableResolutionError, build_resolver
+
 # 执行器在步骤证据里留下的语义标记。
 #
 # 键名带前缀，避免与请求证据自身的字段重名；报告读取时会把这一项剥离，不把它当作
@@ -45,9 +48,11 @@ GUARD_SEMANTICS_KEY = "__platform_guard"
 GUARD_SEMANTICS = "environment_frozen_auth_enforced_v1"
 RESOLUTION_GUARD_KEY = "__platform_resolution_guard"
 RESOLUTION_GUARD = "ordinary_binding_enforced_v1"
+TARGET_RESOLUTION_GUARD = "selected_target_binding_enforced_v1"
 RESOLUTION_KEY_ID = "__platform_resolution_key_id"
 RESOLUTION_CONTEXT_FINGERPRINT = "__platform_resolution_context_fingerprint"
 RESOLUTION_BINDING_FINGERPRINT = "__platform_resolution_binding_fingerprint"
+RESOLUTION_TARGET_FINGERPRINT = "__platform_resolution_target_fingerprint"
 
 # 用途域标签。改动词义时必须换新值：换了标签等于换了算法，旧标记不再匹配——这正是
 # 需要的语义，而不是靠比较字符串去猜。
@@ -56,6 +61,7 @@ PURPOSE_INPUT = "debug-context/input/v1"
 # 主密钥标识自己的域，与上面两个都不同，避免把标记本身当成密钥标识。
 PURPOSE_KEY_ID = "debug-context/key-id/v1"
 PURPOSE_RESOLUTION_BINDING = "resolution-binding/v1"
+PURPOSE_RESOLUTION_TARGET = "resolution-target/v1"
 
 _CONTEXT_BINDING_KEY = "context_binding"
 
@@ -171,6 +177,7 @@ def strip_guard_semantics(evidence: dict[str, Any] | None) -> dict[str, Any] | N
         RESOLUTION_KEY_ID,
         RESOLUTION_CONTEXT_FINGERPRINT,
         RESOLUTION_BINDING_FINGERPRINT,
+        RESOLUTION_TARGET_FINGERPRINT,
     }
     return {key: value for key, value in evidence.items() if key not in hidden}
 
@@ -190,7 +197,14 @@ def build_resolution_proof(
 ) -> dict[str, str] | None:
     """真实 prepare 成功后生成 S1 绑定证明；旧快照不补造。"""
     resolution = snapshot.get("resolution")
-    if not isinstance(resolution, dict) or resolution.get("schema_version") != 1:
+    if not isinstance(resolution, dict):
+        return None
+    raw_schema_version = resolution.get("schema_version")
+    if (
+        isinstance(raw_schema_version, bool)
+        or not isinstance(raw_schema_version, int)
+        or raw_schema_version not in (1, 2)
+    ):
         return None
     context_fingerprint = resolution.get("context_fingerprint")
     if not isinstance(context_fingerprint, str) or not context_fingerprint:
@@ -205,15 +219,46 @@ def build_resolution_proof(
         "request": snapshot.get("request"),
         "variables": snapshot.get("variables"),
     }
-    return {
-        "schema_version": "1",
-        "guard": RESOLUTION_GUARD,
+    schema_version = raw_schema_version
+    proof = {
+        "schema_version": str(schema_version),
+        "guard": TARGET_RESOLUTION_GUARD if schema_version == 2 else RESOLUTION_GUARD,
         "key_id": key_id(key),
         "context_fingerprint": context_fingerprint,
         "binding_fingerprint": _fingerprint(
             key, PURPOSE_RESOLUTION_BINDING, scope, payload
         ),
     }
+    if schema_version == 2:
+        target_ref = resolution.get("target_ref")
+        if not isinstance(target_ref, dict):
+            return None
+        environment = snapshot.get("environment")
+        if not isinstance(environment, dict) or not isinstance(environment.get("base_url"), str):
+            return None
+        try:
+            request = validate_request(snapshot.get("request") or {})
+            resolver = build_resolver(
+                [
+                    {"name": name, "value": value}
+                    for name, value in (snapshot.get("variables") or {}).items()
+                ]
+            )
+            prepared = prepare(request, environment["base_url"], resolver)
+        except (RequestSpecError, VariableResolutionError):
+            return None
+        proof["target_fingerprint"] = _fingerprint(
+            key,
+            PURPOSE_RESOLUTION_TARGET,
+            scope,
+            {
+                "target_ref": target_ref,
+                "method": prepared.method,
+                "url": prepared.url,
+                "base_url": environment["base_url"],
+            },
+        )
+    return proof
 
 
 def stamp_resolution_proof(
@@ -221,13 +266,16 @@ def stamp_resolution_proof(
 ) -> dict[str, Any]:
     if proof is None:
         return evidence
-    return {
+    result = {
         **evidence,
         RESOLUTION_GUARD_KEY: proof["guard"],
         RESOLUTION_KEY_ID: proof["key_id"],
         RESOLUTION_CONTEXT_FINGERPRINT: proof["context_fingerprint"],
         RESOLUTION_BINDING_FINGERPRINT: proof["binding_fingerprint"],
     }
+    if "target_fingerprint" in proof:
+        result[RESOLUTION_TARGET_FINGERPRINT] = proof["target_fingerprint"]
+    return result
 
 
 def read_resolution_proof(
@@ -240,7 +288,13 @@ def read_resolution_proof(
     principal_id: uuid.UUID,
 ) -> dict[str, Any] | None:
     """校验 worker 证明与冻结输入；失败或旧记录均返回 None。"""
-    if not isinstance(evidence, dict) or evidence.get(RESOLUTION_GUARD_KEY) != RESOLUTION_GUARD:
+    if not isinstance(evidence, dict):
+        return None
+    supplied_guard = evidence.get(RESOLUTION_GUARD_KEY)
+    if not isinstance(supplied_guard, str) or supplied_guard not in (
+        RESOLUTION_GUARD,
+        TARGET_RESOLUTION_GUARD,
+    ):
         return None
     if evidence.get(RESOLUTION_KEY_ID) != key_id(key) or not isinstance(snapshot, dict):
         return None
@@ -253,6 +307,8 @@ def read_resolution_proof(
     )
     if expected is None:
         return None
+    if supplied_guard != expected["guard"]:
+        return None
     supplied_context = evidence.get(RESOLUTION_CONTEXT_FINGERPRINT)
     supplied_binding = evidence.get(RESOLUTION_BINDING_FINGERPRINT)
     if not (
@@ -262,12 +318,24 @@ def read_resolution_proof(
         and hmac.compare_digest(expected["binding_fingerprint"], supplied_binding)
     ):
         return None
-    return {
-        "schema_version": 1,
-        "guard": RESOLUTION_GUARD,
+    schema_version = int(expected["schema_version"])
+    result = {
+        "schema_version": schema_version,
+        "guard": expected["guard"],
         "context_fingerprint": supplied_context,
         "binding_fingerprint": supplied_binding,
     }
+    if schema_version == 2:
+        supplied_target = evidence.get(RESOLUTION_TARGET_FINGERPRINT)
+        expected_target = expected.get("target_fingerprint")
+        if not (
+            isinstance(supplied_target, str)
+            and isinstance(expected_target, str)
+            and hmac.compare_digest(expected_target, supplied_target)
+        ):
+            return None
+        result["target_fingerprint"] = supplied_target
+    return result
 
 
 __all__ = [

@@ -76,6 +76,7 @@ def post_asset_operation(
     response: Response,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     request_contract: str | None = Header(default=None, alias="X-Request-Contract"),
+    service_contract: str | None = Header(default=None, alias="X-Service-Contract"),
     scope: deps.ProjectScope = _EDIT_SCOPE,
     session: Session = Depends(get_db),
 ) -> AssetOperationOut:
@@ -83,7 +84,7 @@ def post_asset_operation(
         raise ApiError(428, "idempotency_key_required", "缺少 Idempotency-Key")
     try:
         result, replayed, created = asset_lifecycle.execute_operation(
-            session, scope, payload, idempotency_key, request_contract
+            session, scope, payload, idempotency_key, request_contract, service_contract
         )
     except asset_lifecycle.AssetLifecycleError as error:
         raise _asset_error(error) from error

@@ -27,6 +27,7 @@ from .projects import (
     RunnerPoolProjectGrant,
 )
 from .runs import AssertionResult, AuditEvent, IdempotencyRecord, Job, Run, RunStepAttempt
+from .services import EnvironmentServiceMapping, EnvironmentServiceVersion, ProjectService
 
 __all__ = [
     "Base",
@@ -47,11 +48,14 @@ __all__ = [
     "CredentialUseGrant",
     "Environment",
     "EnvironmentConfigVersion",
+    "EnvironmentServiceMapping",
+    "EnvironmentServiceVersion",
     "Folder",
     "IdempotencyRecord",
     "Job",
     "Project",
     "ProjectConfigVersion",
+    "ProjectService",
     "Run",
     "RunnerPool",
     "RunnerPoolProjectGrant",

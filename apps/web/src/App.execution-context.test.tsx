@@ -10,9 +10,8 @@
  * 通过”立即失效（不等列表刷新回来）。同时验证反向：读取列表、保存失败都**不**推进时钟，
  * 否则界面会无端作废一份刚算好的结论。
  */
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { antSelectedValue, selectAntOption } from "./test/antd";
 
 const WORKSPACE_ID = "11111111-1111-4111-8111-111111111111";
 const WORKSPACE_ID_B = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -287,14 +286,62 @@ function route(rawPath: string, method: string, body?: unknown): unknown {
   // 必须短于外层 15 秒测试门槛；否则装配失败只会报测试整体超时，丢失具体 waitFor/DOM 证据。
   const SETUP_WAIT = { timeout: 5000 };
 
+function exactButton(root: ParentNode, text: string): HTMLButtonElement {
+  const matches = Array.from(root.querySelectorAll<HTMLButtonElement>("button"))
+    .filter((button) => button.textContent?.trim() === text && button.closest('[hidden], [aria-hidden="true"]') === null);
+  if (matches.length !== 1) throw new Error(`按钮“${text}”数量不是 1：${matches.length}`);
+  const button = matches[0];
+  expect(button.type).toBe("button");
+  expect(button.textContent?.trim()).toBe(text);
+  return button;
+}
+
+function activeEditor(): HTMLElement {
+  const editor = document.querySelector<HTMLElement>(".workspace-editor:not([hidden])");
+  if (editor === null) throw new Error("活动用例编辑器未挂载");
+  expect(editor.getAttribute("aria-hidden")).toBe("false");
+  return editor;
+}
+
+function environmentPanel(page: ParentNode): HTMLElement {
+  const panel = page.querySelector<HTMLElement>("#environment-panel");
+  if (panel === null) throw new Error("环境面板未挂载");
+  return panel;
+}
+
+function projectVariablesPanel(page: ParentNode): HTMLElement {
+  const header = Array.from(page.querySelectorAll<HTMLElement>('.ant-collapse-header[role="button"]'))
+    .find((item) => item.textContent?.trim().startsWith("项目普通变量（"));
+  const panel = header?.closest<HTMLElement>(".ant-collapse-item");
+  if (header === undefined || panel === null || panel === undefined) throw new Error("项目普通变量面板未挂载");
+  expect(header.getAttribute("aria-expanded")).toBe("true");
+  return panel;
+}
+
+function labeledInput(root: ParentNode, labelText: string): HTMLInputElement {
+  const labels = Array.from(root.querySelectorAll<HTMLLabelElement>("label"))
+    .filter((label) => label.textContent?.trim() === labelText);
+  if (labels.length !== 1) throw new Error(`标签“${labelText}”数量不是 1：${labels.length}`);
+  const controlId = labels[0].htmlFor;
+  const input = controlId === "" ? null : Array.from(root.querySelectorAll<HTMLElement>("[id]"))
+    .find((candidate) => candidate.id === controlId);
+  if (!(input instanceof HTMLInputElement)) throw new Error(`标签“${labelText}”没有关联输入框`);
+  expect(input.id).toBe(controlId);
+  return input;
+}
+
 /** 打开项目并选中用例，返回编辑器就绪后的容器。 */
 async function openCase(): Promise<void> {
   render(<App />);
-  await screen.findByLabelText("项目");
-  await waitFor(() => expect(antSelectedValue("项目")).toBe(PROJECT_ID), SETUP_WAIT);
+  await waitFor(() => expect(selectedValueById("scope-project")).toBe(PROJECT_ID), SETUP_WAIT);
   await act(async () => {});
   // 等侧栏（目录／用例列表）真正挂载：项目选择到位不等于环境与目录已经读完。
-  const browser = await screen.findByLabelText("用例目录");
+  const browser = await waitFor(() => {
+    const current = document.querySelector<HTMLElement>('.workspace:not([hidden]) [aria-label="用例目录"]');
+    if (current === null) throw new Error("用例目录未挂载");
+    expect(current.getAttribute("aria-label")).toBe("用例目录");
+    return current;
+  }, SETUP_WAIT);
   const caseButton = await waitFor(() => {
     const button = Array.from(browser.querySelectorAll<HTMLButtonElement>(".case-list button"))
       .find((item) => item.textContent?.includes("查询订单"));
@@ -305,7 +352,13 @@ async function openCase(): Promise<void> {
   }, SETUP_WAIT);
   fireEvent.click(caseButton);
   await waitFor(
-    () => expect((screen.getByLabelText("用例名称") as HTMLInputElement).value).toBe("查询订单"),
+    () => {
+      const input = activeEditor().querySelector<HTMLInputElement>(".case-name-input");
+      if (input === null) throw new Error("活动用例名称输入框未挂载");
+      const label = activeEditor().querySelector<HTMLLabelElement>(`label[for="${input.id}"]`);
+      expect(label?.textContent?.trim()).toBe("用例名称");
+      expect(input.value).toBe("查询订单");
+    },
     SETUP_WAIT,
   );
   // 等编辑防抖触发的展示性预检真实进入 API 边界。
@@ -373,6 +426,17 @@ async function waitForReportHeading(region: HTMLElement, runId: string): Promise
   ).toBe(true));
 }
 
+async function leaveDialog(): Promise<HTMLElement> {
+  return waitFor(() => {
+    const dialogs = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"]'))
+      .filter((dialog) => dialog.closest('[hidden], [aria-hidden="true"]') === null && dialog.textContent?.includes("确认离开"));
+    if (dialogs.length !== 1) throw new Error(`确认离开对话框数量不是 1：${dialogs.length}`);
+    expect(dialogs[0].getAttribute("role")).toBe("dialog");
+    expect(dialogs[0].textContent).toContain("确认离开");
+    return dialogs[0];
+  });
+}
+
 async function waitForRunRow(region: HTMLElement, runId: string): Promise<HTMLElement> {
   const shortId = runId.slice(0, 8);
   await waitFor(() => expect(
@@ -405,9 +469,37 @@ function selectedValueById(id: string): string {
   return root?.dataset.selectedValue ?? "";
 }
 
+async function selectScopeOption(id: "scope-project" | "scope-workspace", label: "项目" | "工作空间", optionLabel: string): Promise<void> {
+  const combobox = document.getElementById(id);
+  if (!(combobox instanceof HTMLElement)) throw new Error(`${label}下拉框未挂载`);
+  expect(combobox.getAttribute("aria-label")).toBe(label);
+  expect(combobox.getAttribute("role")).toBe("combobox");
+  fireEvent.mouseDown(combobox);
+  const listId = combobox.getAttribute("aria-controls");
+  if (listId === null) throw new Error(`${label}下拉框没有关联选项列表`);
+  const option = await waitFor(() => {
+    const list = document.getElementById(listId);
+    if (list === null) throw new Error(`${label}下拉选项列表未挂载`);
+    const popup = list.closest<HTMLElement>(".ant-select-dropdown");
+    if (popup === null) throw new Error(`${label}下拉选项列表不在当前弹层中`);
+    const matches = Array.from(popup.querySelectorAll<HTMLElement>(".ant-select-item-option"))
+      .filter((candidate) => candidate.textContent?.trim() === optionLabel && candidate.closest('[hidden], [aria-hidden="true"]') === null);
+    if (matches.length !== 1) throw new Error(`${label}选项“${optionLabel}”数量不是 1：${matches.length}`);
+    return matches[0];
+  });
+  expect(option.classList.contains("ant-select-item-option")).toBe(true);
+  fireEvent.click(option);
+}
+
 /** 发一次调试并等它显示真实结论，返回响应区。 */
 async function debugOnce(): Promise<HTMLElement> {
-  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+  const editor = activeEditor();
+  const send = editor.querySelector<HTMLButtonElement>('button[aria-label="发送"]');
+  if (send === null) throw new Error("活动用例发送按钮未挂载");
+  expect(send.type).toBe("button");
+  expect(send.textContent?.trim()).toBe("发送");
+  expect(send.disabled).toBe(false);
+  fireEvent.click(send);
   const response = await waitFor(() => {
     const current = document.querySelector<HTMLElement>('.workspace-editor:not([hidden]) [aria-label="响应"]');
     if (current === null) throw new Error("活动编辑器响应区未挂载");
@@ -443,15 +535,19 @@ describe("执行配置变更的真实失效链", () => {
     const response = await debugOnce();
     expect(response.textContent).not.toContain("上一次发送");
 
-    const admin = await openAdmin();
+    const page = await openAdmin();
+    const admin = environmentPanel(page);
     // 真实环境编辑表单：打开编辑、改地址、保存。
-    fireEvent.click(within(admin).getByRole("button", { name: "编辑" }));
-    const baseInput = await within(admin).findByLabelText("服务地址");
+    fireEvent.click(exactButton(admin, "编辑"));
+    const baseInput = labeledInput(admin, "服务地址");
     fireEvent.change(baseInput, { target: { value: "http://echo-alt.test" } });
-    const saveButton = within(admin).getByRole("button", { name: "保存环境" });
+    const saveButton = exactButton(admin, "保存环境");
     await act(async () => {
       fireEvent.click(saveButton);
     });
+    await waitFor(() => expect(
+      calls.find((call) => call.method === "PATCH" && call.path.endsWith(`/environments/${ENV_ID}`))?.body,
+    ).toMatchObject({ base_url: "http://echo-alt.test" }));
 
     // PATCH 一旦成功，工作台当场把旧结论标成“上一次发送”——不等环境列表刷新回来。
     await waitFor(() => expect(response.textContent).toContain("上一次发送"));
@@ -461,14 +557,18 @@ describe("执行配置变更的真实失效链", () => {
     await openCase();
     const response = await debugOnce();
 
-    const admin = await openAdmin();
+    const page = await openAdmin();
+    const admin = projectVariablesPanel(page);
     // 项目变量面板：新增一行并保存。
-    fireEvent.click(within(admin).getByRole("button", { name: "＋添加变量" }));
-    const nameInput = await within(admin).findByLabelText("名称");
+    fireEvent.click(exactButton(admin, "＋添加变量"));
+    const nameInput = labeledInput(admin, "名称");
     fireEvent.change(nameInput, { target: { value: "shared" } });
     await act(async () => {
-      fireEvent.click(within(admin).getByRole("button", { name: "保存为新版本" }));
+      fireEvent.click(exactButton(admin, "保存为新版本"));
     });
+    await waitFor(() => expect(
+      calls.find((call) => call.method === "PUT" && call.path.endsWith("/variables"))?.body,
+    ).toEqual({ variables: [{ name: "shared", value: { type: "string", text: "" } }] }));
 
     await waitFor(() => expect(response.textContent).toContain("上一次发送"));
   });
@@ -477,15 +577,17 @@ describe("执行配置变更的真实失效链", () => {
     await openCase();
     const response = await debugOnce();
 
-    const admin = await openAdmin();
+    const page = await openAdmin();
+    const admin = environmentPanel(page);
     failWrites = true;
-    fireEvent.click(within(admin).getByRole("button", { name: "编辑" }));
-    const baseInput = await within(admin).findByLabelText("服务地址");
+    fireEvent.click(exactButton(admin, "编辑"));
+    const baseInput = labeledInput(admin, "服务地址");
     fireEvent.change(baseInput, { target: { value: "http://echo-alt.test" } });
     await act(async () => {
-      fireEvent.click(within(admin).getByRole("button", { name: "保存环境" }));
+      fireEvent.click(exactButton(admin, "保存环境"));
     });
     await act(async () => {});
+    expect(calls.find((call) => call.method === "PATCH")?.body).toMatchObject({ base_url: "http://echo-alt.test" });
 
     // 保存失败：没有发生配置变更，不该作废一份仍然成立的结论。
     expect(response.textContent).not.toContain("上一次发送");
@@ -495,9 +597,10 @@ describe("执行配置变更的真实失效链", () => {
     await openCase();
     const response = await debugOnce();
 
-    const admin = await openAdmin();
+    const page = await openAdmin();
+    const admin = environmentPanel(page);
     // 展开各管理面板会触发多次 GET；读取不是变更。
-    fireEvent.click(within(admin).getByRole("button", { name: "编辑" }));
+    fireEvent.click(exactButton(admin, "编辑"));
     await act(async () => {});
     await act(async () => {});
 
@@ -518,10 +621,11 @@ describe("环境地址无效时的真实入口", () => {
     environment = makeEnvironment("target-service:8080");
     await openCase();
 
-    const entry = await screen.findByRole("button", { name: "前往环境设置" });
+    const editor = activeEditor();
+    const entry = exactButton(editor, "前往环境设置");
     // 无效地址不能被当成“实际目标”展示。
-    expect(screen.getByText(/环境地址不合法，暂时无法确定/)).toBeTruthy();
-    expect(screen.queryByText(/实际目标：target-service:8080/)).toBeNull();
+    expect(editor.textContent).toContain("环境地址不合法，暂时无法确定");
+    expect(editor.textContent).not.toContain("实际目标：target-service:8080");
 
     const panel = document.getElementById("environment-panel") as HTMLElement;
     const environmentTrigger = environmentCollapseTrigger(panel);
@@ -537,42 +641,48 @@ describe("环境地址无效时的真实入口", () => {
     fireEvent.click(entry);
     await act(async () => {});
 
-    expect(screen.getByRole("region", { name: "环境配置" })).toBeTruthy();
+    const page = document.querySelector<HTMLElement>('section.content-page[aria-label="环境配置"]:not([hidden])');
+    expect(page?.getAttribute("aria-label")).toBe("环境配置");
     expect(window.location.hash).toBe("#/environments");
     expect(environmentTrigger.getAttribute("aria-expanded")).toBe("true");
 
     // 进入配置页必须保住同一份未保存用例：工作台只是隐藏，编辑器没有重挂载。
-    expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/echo");
+    expect(labeledInput(editor, "路径").value).toBe("/echo");
   });
 
   it("展开后确实能走到环境编辑表单（编辑入口不再藏在折叠标题下）", async () => {
     environment = makeEnvironment("target-service:8080");
     await openCase();
 
-    fireEvent.click(await screen.findByRole("button", { name: "前往环境设置" }));
+    fireEvent.click(exactButton(activeEditor(), "前往环境设置"));
     await act(async () => {});
 
     const panel = document.getElementById("environment-panel") as HTMLElement;
     expect(environmentCollapseTrigger(panel).getAttribute("aria-expanded")).toBe("true");
     // 面板内的编辑入口真的可用：点开后能看到地址输入框。
-    fireEvent.click(within(panel).getByRole("button", { name: "编辑" }));
-    expect((await within(panel).findByLabelText("服务地址")) as HTMLInputElement).toBeTruthy();
+    fireEvent.click(exactButton(panel, "编辑"));
+    expect(labeledInput(panel, "服务地址")).toBeTruthy();
   });
 
   it("缺协议的地址在环境面板里就地挡住，不发写请求", async () => {
     environment = makeEnvironment("target-service:8080");
     await openCase();
-    const entry = await screen.findByRole("button", { name: "前往环境设置" });
+    const entry = exactButton(activeEditor(), "前往环境设置");
     fireEvent.click(entry);
-    const admin = await screen.findByRole("region", { name: "环境配置" });
+    const page = await waitFor(() => {
+      const current = document.querySelector<HTMLElement>('section.content-page[aria-label="环境配置"]:not([hidden])');
+      if (current === null) throw new Error("环境配置页未挂载");
+      return current;
+    });
+    const admin = environmentPanel(page);
     await waitFor(() => expect(environmentCollapseTrigger(admin).getAttribute("aria-expanded")).toBe("true"));
-    fireEvent.click(within(admin).getByRole("button", { name: "编辑" }));
-    const baseInput = await within(admin).findByLabelText("服务地址");
+    fireEvent.click(exactButton(admin, "编辑"));
+    const baseInput = labeledInput(admin, "服务地址");
     // 不改地址直接保存：服务端会拒绝这条存量值，本地也应当先挡住。
     const writesBefore = calls.filter((call) => call.method === "PATCH").length;
-    fireEvent.click(within(admin).getByRole("button", { name: "保存环境" }));
+    fireEvent.click(exactButton(admin, "保存环境"));
 
-    await within(admin).findByText("环境地址不合法，请按提示修正后再保存。");
+    await waitFor(() => expect(admin.textContent).toContain("环境地址不合法，请按提示修正后再保存。"));
     expect(calls.filter((call) => call.method === "PATCH")).toHaveLength(writesBefore);
     expect((baseInput as HTMLInputElement).value).toBe("target-service:8080");
   });
@@ -580,23 +690,32 @@ describe("环境地址无效时的真实入口", () => {
   it("把环境地址修好之后，同一份未保存草稿可以继续调试", async () => {
     environment = makeEnvironment("target-service:8080");
     await openCase();
-    const entry = await screen.findByRole("button", { name: "前往环境设置" });
+    const editor = activeEditor();
+    const entry = exactButton(editor, "前往环境设置");
     fireEvent.click(entry);
 
     // 走真实环境编辑表单改地址。
-    const admin = await screen.findByRole("region", { name: "环境配置" });
+    const page = await waitFor(() => {
+      const current = document.querySelector<HTMLElement>('section.content-page[aria-label="环境配置"]:not([hidden])');
+      if (current === null) throw new Error("环境配置页未挂载");
+      return current;
+    });
+    const admin = environmentPanel(page);
     await waitFor(() => expect(environmentCollapseTrigger(admin).getAttribute("aria-expanded")).toBe("true"));
-    fireEvent.click(within(admin).getByRole("button", { name: "编辑" }));
-    const baseInput = await within(admin).findByLabelText("服务地址");
+    fireEvent.click(exactButton(admin, "编辑"));
+    const baseInput = labeledInput(admin, "服务地址");
     fireEvent.change(baseInput, { target: { value: "http://echo.test" } });
-    fireEvent.click(within(admin).getByRole("button", { name: "保存环境" }));
+    fireEvent.click(exactButton(admin, "保存环境"));
+    await waitFor(() => expect(
+      calls.find((call) => call.method === "PATCH" && call.path.endsWith(`/environments/${ENV_ID}`))?.body,
+    ).toMatchObject({ base_url: "http://echo.test" }));
 
     // 配置变更由外壳广播；预检按新地址重新给结论，无效提示随之消失。
-    await waitFor(() =>
-      expect(screen.queryByRole("button", { name: "前往环境设置" })).toBeNull(),
-    );
+    await waitFor(() => expect(
+      Array.from(editor.querySelectorAll("button")).some((button) => button.textContent?.trim() === "前往环境设置"),
+    ).toBe(false));
     // 草稿没有被清掉或重载：还是原来那一份请求内容。
-    expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/echo");
+    expect(labeledInput(editor, "路径").value).toBe("/echo");
   });
 });
 
@@ -611,16 +730,21 @@ describe("独立页面的状态归属", () => {
     };
     await openCase();
 
-    const entry = await screen.findByRole("button", { name: "环境与凭证管理" });
+    const editor = activeEditor();
+    const entry = exactButton(editor, "环境与凭证管理");
     fireEvent.click(entry);
     await act(async () => {});
 
     const credentials = document.getElementById("credentials-panel") as HTMLElement;
-    const credentialsTrigger = within(credentials).getByRole("button", { name: "人工凭证" });
-    expect(screen.getByRole("region", { name: "环境配置" })).toBeTruthy();
+    const credentialsTrigger = Array.from(credentials.querySelectorAll<HTMLElement>('.ant-collapse-header[role="button"]'))
+      .find((item) => item.textContent?.trim() === "人工凭证");
+    if (credentialsTrigger === undefined) throw new Error("人工凭证折叠入口未挂载");
+    expect(credentialsTrigger.getAttribute("role")).toBe("button");
+    const page = document.querySelector<HTMLElement>('section.content-page[aria-label="环境配置"]:not([hidden])');
+    expect(page?.getAttribute("aria-label")).toBe("环境配置");
     expect(credentialsTrigger.getAttribute("aria-expanded")).toBe("true");
     expect(document.activeElement).toBe(credentials);
-    expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/echo");
+    expect(labeledInput(editor, "路径").value).toBe("/echo");
   });
 
   it("任务报告跳转只消费一次，往返保留新选择，再点同一任务仍可跳回", async () => {
@@ -635,9 +759,8 @@ describe("独立页面的状态归属", () => {
     const tasks = await activePageRegion("任务中心");
     const rowA = await waitForRunRow(tasks, RUN_ID);
     fireEvent.click(viewReportButton(rowA));
-    const headingA = await screen.findByRole("heading", { name: `运行 ${RUN_ID.slice(0, 8)} 的报告` });
-    const reports = headingA.closest<HTMLElement>('section[aria-label="测试报告"]');
-    if (reports === null) throw new Error("报告 A 不在测试报告页面内");
+    const reports = await activePageRegion("测试报告");
+    await waitForReportHeading(reports, RUN_ID);
 
     const rowB = await waitForRunRow(reports, RUN_ID_B);
     fireEvent.click(viewReportButton(rowB));
@@ -661,26 +784,28 @@ describe("独立页面的状态归属", () => {
   it("跨项目首帧拒绝旧报告意图，不向新项目请求旧运行", async () => {
     historyRuns = [{ ...RUN_REPORT.run, id: RUN_ID, state: "finished", outcome: "passed" }];
     await openCase();
-    fireEvent.click(screen.getByRole("button", { name: "任务中心" }));
-    const rowA = (await screen.findByText(RUN_ID.slice(0, 8))).closest("tr") as HTMLElement;
-    fireEvent.click(within(rowA).getByRole("button", { name: "查看报告" }));
-    await screen.findByRole("heading", { name: `运行 ${RUN_ID.slice(0, 8)} 的报告` });
+    const editor = activeEditor();
+    fireEvent.click(primaryNavButton("任务中心"));
+    const tasks = await activePageRegion("任务中心");
+    const rowA = await waitForRunRow(tasks, RUN_ID);
+    fireEvent.click(viewReportButton(rowA));
+    await waitForReportHeading(await activePageRegion("测试报告"), RUN_ID);
 
     // 报告页隐藏着同一个编辑器；未保存草稿仍必须拦住跨项目切换。
-    fireEvent.change(screen.getByLabelText("路径") as HTMLInputElement, {
+    fireEvent.change(labeledInput(editor, "路径"), {
       target: { value: "/changed" },
     });
-    await selectAntOption("项目", "项目乙");
-    const firstLeave = await screen.findByRole("dialog", { name: "确认离开" });
-    fireEvent.click(within(firstLeave).getByRole("button", { name: "取消" }));
-    expect(antSelectedValue("项目")).toBe(PROJECT_ID);
-    expect((screen.getByLabelText("路径") as HTMLInputElement).value).toBe("/changed");
+    await selectScopeOption("scope-project", "项目", "项目乙");
+    const firstLeave = await leaveDialog();
+    fireEvent.click(exactButton(firstLeave, "取消"));
+    expect(selectedValueById("scope-project")).toBe(PROJECT_ID);
+    expect(labeledInput(editor, "路径").value).toBe("/changed");
 
-    await selectAntOption("项目", "项目乙");
-    const secondLeave = await screen.findByRole("dialog", { name: "确认离开" });
-    fireEvent.click(within(secondLeave).getByRole("button", { name: "继续离开" }));
-    await waitFor(() => expect(antSelectedValue("项目")).toBe(PROJECT_ID_B));
-    expect(screen.queryByRole("heading", { name: `运行 ${RUN_ID.slice(0, 8)} 的报告` })).toBeNull();
+    await selectScopeOption("scope-project", "项目", "项目乙");
+    const secondLeave = await leaveDialog();
+    fireEvent.click(exactButton(secondLeave, "继续离开"));
+    await waitFor(() => expect(selectedValueById("scope-project")).toBe(PROJECT_ID_B));
+    expect(document.querySelector('section[aria-label="测试报告"]')?.textContent).not.toContain(`运行 ${RUN_ID.slice(0, 8)} 的报告`);
     expect(
       calls.some((call) =>
         call.method === "GET" &&
@@ -692,15 +817,16 @@ describe("独立页面的状态归属", () => {
   it("跨工作空间首帧同样拒绝旧报告意图", async () => {
     historyRuns = [{ ...RUN_REPORT.run, id: RUN_ID, state: "finished", outcome: "passed" }];
     await openCase();
-    fireEvent.click(screen.getByRole("button", { name: "任务中心" }));
-    const rowA = (await screen.findByText(RUN_ID.slice(0, 8))).closest("tr") as HTMLElement;
-    fireEvent.click(within(rowA).getByRole("button", { name: "查看报告" }));
-    await screen.findByRole("heading", { name: `运行 ${RUN_ID.slice(0, 8)} 的报告` });
+    fireEvent.click(primaryNavButton("任务中心"));
+    const tasks = await activePageRegion("任务中心");
+    const rowA = await waitForRunRow(tasks, RUN_ID);
+    fireEvent.click(viewReportButton(rowA));
+    await waitForReportHeading(await activePageRegion("测试报告"), RUN_ID);
 
-    await selectAntOption("工作空间", "第二工作空间");
-    await waitFor(() => expect(antSelectedValue("工作空间")).toBe(WORKSPACE_ID_B));
-    await waitFor(() => expect(antSelectedValue("项目")).toBe(PROJECT_ID_B));
-    expect(screen.queryByRole("heading", { name: `运行 ${RUN_ID.slice(0, 8)} 的报告` })).toBeNull();
+    await selectScopeOption("scope-workspace", "工作空间", "第二工作空间");
+    await waitFor(() => expect(selectedValueById("scope-workspace")).toBe(WORKSPACE_ID_B));
+    await waitFor(() => expect(selectedValueById("scope-project")).toBe(PROJECT_ID_B));
+    expect(document.querySelector('section[aria-label="测试报告"]')?.textContent).not.toContain(`运行 ${RUN_ID.slice(0, 8)} 的报告`);
     expect(
       calls.some((call) =>
         call.method === "GET" &&

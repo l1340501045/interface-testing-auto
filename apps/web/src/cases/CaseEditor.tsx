@@ -14,7 +14,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button, Collapse, Modal } from "antd";
 
 import { ApiError, apiSend, apiSendWithMeta, projectPath } from "../api/client";
-import { toAssertionTypes, toCaseDetail, toCaseVersion, toCurlPreview, toVariableContext } from "../api/guards";
+import { toAssertionTypes, toCaseDetail, toCaseVersion, toCurlPreview, toServiceCatalog, toVariableContext } from "../api/guards";
 import type {
   AssertionResult,
   AssertionType,
@@ -25,6 +25,9 @@ import type {
   Folder,
   RunReport,
   ResolutionLocation,
+  ProjectService,
+  ServiceCatalog,
+  TargetRefV2,
   VariableContext,
 } from "../api/types";
 import { ErrorText, Hint, Loading, Notice } from "../components/Feedback";
@@ -50,7 +53,7 @@ import { ResponseFieldPanel } from "./ResponseFieldPanel";
 import { scheduleEditorFieldFocus } from "./resolutionFocus";
 import { RunPanel, type RunProvenance } from "../runs/RunPanel";
 import { matchesResolutionEvidence } from "../runs/runEvidence";
-import { emptyRequest, newRequestRow, rawToSpec, requestToRaw, sameRequest, upgradeRequestV2, type RawKeyValue, type RawRequest } from "./requestDraft";
+import { emptyRequest, newRequestRow, preserveServiceTarget, rawToSpec, requestToRaw, sameRequest, upgradeRequestV2, type RawKeyValue, type RawRequest } from "./requestDraft";
 import { useFieldTree } from "./useFieldTree";
 
 /** 正文类型的短标签，用在请求体标签上；不写“有”这种没有信息量的词。 */
@@ -59,6 +62,7 @@ const BODY_TYPE_LABEL: Record<string, string> = {
   text: "文本",
   form: "表单",
 };
+const EMPTY_SERVICES: ProjectService[] = [];
 
 /**
  * 当前查看的运行：来源 + run_id。
@@ -312,6 +316,7 @@ export function CaseEditor({
     environmentId: string | null;
     configEpoch: number;
     contextFingerprint: string | null;
+    targetRef: TargetRefV2 | null;
   } | null>(null);
   const [creating, setCreating] = useState(false);
   const [versionOperationActive, setVersionOperationActive] = useState(false);
@@ -383,12 +388,22 @@ export function CaseEditor({
   const [editorKey] = useState(() => newEditorInstance());
   const editorRootRef = useRef<HTMLElement>(null);
   const editRevisionRef = useRef(0);
+  const [serviceCatalogRequested, setServiceCatalogRequested] = useState(false);
+  const services = useResource<ServiceCatalog>(
+    active && serviceCatalogRequested ? `${workspaceId}/${projectId}/services` : null,
+    (signal) => apiSend(projectPath(workspaceId, projectId, "/services"), "GET", undefined, toServiceCatalog, { signal }),
+  );
+  const selectedServiceKey = request.service_contract === 1 && request.service_key ? request.service_key : "default";
+  // 已保存named请求在成为活动标签时按需确认目录；隐藏的其余标签不常驻加载。
+  useEffect(() => {
+    if (active && selectedServiceKey !== "default") setServiceCatalogRequested(true);
+  }, [active, selectedServiceKey]);
   const variableContext = useResource<VariableContext>(
     active && selectedEnvironmentId !== null
-      ? `${workspaceId}/${projectId}/${currentUserId ?? ""}/${editorKey}/${selectedEnvironmentId}/${configEpoch}`
+      ? `${workspaceId}/${projectId}/${currentUserId ?? ""}/${editorKey}/${selectedEnvironmentId}/${selectedServiceKey}/${configEpoch}`
       : null,
     (signal) => apiSend(
-      projectPath(workspaceId, projectId, `/variable-context?environment_id=${encodeURIComponent(selectedEnvironmentId ?? "")}`),
+      projectPath(workspaceId, projectId, `/variable-context?environment_id=${encodeURIComponent(selectedEnvironmentId ?? "")}${selectedServiceKey === "default" ? "" : `&service_key=${encodeURIComponent(selectedServiceKey)}`}`),
       "GET",
       undefined,
       toVariableContext,
@@ -954,7 +969,11 @@ export function CaseEditor({
     displayedReport.context !== null &&
     preflightIsCurrent &&
     debug.preflight?.context != null &&
-    matchesResolutionEvidence(displayedReport, debug.preflight.resolution?.context_fingerprint) &&
+    matchesResolutionEvidence(
+      displayedReport,
+      debug.preflight.resolution?.context_fingerprint,
+      debug.preflight.resolution?.schema_version === 2 ? debug.preflight.resolution.target_ref : null,
+    ) &&
     // 两个标记都要比：snapshot 覆盖请求与断言，input 覆盖普通变量；环境除了 id 还要比
     // 地址——同一条环境记录被改了 base_url，运行就不再是打到同一个目标。
     displayedReport.context.snapshot_fingerprint === debug.preflight.context.snapshot_fingerprint &&
@@ -992,7 +1011,7 @@ export function CaseEditor({
     selection?.source === "history" &&
     displayedReport.run.target_type === "case_version" &&
     displayedReport.run.environment_id === selectedEnvironmentId &&
-    matchesResolutionEvidence(displayedReport, versionProvenance?.contextFingerprint) &&
+    matchesResolutionEvidence(displayedReport, versionProvenance?.contextFingerprint, versionProvenance?.targetRef) &&
     versionProvenanceMatches &&
     !dirty &&
     draftSnapshotHash !== null &&
@@ -1035,7 +1054,7 @@ export function CaseEditor({
     const epoch = getConfigEpoch === undefined ? configEpoch : getConfigEpoch();
     if (epoch === null) return null;
     if (selectedEnvironmentId === null) return null;
-    return { environmentId: selectedEnvironmentId, configEpoch: epoch, contextFingerprint: null };
+    return { environmentId: selectedEnvironmentId, configEpoch: epoch, contextFingerprint: null, targetRef: null };
   }, [getConfigEpoch, configEpoch, selectedEnvironmentId]);
 
   /**
@@ -1044,7 +1063,7 @@ export function CaseEditor({
    * **不在此刻读取时钟**：到这里时配置可能已经变了，而这次运行用的仍是提交时的配置。
    */
   const handleRunSubmitted = useCallback((runId: string, provenance: RunProvenance) => {
-    setVersionProvenance({ runId, ...provenance, contextFingerprint: provenance.contextFingerprint ?? null });
+    setVersionProvenance({ runId, ...provenance, contextFingerprint: provenance.contextFingerprint ?? null, targetRef: provenance.targetRef ?? null });
   }, []);
 
   /** 用户点选项目／环境历史里的某条运行：这是**显式**的来源切换。 */
@@ -1404,7 +1423,9 @@ export function CaseEditor({
         currentRequest = requestRef.current;
         currentAssertions = assertionsRef.current;
       }
-      let next = requestToRaw(preview.draft);
+      // cURL 只描述来源 URL，不代表用户要切换项目服务。已有标签继续保留明确选择；
+      // 新请求本来就是 default（两字段缺席），因此也不会猜命名服务。
+      let next = preserveServiceTarget(currentRequest, requestToRaw(preview.draft));
       let nextAssertions = currentAssertions;
       if (currentRequest.schema_version === 2 || hasAssertions) {
         const upgraded = upgradeRequestV2(currentRequest, currentAssertions);
@@ -1586,6 +1607,14 @@ export function CaseEditor({
             <SendBar
               idPrefix={domIdPrefix ? `${domIdPrefix}-send` : undefined}
               request={request}
+              services={services.data?.items ?? EMPTY_SERVICES}
+              servicesLoading={services.loading}
+              servicesError={services.error?.message ?? null}
+              servicesLoaded={services.data !== null}
+              onReloadServices={services.reload}
+              onRequestServices={() => setServiceCatalogRequested(true)}
+              interactive={active}
+              servicesRequested={serviceCatalogRequested}
               environments={environments}
               selectedEnvironmentId={selectedEnvironmentId}
               onSelectEnvironment={onSelectEnvironment}

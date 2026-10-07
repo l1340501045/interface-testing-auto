@@ -320,15 +320,41 @@ describe("独立用例库", () => {
       </AppProviders>,
     );
 
-    const activeName = await screen.findByText("查询订单");
-    const activeRow = activeName.closest("tr");
-    if (activeRow === null) throw new Error("活动用例不在表格行内");
-    const legacyRow = screen.getByText("旧目录用例").closest("tr");
-    if (legacyRow === null) throw new Error("旧目录用例不在表格行内");
-    expect(within(legacyRow).getByText("旧目录归档，待整理")).toBeTruthy();
-    expect((within(legacyRow).getByRole("button", { name: "打开" }) as HTMLButtonElement).disabled).toBe(true);
+    const library = document.querySelector<HTMLElement>('section[aria-label="用例库内容"]');
+    if (library === null) throw new Error("用例库区域未挂载");
+    expect(library.getAttribute("aria-label")).toBe("用例库内容");
+    const tree = library.querySelector<HTMLElement>('[aria-label="用例目录与个人集合"]');
+    if (tree === null) throw new Error("用例目录与个人集合未挂载");
 
-    fireEvent.click(within(screen.getByLabelText("用例目录与个人集合")).getByText("订单目录"));
+    const tableRow = async (name: string): Promise<HTMLTableRowElement> => waitFor(() => {
+      const matches = Array.from(library.querySelectorAll<HTMLTableRowElement>(".ant-table-tbody .ant-table-row"))
+        .filter((row) => row.textContent?.includes(name));
+      if (matches.length !== 1) throw new Error(`用例“${name}”所在行数量不是 1：${matches.length}`);
+      return matches[0];
+    });
+    const treeTitle = (label: string): HTMLElement => {
+      const matches = Array.from(tree.querySelectorAll<HTMLElement>(".ant-tree-title"))
+        .filter((title) => title.textContent?.trim() === label);
+      if (matches.length !== 1) throw new Error(`目录项“${label}”数量不是 1：${matches.length}`);
+      return matches[0];
+    };
+    const rowButton = (row: HTMLTableRowElement, name: string, ariaLabel?: string): HTMLButtonElement => {
+      const matches = Array.from(row.querySelectorAll<HTMLButtonElement>("button"))
+        .filter((button) => ariaLabel === undefined
+          ? button.textContent?.trim() === name
+          : button.getAttribute("aria-label") === ariaLabel);
+      if (matches.length !== 1) throw new Error(`用例行按钮“${ariaLabel ?? name}”数量不是 1：${matches.length}`);
+      expect(matches[0].type).toBe("button");
+      return matches[0];
+    };
+
+    const activeRow = await tableRow("查询订单");
+    const legacyRow = await tableRow("旧目录用例");
+    expect(activeRow.textContent).toContain("查询订单");
+    expect(legacyRow.textContent).toContain("旧目录归档，待整理");
+    expect(rowButton(legacyRow, "打开").disabled).toBe(true);
+
+    fireEvent.click(treeTitle("订单目录"));
     await waitFor(() => {
       const path = [...calls.get].reverse().find((item) => item.includes("/case-library?"));
       expect(path).toBeDefined();
@@ -340,33 +366,32 @@ describe("独立用例库", () => {
       }));
     });
 
-    const tree = screen.getByLabelText("用例目录与个人集合");
-    fireEvent.click(within(tree).getByText("最近打开"));
+    fireEvent.click(treeTitle("最近打开"));
     await waitFor(() => {
       const path = [...calls.get].reverse().find((item) => item.includes("/case-library?"));
       const query = new URLSearchParams(path?.split("?")[1] ?? "");
       expect({ collection: query.get("collection"), sort: query.get("sort") }).toEqual({ collection: "recent", sort: "recent_desc" });
     });
-    expect(screen.getByLabelText("排序").closest(".ant-select")?.textContent).toContain("最近打开时间");
+    const sort = library.querySelector<HTMLElement>('[aria-label="排序"]');
+    if (sort === null) throw new Error("排序选择器未挂载");
+    expect(sort.closest(".ant-select")?.textContent).toContain("最近打开时间");
     for (const label of ["全部用例", "未分组", "我的收藏", "订单目录"]) {
-      fireEvent.click(within(tree).getByText(label));
+      fireEvent.click(treeTitle(label));
       await waitFor(() => {
         const path = [...calls.get].reverse().find((item) => item.includes("/case-library?"));
         expect(new URLSearchParams(path?.split("?")[1] ?? "").get("sort")).not.toBe("recent_desc");
       });
     }
 
-    const filteredRow = screen.getByText("查询订单").closest("tr");
-    if (filteredRow === null) throw new Error("筛选后活动用例不在表格行内");
-    fireEvent.click(within(filteredRow).getByRole("button", { name: "收藏 查询订单" }));
+    const filteredRow = await tableRow("查询订单");
+    fireEvent.click(rowButton(filteredRow, "", "收藏 查询订单"));
     await waitFor(() => expect(calls.send).toContainEqual(expect.objectContaining({
       method: "PUT",
       body: { favorite: true },
     })));
 
-    const refreshedRow = screen.getByText("查询订单").closest("tr");
-    if (refreshedRow === null) throw new Error("收藏后活动用例不在表格行内");
-    fireEvent.click(within(refreshedRow).getByRole("button", { name: "打开" }));
+    const refreshedRow = await tableRow("查询订单");
+    fireEvent.click(rowButton(refreshedRow, "打开"));
     await waitFor(() => expect(onOpen).toHaveBeenCalledWith("22222222-2222-4222-8222-222222222222"));
   });
 

@@ -229,6 +229,47 @@ def test_legacy_bad_address_is_reported_as_an_environment_problem(
     )
 
 
+def test_status_only_patch_maps_legacy_bad_default_and_rolls_back(
+    client: TestClient, account: dict, project: dict
+) -> None:
+    environment = create_environment(client, account, project, name="状态原子回滚")
+    bad_url = "legacy-without-scheme:8080"
+    connection = migrator_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE app.environments SET base_url=%s WHERE id=%s",
+                (bad_url, environment["id"]),
+            )
+            cursor.execute(
+                "UPDATE app.environment_service_versions v SET base_url=%s "
+                "FROM app.environment_service_mappings m, app.project_services s "
+                "WHERE v.id=m.current_version_id AND m.service_id=s.id AND s.is_default "
+                "AND m.environment_id=%s",
+                (bad_url, environment["id"]),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+    rejected = client.patch(
+        f"{project_base(account, project)}/environments/{environment['id']}",
+        json={"status": "archived"},
+        headers={"If-Match": str(environment["rev"])},
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert rejected.json()["code"] == "environment_url_invalid"
+    connection = migrator_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT status, rev, base_url FROM app.environments WHERE id=%s",
+                (environment["id"],),
+            )
+            assert cursor.fetchone() == ("active", environment["rev"], bad_url)
+    finally:
+        connection.close()
+
+
 def test_valid_address_outside_allowlist_stays_a_request_problem(
     client: TestClient, account: dict, project: dict
 ) -> None:

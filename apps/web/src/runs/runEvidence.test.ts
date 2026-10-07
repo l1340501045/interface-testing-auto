@@ -24,4 +24,20 @@ describe("报告的 S1 来源证明", () => {
     expect(matchesResolutionEvidence(old, "source-a")).toBe(false);
     expect(matchesResolutionEvidence({ ...report(), resolution: null }, "source-a")).toBe(false);
   });
+
+  it("schema2还必须匹配冻结target与新worker guard", () => {
+    const target = {
+      kind: "service" as const, service_id: "s1", service_key: "svc_11111111111111111111111111111111", service_rev: 2,
+      mapping_id: "m1", mapping_rev: 3, mapping_version_id: "mv1", mapping_version: 3, environment_id: "e1",
+    };
+    const schema2: RunReport = {
+      ...report(),
+      resolution: { ...report().resolution!, schema_version: 2, target_ref: target },
+      context: { ...report().context!, resolution: { schema_version: 2, guard: "selected_target_binding_enforced_v1", context_fingerprint: "source-a", binding_fingerprint: "binding-a", target_fingerprint: "target-a" } },
+    };
+    expect(matchesResolutionEvidence(schema2, "source-a", target)).toBe(true);
+    expect(matchesResolutionEvidence(schema2, "source-a", { ...target, mapping_rev: 4 })).toBe(false);
+    expect(matchesResolutionEvidence(schema2, "source-a", null)).toBe(false);
+    expect(matchesResolutionEvidence(report(), "source-a", target)).toBe(false);
+  });
 });

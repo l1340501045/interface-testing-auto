@@ -27,6 +27,8 @@ export interface RawRequest {
   imported_origin?: string;
   /** 必须使用当前环境登录态；见 RequestSpec.auth_required。缺省即“跟随环境”。 */
   auth_required?: boolean;
+  service_contract?: 1;
+  service_key?: string;
 }
 
 export function ltrimPath(value: string): string {
@@ -57,7 +59,20 @@ export function requestToRaw(spec: RequestSpec): RawRequest {
   if (spec.imported_origin) raw.imported_origin = spec.imported_origin;
   // 只在为 true 时带上：写一个 false 会让服务端摘要与既有版本、既有授权都不同。
   if (spec.auth_required === true) raw.auth_required = true;
+  if (spec.service_contract === 1 && spec.service_key) {
+    raw.service_contract = 1;
+    raw.service_key = spec.service_key;
+  }
   return raw;
+}
+
+/** cURL 不携带项目服务语义；应用到已有标签时只保留该标签明确选择的服务。 */
+export function preserveServiceTarget(current: RawRequest, imported: RawRequest): RawRequest {
+  if (current.service_contract === 1 && current.service_key) {
+    return { ...imported, service_contract: 1, service_key: current.service_key };
+  }
+  const { service_contract: _contract, service_key: _key, ...defaultRequest } = imported;
+  return defaultRequest;
 }
 
 function cleanV1Rows(rows: RawKeyValue[]): { name: string; value: string }[] {
@@ -181,6 +196,7 @@ export function rawToSpec(raw: RawRequest, assertions: CaseAssertion[] = []): Re
     body: raw.body_type === "none" ? "" : raw.body,
     ...(raw.imported_origin ? { imported_origin: raw.imported_origin } : {}),
     ...(raw.auth_required === true ? { auth_required: true } : {}),
+    ...(raw.service_contract === 1 && raw.service_key ? { service_contract: 1 as const, service_key: raw.service_key } : {}),
   };
   // 复用与响应相同的运行时校验，避免界面拼出后端不接受的结构。
   return toRequestSpec(spec);

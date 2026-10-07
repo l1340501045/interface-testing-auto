@@ -23,6 +23,7 @@ import {
   ENVIRONMENT_URL_IP_EXAMPLE,
 } from "./environmentUrl";
 import { EnvironmentPanel } from "./EnvironmentPanel";
+import { ServiceConfigPanel } from "./ServiceConfigPanel";
 
 const WS = "11111111-1111-4111-8111-111111111111";
 const PROJECT = "22222222-2222-4222-8222-222222222222";
@@ -238,6 +239,56 @@ describe("环境编辑", () => {
     expect(names.map((input) => input.value).sort()).toEqual(["base", "flag"]);
     // 布尔变量的取值控件应当直接选中 true，而不是让人从 "true"/"false" 文本里猜。
     expect(antSelectedValue("值")).toBe("true");
+  });
+});
+
+const SERVICE_MAPPING_KEY = "svc_11111111111111111111111111111111";
+function serviceCatalogFixture() { return { schema_version: 1, items: [
+  { id: "s0", service_key: "default", name: "默认服务", is_default: true, status: "active", rev: 1, created_at: "t", updated_at: "t" },
+  { id: "s1", service_key: SERVICE_MAPPING_KEY, name: "订单服务", is_default: false, status: "active", rev: 1, created_at: "t", updated_at: "t" },
+] }; }
+function serviceConfigFixture(rev: number, mappingRev: number) { return {
+  schema_version: 1,
+  environment: { id: "e1", name: "测试环境", kind: "test", status: "active", rev, config_version: rev },
+  inheritance: { identity: { mode: "shared_environment", state: "ready", profile_id: "profile" }, pool: { state: "ready", id: "pool", name: "默认池", status: "active" } },
+  items: [
+    { service_id: "s0", service_key: "default", service_name: "默认服务", is_default: true, service_status: "active", service_rev: 1, mapping: { id: "m0", rev: 1, status: "active", base_url: "http://default", version: 1, version_id: "mv0" }, availability: "ready" },
+    { service_id: "s1", service_key: SERVICE_MAPPING_KEY, service_name: "订单服务", is_default: false, service_status: "active", service_rev: 1, mapping: { id: "m1", rev: mappingRev, status: "active", base_url: "http://orders-old", version: mappingRev, version_id: `mv${mappingRev}` }, availability: "ready" },
+  ],
+}; }
+
+describe("环境服务映射修订保护", () => {
+  beforeEach(() => apiSendMock.mockReset());
+  it("冲突刷新不偷换草稿基线，明确采用新修订后才以新If-Match保存", async () => {
+    let getCount = 0;
+    const patches: Array<{ body: unknown; headers: Record<string, string> | undefined }> = [];
+    apiSendMock.mockImplementation((async (path: string, method: string, body: unknown, parse: (raw: unknown) => unknown, options?: { headers?: Record<string, string> }) => {
+      if (path === undefined) return undefined;
+      if (method === "GET" && path.endsWith("/services")) return parse(serviceCatalogFixture());
+      if (method === "GET" && path.endsWith("/service-config")) { getCount += 1; return parse(getCount === 1 ? serviceConfigFixture(1, 1) : serviceConfigFixture(2, 2)); }
+      if (method === "PATCH" && path.endsWith("/service-config")) {
+        patches.push({ body, headers: options?.headers });
+        if (options?.headers?.["If-Match"] !== "2") throw new ApiError(409, "config_revision_conflict", "配置已更新", null);
+        return parse(serviceConfigFixture(3, 3));
+      }
+      throw new Error(`未覆盖请求：${method} ${path}`);
+    }) as never);
+    const changed = vi.fn();
+    const view = render(<ServiceConfigPanel workspaceId="w1" projectId="p1" environmentId="e1" canEdit onChanged={changed} />);
+    fireEvent.click(screen.getByRole("button", { name: /服务目录与环境映射/ }));
+    expect((await screen.findAllByText("订单服务")).length).toBeGreaterThanOrEqual(2);
+    const configure = view.container.querySelector(`[data-row-key="${SERVICE_MAPPING_KEY}"] button`);
+    expect(configure).not.toBeNull(); fireEvent.click(configure!);
+    fireEvent.change(screen.getByRole("textbox", { name: "服务映射地址" }), { target: { value: "http://orders-new" } });
+    fireEvent.click(screen.getByRole("button", { name: /保存\s*映射/ }));
+    await screen.findByText(/草稿已保留/); await waitFor(() => expect(getCount).toBe(2));
+    expect(patches[0]).toMatchObject({ headers: { "If-Match": "1" }, body: { items: [{ service_key: SERVICE_MAPPING_KEY, expected_mapping_rev: 1 }] } });
+    fireEvent.click(screen.getByRole("button", { name: /保存\s*映射/ }));
+    expect(patches[1]?.headers).toEqual({ "If-Match": "1" });
+    await act(async () => { fireEvent.click(await screen.findByRole("button", { name: /采用最新修订/ })); });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: /保存\s*映射/ })); });
+    expect(patches[2]).toMatchObject({ headers: { "If-Match": "2" }, body: { items: [{ service_key: SERVICE_MAPPING_KEY, expected_mapping_rev: 2, base_url: "http://orders-new" }] } });
+    expect(changed).toHaveBeenCalledTimes(1);
   });
 });
 

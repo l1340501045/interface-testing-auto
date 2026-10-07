@@ -25,6 +25,11 @@ function isReservedPlaceholder(url: string): boolean {
 }
 
 describe("validateEnvironmentUrl 接受完整服务地址", () => {
+  it("500字符上限按Unicode字符计数，不把非BMP路径按两个字符拒绝", () => {
+    expect(validateEnvironmentUrl(`http://echo/${"😀".repeat(488)}`)).toBeNull();
+    expect(validateEnvironmentUrl(`http://echo/${"😀".repeat(489)}`)).toBe("环境地址最多 500 个字符。");
+  });
+
   it.each([
     "http://echo:8080",
     "https://api.example.test",

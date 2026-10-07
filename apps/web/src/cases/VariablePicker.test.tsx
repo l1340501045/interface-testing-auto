@@ -37,7 +37,7 @@ describe("变量选择与来源", () => {
     second.focus();
     second.setSelectionRange(1, 3);
     fireEvent.select(second);
-    await selectAntOption("插入变量到查询参数值 2", "地区.代码 · string · 环境配置第 4 版");
+    await selectAntOption("插入变量到查询参数值 2", "地区.代码 · string · 环境修订 4");
     expect(onChange).toHaveBeenCalledTimes(1);
     expect(onChange.mock.calls[0]?.[0]).toEqual([
       expect.objectContaining({ value: "keep" }),
@@ -52,7 +52,7 @@ describe("变量选择与来源", () => {
     const picker = screen.getByRole("combobox", { name: "插入变量到查询参数值 1" });
     fireEvent.mouseDown(picker);
     view.rerender(<KeyValueRows rows={rows} label="查询参数" addLabel="添加" kind="query" version={2} readOnly={false} onChange={onChange} ownerRevision="owner:2" variablePicker={{ context, loading: false, error: null }} />);
-    const option = await screen.findByText("地区.代码 · string · 环境配置第 4 版");
+    const option = await screen.findByText("地区.代码 · string · 环境修订 4");
     fireEvent.click(option);
     expect(onChange).not.toHaveBeenCalled();
   });
@@ -60,7 +60,7 @@ describe("变量选择与来源", () => {
   it("来源抽屉显示生效环境项及被覆盖项目项的独立类型", () => {
     render(<VariableSourceDrawer context={context} loading={false} error={null} onReload={vi.fn()} />, { wrapper: AppProviders });
     fireEvent.click(screen.getByRole("button", { name: "查看变量来源" }));
-    expect(screen.getByText("环境配置第 4 版")).toBeTruthy();
+    expect(screen.getByText("环境修订 4")).toBeTruthy();
     expect(screen.getByText(/项目变量第 3 版/)).toBeTruthy();
     expect(screen.getByText("9007199254740993")).toBeTruthy();
   });

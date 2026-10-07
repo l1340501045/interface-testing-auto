@@ -42,14 +42,16 @@ const preview = {
   resolution_context: "version-resolution-context",
 };
 let runResponses: unknown[] = [];
+let previewResponse: unknown = preview;
 function setRunResponses(...responses: unknown[]) { runResponses = responses; }
 
 describe("固定版本运行受理确认", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     runResponses = [];
+    previewResponse = preview;
     vi.mocked(apiSend).mockImplementation((async (path: string, _method: string, _body: unknown, parse: (raw: unknown) => unknown) => {
-      if (path.endsWith("/resolution-preview")) return parse(preview);
+      if (path.endsWith("/resolution-preview")) return parse(previewResponse);
       const next = runResponses.shift();
       if (next instanceof Error) throw next;
       return parse(next);
@@ -92,6 +94,35 @@ describe("固定版本运行受理确认", () => {
     expect(first[2]).toEqual({ environment_id: "e1", case_version_id: version.id, resolution_context: "version-resolution-context" });
     expect(second[2]).toEqual(first[2]);
     expect(second[4]?.headers?.["Idempotency-Key"]).toBe(first[4]?.headers?.["Idempotency-Key"]);
+  });
+
+  it("固定版本只采用版本预览返回的服务A目标并随受理依据上报", async () => {
+    const targetRef = {
+      kind: "service", service_id: "s-a", service_key: "svc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", service_rev: 2,
+      mapping_id: "m-a", mapping_rev: 4, mapping_version_id: "mv-a", mapping_version: 4, environment_id: "e1",
+    };
+    previewResponse = {
+      ...preview,
+      schema_version: 2,
+      selected_target: {
+        kind: "service", service_id: "s-a", service_key: "svc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", service_name: "服务A", service_rev: 2,
+        service_status: "active", availability: "ready",
+        mapping: { id: "m-a", rev: 4, status: "active", base_url: "http://service-a", version: 4, version_id: "mv-a" },
+      },
+      target_ref: targetRef,
+    };
+    setRunResponses({ id: "77777777-7777-4777-8777-777777777777" });
+    const submitted = vi.fn();
+    render(<RunPanel workspaceId="w1" projectId="p1" environmentId="e1" caseId={version.case_id} needsVersion={false} publishedVersion={version} onEnsureVersion={vi.fn()} onReport={vi.fn()} selectedRunId={null} onSelectRun={vi.fn()} onRunSubmitted={submitted} captureProvenance={() => ({ environmentId: "e1", configEpoch: 3 })} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "保存并执行" }));
+    await waitFor(() => expect(submitted).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(apiSend).mock.calls[0]?.[2]).toEqual({ environment_id: "e1", case_version_id: version.id });
+    expect(vi.mocked(apiSend).mock.calls[1]?.[2]).toEqual({ environment_id: "e1", case_version_id: version.id, resolution_context: "version-resolution-context" });
+    expect(submitted).toHaveBeenCalledWith("77777777-7777-4777-8777-777777777777", expect.objectContaining({
+      contextFingerprint: "version-context-fingerprint",
+      targetRef,
+    }));
   });
 
   it("成功信封缺少 id 时保留原操作，确认仍使用原 body 与键", async () => {

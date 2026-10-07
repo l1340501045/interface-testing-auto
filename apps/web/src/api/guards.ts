@@ -49,6 +49,12 @@ import type {
   VariableSource,
   AvailableVariableSource,
   FrozenResolution,
+  EnvironmentServiceConfig,
+  ProjectService,
+  SelectedTarget,
+  ServiceCatalog,
+  ServiceMapping,
+  TargetRefV2,
   ValueLiteral,
   Workspace,
   WorkspaceMember,
@@ -311,6 +317,18 @@ export function toRequestSpec(raw: unknown, field = "request"): RequestSpec {
     body_type: normalizedBodyType,
     body: asString(spec.body ?? "", `${field}.body`),
   };
+  const hasServiceContract = Object.prototype.hasOwnProperty.call(spec, "service_contract");
+  const hasServiceKey = Object.prototype.hasOwnProperty.call(spec, "service_key");
+  let serviceTarget: { service_contract: 1; service_key: string } | Record<string, never> = {};
+  if (hasServiceContract !== hasServiceKey) throw new ContractError(`${field} 的服务协议与服务标识必须同时存在`);
+  if (hasServiceContract) {
+    if (asInteger(spec.service_contract, `${field}.service_contract`, 1) !== 1) {
+      throw new ContractError(`${field}.service_contract 仅支持 1`);
+    }
+    const serviceKey = asString(spec.service_key, `${field}.service_key`);
+    if (!/^svc_[0-9a-f]{32}$/.test(serviceKey)) throw new ContractError(`${field}.service_key 不是有效的命名服务标识`);
+    serviceTarget = { service_contract: 1, service_key: serviceKey };
+  }
   let result: RequestSpec;
   if (schemaVersion === undefined) {
     for (const [index, item] of [...asArray(spec.query_params, `${field}.query_params`), ...asArray(spec.headers, `${field}.headers`)].entries()) {
@@ -321,7 +339,7 @@ export function toRequestSpec(raw: unknown, field = "request"): RequestSpec {
     }
     const queryParams = mapList(spec.query_params, `${field}.query_params`, itemGuard(`${field}.query_params`, toNameValue));
     const headers = mapList(spec.headers, `${field}.headers`, itemGuard(`${field}.headers`, toNameValue));
-    result = { ...common, query_params: queryParams, headers };
+    result = { ...common, ...serviceTarget, query_params: queryParams, headers };
   } else {
     const queryParams = mapList(spec.query_params, `${field}.query_params`, itemGuard(`${field}.query_params`, toRequestRowV2));
     const headers = mapList(spec.headers, `${field}.headers`, itemGuard(`${field}.headers`, toRequestRowV2));
@@ -333,7 +351,7 @@ export function toRequestSpec(raw: unknown, field = "request"): RequestSpec {
       if (ids.has(row.row_id)) throw new ContractError(`请求行 ID 重复：${row.row_id}`);
       ids.add(row.row_id);
     }
-    result = { ...common, schema_version: 2, query_params: queryParams, headers };
+    result = { ...common, ...serviceTarget, schema_version: 2, query_params: queryParams, headers };
   }
   const origin = asNullableString(spec.imported_origin, `${field}.imported_origin`);
   if (origin !== null) result.imported_origin = origin;
@@ -429,13 +447,177 @@ export function toEnvironmentList(raw: unknown): Environment[] {
   return mapList(raw, "环境列表", (item, index) => toEnvironmentItem(item, `环境[${index}]`));
 }
 
+const SERVICE_AVAILABILITIES = new Set(["ready", "environment_archived", "service_archived", "mapping_disabled", "mapping_missing", "config_inconsistent"]);
+
+function toServiceMapping(raw: unknown, field: string): ServiceMapping {
+  const record = asRecord(raw, field);
+  const status = asEnum<ServiceMapping["status"]>(record.status, `${field}.status`, new Set(["active", "disabled", "archived"]));
+  return {
+    id: asString(record.id, `${field}.id`),
+    rev: asInteger(record.rev, `${field}.rev`, 1),
+    status,
+    base_url: asString(record.base_url, `${field}.base_url`),
+    version: asInteger(record.version, `${field}.version`, 1),
+    version_id: asString(record.version_id, `${field}.version_id`),
+  };
+}
+
+function toSelectedTarget(raw: unknown, field: string): SelectedTarget {
+  const record = asRecord(raw, field);
+  const kind = asEnum<SelectedTarget["kind"]>(record.kind, `${field}.kind`, new Set(["default", "service"]));
+  const serviceKey = asString(record.service_key, `${field}.service_key`);
+  const serviceStatus = asEnum<SelectedTarget["service_status"]>(record.service_status, `${field}.service_status`, new Set(["active", "archived"]));
+  const availability = asEnum<SelectedTarget["availability"]>(record.availability, `${field}.availability`, SERVICE_AVAILABILITIES);
+  if (kind === "default" && (serviceKey !== "default" || serviceStatus !== "active")) throw new ContractError(`${field} 默认服务形状不一致`);
+  if (kind === "service" && !/^svc_[0-9a-f]{32}$/.test(serviceKey)) throw new ContractError(`${field}.service_key 不是命名服务标识`);
+  if (kind === "service" && availability === "service_archived" && serviceStatus !== "archived") throw new ContractError(`${field} 服务归档状态不一致`);
+  if (kind === "service" && (availability === "ready" || availability === "mapping_disabled") && serviceStatus !== "active") {
+    throw new ContractError(`${field} 活动服务状态不一致`);
+  }
+  const mapping = record.mapping === null ? null : toServiceMapping(record.mapping, `${field}.mapping`);
+  const requiresMapping = ["ready", "environment_archived", "service_archived", "mapping_disabled"].includes(availability);
+  if (requiresMapping !== (mapping !== null)) throw new ContractError(`${field}.mapping 与 availability 不一致`);
+  if (kind === "default" && ["service_archived", "mapping_disabled", "mapping_missing"].includes(availability)) throw new ContractError(`${field} 默认服务可用状态无效`);
+  if (kind === "default" && mapping !== null && mapping.status !== "active" && mapping.status !== "archived") throw new ContractError(`${field} 默认映射状态无效`);
+  if (kind === "service" && mapping !== null && mapping.status === "archived") throw new ContractError(`${field} 命名服务映射状态无效`);
+  if (kind === "default" && mapping !== null) {
+    if (availability === "ready" && mapping.status !== "active") throw new ContractError(`${field} 默认映射可用状态不一致`);
+    if (availability === "environment_archived" && mapping.status !== "archived") throw new ContractError(`${field} 默认映射停用状态不一致`);
+  }
+  if (kind === "service" && mapping !== null) {
+    if (availability === "mapping_disabled" && mapping.status !== "disabled") throw new ContractError(`${field} 命名映射暂停状态不一致`);
+    if (availability === "ready" && mapping.status !== "active") throw new ContractError(`${field} 命名映射启用状态不一致`);
+    // 环境/服务归档优先于映射暂停：归档发生前已经disabled的映射仍是合法历史状态。
+    if ((availability === "environment_archived" || availability === "service_archived")
+      && mapping.status !== "active" && mapping.status !== "disabled") {
+      throw new ContractError(`${field} 归档服务的命名映射状态无效`);
+    }
+  }
+  return {
+    kind,
+    service_id: asString(record.service_id, `${field}.service_id`),
+    service_key: serviceKey,
+    service_name: asString(record.service_name, `${field}.service_name`),
+    service_rev: asInteger(record.service_rev, `${field}.service_rev`, 1),
+    service_status: serviceStatus,
+    availability,
+    mapping,
+  };
+}
+
+function toTargetRefV2(raw: unknown, field: string): TargetRefV2 {
+  const record = asRecord(raw, field);
+  const kind = asEnum<TargetRefV2["kind"]>(record.kind, `${field}.kind`, new Set(["default", "service"]));
+  const serviceKey = asString(record.service_key, `${field}.service_key`);
+  if ((kind === "default" && serviceKey !== "default") || (kind === "service" && !/^svc_[0-9a-f]{32}$/.test(serviceKey))) {
+    throw new ContractError(`${field} 目标类型与服务标识不一致`);
+  }
+  return {
+    kind,
+    service_id: asString(record.service_id, `${field}.service_id`),
+    service_key: serviceKey,
+    service_rev: asInteger(record.service_rev, `${field}.service_rev`, 1),
+    mapping_id: asString(record.mapping_id, `${field}.mapping_id`),
+    mapping_rev: asInteger(record.mapping_rev, `${field}.mapping_rev`, 1),
+    mapping_version_id: asString(record.mapping_version_id, `${field}.mapping_version_id`),
+    mapping_version: asInteger(record.mapping_version, `${field}.mapping_version`, 1),
+    environment_id: asString(record.environment_id, `${field}.environment_id`),
+  };
+}
+
+function toProjectService(raw: unknown, field: string): ProjectService {
+  const record = asRecord(raw, field);
+  const isDefault = asBoolean(record.is_default, `${field}.is_default`);
+  const serviceKey = asString(record.service_key, `${field}.service_key`);
+  const status = asEnum<ProjectService["status"]>(record.status, `${field}.status`, new Set(["active", "archived"]));
+  if (isDefault ? serviceKey !== "default" || status !== "active" : !/^svc_[0-9a-f]{32}$/.test(serviceKey)) {
+    throw new ContractError(`${field} 服务类型与稳定标识不一致`);
+  }
+  return {
+    id: asString(record.id, `${field}.id`), service_key: serviceKey,
+    name: asString(record.name, `${field}.name`), is_default: isDefault, status,
+    rev: asInteger(record.rev, `${field}.rev`, 1),
+    created_at: asString(record.created_at, `${field}.created_at`), updated_at: asString(record.updated_at, `${field}.updated_at`),
+  };
+}
+
+export function toServiceCatalog(raw: unknown): ServiceCatalog {
+  const record = asRecord(raw, "服务目录");
+  if (asInteger(record.schema_version, "服务目录.schema_version", 1) !== 1) throw new ContractError("服务目录.schema_version 不受支持");
+  const items = mapList(record.items, "服务目录.items", (item, index) => toProjectService(item, `服务目录.items[${index}]`));
+  if (items.filter((item) => item.is_default).length !== 1) throw new ContractError("服务目录必须且只能包含一个默认服务");
+  if (new Set(items.map((item) => item.id)).size !== items.length || new Set(items.map((item) => item.service_key)).size !== items.length) {
+    throw new ContractError("服务目录包含重复资源或稳定标识");
+  }
+  return { schema_version: 1, items };
+}
+
+export function toProjectServiceResponse(raw: unknown): ProjectService {
+  return toProjectService(raw, "服务");
+}
+
+export function toEnvironmentServiceConfig(raw: unknown): EnvironmentServiceConfig {
+  const record = asRecord(raw, "环境服务配置");
+  if (asInteger(record.schema_version, "环境服务配置.schema_version", 1) !== 1) throw new ContractError("环境服务配置.schema_version 不受支持");
+  const environment = asRecord(record.environment, "环境服务配置.environment");
+  const environmentStatus = asEnum(environment.status, "环境服务配置.environment.status", new Set(["active", "archived"]));
+  const inheritance = asRecord(record.inheritance, "环境服务配置.inheritance");
+  const identity = asRecord(inheritance.identity, "环境服务配置.inheritance.identity");
+  if (asString(identity.mode, "环境服务配置.inheritance.identity.mode") !== "shared_environment") throw new ContractError("环境身份继承模式未知");
+  const identityState = asEnum<EnvironmentServiceConfig["inheritance"]["identity"]["state"]>(identity.state, "环境服务配置.inheritance.identity.state", new Set(["unchecked", "none", "ready", "unavailable", "ambiguous"]));
+  let decodedIdentity: EnvironmentServiceConfig["inheritance"]["identity"];
+  if (identityState === "ready" || identityState === "unavailable") {
+    const profile = identity.profile_id;
+    decodedIdentity = { mode: "shared_environment", state: identityState, ...(profile === undefined ? {} : { profile_id: asString(profile, "环境服务配置.inheritance.identity.profile_id") }) };
+  } else {
+    if (identity.profile_id !== undefined) throw new ContractError("当前环境身份状态不能返回 profile_id");
+    decodedIdentity = { mode: "shared_environment", state: identityState };
+  }
+  const pool = asRecord(inheritance.pool, "环境服务配置.inheritance.pool");
+  const poolState = asEnum<EnvironmentServiceConfig["inheritance"]["pool"]["state"]>(pool.state, "环境服务配置.inheritance.pool.state", new Set(["ready", "disabled", "not_granted", "missing"]));
+  const decodedPool: EnvironmentServiceConfig["inheritance"]["pool"] = poolState === "missing"
+    ? { state: "missing" }
+    : { state: poolState, id: asString(pool.id, "环境服务配置.inheritance.pool.id"), name: asString(pool.name, "环境服务配置.inheritance.pool.name"), status: asEnum(pool.status, "环境服务配置.inheritance.pool.status", new Set(["active", "disabled"])) };
+  if (decodedPool.state === "ready" && decodedPool.status !== "active") throw new ContractError("可用执行池必须为 active");
+  if (decodedPool.state === "disabled" && decodedPool.status !== "disabled") throw new ContractError("停用执行池状态不一致");
+  if (decodedPool.state === "not_granted" && decodedPool.status !== "active") throw new ContractError("未授权执行池必须为 active");
+  const items = mapList(record.items, "环境服务配置.items", (item, index) => {
+    const field = `环境服务配置.items[${index}]`;
+    const entry = asRecord(item, field);
+    const target = toSelectedTarget({
+      kind: asBoolean(entry.is_default, `${field}.is_default`) ? "default" : "service",
+      service_id: entry.service_id, service_key: entry.service_key, service_name: entry.service_name,
+      service_rev: entry.service_rev, service_status: entry.service_status,
+      availability: entry.availability, mapping: entry.mapping,
+    }, field);
+    return { ...target, is_default: target.kind === "default" };
+  });
+  if (items.filter((item) => item.is_default).length !== 1 || new Set(items.map((item) => item.service_key)).size !== items.length) {
+    throw new ContractError("环境服务配置必须包含唯一默认服务且不能重复服务标识");
+  }
+  const defaultItem = items.find((item) => item.is_default)!;
+  if (defaultItem.mapping !== null && defaultItem.mapping.status !== environmentStatus) throw new ContractError("默认服务映射状态必须与环境状态一致");
+  return {
+    schema_version: 1,
+    environment: {
+      id: asString(environment.id, "环境服务配置.environment.id"), name: asString(environment.name, "环境服务配置.environment.name"),
+      kind: asString(environment.kind, "环境服务配置.environment.kind"), status: environmentStatus,
+      rev: asInteger(environment.rev, "环境服务配置.environment.rev", 1),
+      config_version: environment.config_version === null ? null : asInteger(environment.config_version, "环境服务配置.environment.config_version", 1),
+    },
+    inheritance: { identity: decodedIdentity, pool: decodedPool },
+    items,
+  };
+}
+
 export function toVariableContext(raw: unknown): VariableContext {
   const record = asRecord(raw, "变量目录");
-  if (asInteger(record.schema_version, "变量目录.schema_version", 1) !== 1) {
+  const schemaVersion = asInteger(record.schema_version, "变量目录.schema_version", 1);
+  if (schemaVersion !== 1 && schemaVersion !== 2) {
     throw new ContractError("变量目录.schema_version 不受支持");
   }
   return {
-    schema_version: 1,
+    schema_version: schemaVersion,
     scope: toResolutionScope(record.scope, "变量目录.scope"),
     config_basis: toConfigBasis(record.config_basis, "变量目录.config_basis"),
     variables: mapList(record.variables, "变量目录.variables", (item, index) => {
@@ -464,12 +646,14 @@ export function toVariableContext(raw: unknown): VariableContext {
         unavailable_reason: asNullableString(entry.unavailable_reason, `${field}.unavailable_reason`),
       };
     }),
+    ...(schemaVersion === 2 ? { selected_target: toSelectedTarget(record.selected_target, "变量目录.selected_target") } : {}),
   };
 }
 
 export function toResolutionPreview(raw: unknown): ResolutionPreview {
   const record = asRecord(raw, "解析预览");
-  if (asInteger(record.schema_version, "解析预览.schema_version", 1) !== 1) {
+  const schemaVersion = asInteger(record.schema_version, "解析预览.schema_version", 1);
+  if (schemaVersion !== 1 && schemaVersion !== 2) {
     throw new ContractError("解析预览.schema_version 不受支持");
   }
   const ordinary = asString(record.ordinary_resolution, "解析预览.ordinary_resolution");
@@ -488,8 +672,7 @@ export function toResolutionPreview(raw: unknown): ResolutionPreview {
   if (!["none", "ready", "needs_authorization", "unavailable", "ambiguous", "unchecked"].includes(authStatus)) {
     throw new ContractError("解析预览.auth.status 未知");
   }
-  return {
-    schema_version: 1,
+  const common: Omit<ResolutionPreview, "schema_version" | "selected_target" | "target_ref"> = {
     scope: toResolutionScope(record.scope, "解析预览.scope"),
     ready: asBoolean(record.ready, "解析预览.ready"),
     ordinary_resolution: ordinary,
@@ -515,6 +698,23 @@ export function toResolutionPreview(raw: unknown): ResolutionPreview {
     context_fingerprint: asString(record.context_fingerprint, "解析预览.context_fingerprint"),
     resolution_context: asNullableString(record.resolution_context, "解析预览.resolution_context"),
   };
+  if (schemaVersion === 1) return { schema_version: 1, ...common };
+  const selectedTarget = toSelectedTarget(record.selected_target, "解析预览.selected_target");
+  const targetRef = record.target_ref === null ? null : toTargetRefV2(record.target_ref, "解析预览.target_ref");
+  if (targetRef !== null && (targetRef.service_id !== selectedTarget.service_id || targetRef.service_key !== selectedTarget.service_key)) {
+    throw new ContractError("解析预览.target_ref 与 selected_target 不一致");
+  }
+  if (targetRef !== null && selectedTarget.availability !== "ready") throw new ContractError("解析预览不可用目标不能形成 target_ref");
+  if (targetRef !== null && (
+    selectedTarget.mapping === null
+    || targetRef.service_rev !== selectedTarget.service_rev
+    || targetRef.environment_id !== common.scope.environment_id
+    || targetRef.mapping_id !== selectedTarget.mapping.id
+    || targetRef.mapping_rev !== selectedTarget.mapping.rev
+    || targetRef.mapping_version_id !== selectedTarget.mapping.version_id
+    || targetRef.mapping_version !== selectedTarget.mapping.version
+  )) throw new ContractError("解析预览.target_ref 与当前映射坐标不一致");
+  return { schema_version: 2, ...common, selected_target: selectedTarget, target_ref: targetRef };
 }
 
 export function toFolderList(raw: unknown): Folder[] {
@@ -847,9 +1047,9 @@ function toFrozenResolution(raw: unknown): FrozenResolution | null {
   if (raw === null || raw === undefined) return null;
   try {
     const record = asRecord(raw, "运行报告.resolution");
-    if (asInteger(record.schema_version, "运行报告.resolution.schema_version", 1) !== 1) return null;
-    return {
-      schema_version: 1,
+    const schemaVersion = asInteger(record.schema_version, "运行报告.resolution.schema_version", 1);
+    if (schemaVersion !== 1 && schemaVersion !== 2) return null;
+    const common = {
       config_basis: toConfigBasis(record.config_basis, "运行报告.resolution.config_basis"),
       variable_sources: mapList(record.variable_sources, "运行报告.resolution.variable_sources", (item, index) => {
         const field = `运行报告.resolution.variable_sources[${index}]`;
@@ -865,6 +1065,9 @@ function toFrozenResolution(raw: unknown): FrozenResolution | null {
         toResolutionBinding(item, `运行报告.resolution.bindings[${index}]`)),
       context_fingerprint: asString(record.context_fingerprint, "运行报告.resolution.context_fingerprint"),
     };
+    return schemaVersion === 1
+      ? { schema_version: 1, ...common }
+      : { schema_version: 2, ...common, target_ref: toTargetRefV2(record.target_ref, "运行报告.resolution.target_ref") };
   } catch {
     // 新旁路字段损坏或版本未知只表示“冻结来源不可验证”，不能让旧报告基本内容不可读。
     return null;
@@ -882,18 +1085,20 @@ function toRunContext(raw: unknown): RunContext | null {
   if (resolution !== null && resolution !== undefined) {
     try {
         const proof = asRecord(resolution, "运行报告.context.resolution");
-        if (asInteger(proof.schema_version, "运行报告.context.resolution.schema_version", 1) !== 1) {
-          throw new ContractError("运行报告.context.resolution.schema_version 不受支持");
+        const schemaVersion = asInteger(proof.schema_version, "运行报告.context.resolution.schema_version", 1);
+        const guard = asString(proof.guard, "运行报告.context.resolution.guard");
+        const contextFingerprint = asString(proof.context_fingerprint, "运行报告.context.resolution.context_fingerprint");
+        const bindingFingerprint = asString(proof.binding_fingerprint, "运行报告.context.resolution.binding_fingerprint");
+        if (schemaVersion === 1 && guard === "ordinary_binding_enforced_v1") {
+          decodedResolution = { schema_version: 1, guard, context_fingerprint: contextFingerprint, binding_fingerprint: bindingFingerprint };
+        } else if (schemaVersion === 2 && guard === "selected_target_binding_enforced_v1") {
+          decodedResolution = {
+            schema_version: 2, guard, context_fingerprint: contextFingerprint, binding_fingerprint: bindingFingerprint,
+            target_fingerprint: asString(proof.target_fingerprint, "运行报告.context.resolution.target_fingerprint"),
+          };
+        } else {
+          throw new ContractError("运行报告.context.resolution 证明版本不受支持");
         }
-        if (asString(proof.guard, "运行报告.context.resolution.guard") !== "ordinary_binding_enforced_v1") {
-          throw new ContractError("运行报告.context.resolution.guard 不受支持");
-        }
-        decodedResolution = {
-          schema_version: 1 as const,
-          guard: "ordinary_binding_enforced_v1" as const,
-          context_fingerprint: asString(proof.context_fingerprint, "运行报告.context.resolution.context_fingerprint"),
-          binding_fingerprint: asString(proof.binding_fingerprint, "运行报告.context.resolution.binding_fingerprint"),
-        };
     } catch {
       decodedResolution = null;
     }
@@ -956,8 +1161,15 @@ export function toRunReport(raw: unknown): RunReport {
   const record = asRecord(raw, "运行报告");
   const request = record.request;
   const response = record.response;
+  const run = toRunSummary(record.run, "运行报告.run");
+  const context = toRunContext(record.context);
+  let resolution = toFrozenResolution(record.resolution);
+  if (resolution?.schema_version === 2 && (
+    resolution.target_ref.environment_id !== run.environment_id
+    || (context !== null && context.environment.id !== resolution.target_ref.environment_id)
+  )) resolution = null;
   return {
-    run: toRunSummary(record.run, "运行报告.run"),
+    run,
     steps: mapList(record.steps, "运行报告.steps", (item, index) =>
       toRunStep(item, `运行报告.steps[${index}]`),
     ),
@@ -980,8 +1192,8 @@ export function toRunReport(raw: unknown): RunReport {
     }),
     request: request === null || request === undefined ? null : asRecord(request, "运行报告.request"),
     response: response === null || response === undefined ? null : asRecord(response, "运行报告.response"),
-    context: toRunContext(record.context),
-    resolution: toFrozenResolution(record.resolution),
+    context,
+    resolution,
   };
 }
 

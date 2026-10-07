@@ -12,7 +12,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { Button, Collapse, Descriptions, Empty, Space, Table, Tag } from "antd";
 
 import { ApiError, apiSend, projectPath } from "../api/client";
-import type { CaseVersion, RunReport, RunSummary } from "../api/types";
+import type { CaseVersion, RunReport, RunSummary, TargetRefV2 } from "../api/types";
 import { toResolutionPreview } from "../api/guards";
 import { ErrorText, Hint, Loading, StatusTag } from "../components/Feedback";
 import { describeValue, literalToInput } from "../api/literals";
@@ -24,6 +24,7 @@ export interface RunProvenance {
   environmentId: string;
   configEpoch: number;
   contextFingerprint?: string | null;
+  targetRef?: TargetRefV2 | null;
 }
 
 function toRunId(raw: unknown): string | null {
@@ -38,6 +39,10 @@ function sourceValueLabel(value: import("../api/types").ValueLiteral | null): st
   const parsed = literalToInput(value);
   if (parsed === null) return "（无法显示）";
   return parsed.type === "null" ? "null" : parsed.text;
+}
+
+function frozenSourceLabel(source: import("../api/types").VariableSource): string {
+  return source.level === "environment" ? `环境修订 ${source.revision}` : `项目变量第 ${source.revision} 版`;
 }
 
 export function ReportView({ report }: { report: RunReport }) {
@@ -105,8 +110,16 @@ export function ReportView({ report }: { report: RunReport }) {
         />
       )}
 
-      <h4>冻结变量来源</h4>
-      {report.resolution == null ? <Hint>该运行没有记录 S1 变量来源；不会用当前配置补造历史。</Hint> : (
+      <h4>冻结目标与变量来源</h4>
+      {report.resolution == null ? <Hint>该运行没有可验证的冻结来源；不会用当前服务目录或变量配置补造历史。</Hint> : (
+        <>
+        {report.resolution.schema_version === 2 ? (
+          <Descriptions size="small" column={1} items={[
+            { key: "service", label: "服务目标", children: <code>{report.resolution.target_ref.service_key}</code> },
+            { key: "mapping", label: "环境映射版本", children: `第 ${report.resolution.target_ref.mapping_version} 版（修订 ${report.resolution.target_ref.mapping_rev}）` },
+            { key: "proof", label: "执行保护", children: report.context?.resolution?.schema_version === 2 && report.context.resolution.guard === "selected_target_binding_enforced_v1" ? "执行器已验证所选服务、映射与普通变量" : "未记录可验证的新执行保护" },
+          ]} />
+        ) : <Hint>这是默认服务的旧兼容记录，仅包含普通变量来源证明。</Hint>}
         <Table
           size="small"
           pagination={false}
@@ -114,10 +127,11 @@ export function ReportView({ report }: { report: RunReport }) {
           dataSource={report.resolution.variable_sources}
           columns={[
             { title: "变量", dataIndex: "name" },
-            { title: "实际来源", render: (_: unknown, item: NonNullable<RunReport["resolution"]>["variable_sources"][number]) => `${item.source.level === "environment" ? "环境" : "项目"}第 ${item.source.revision} 版：${sourceValueLabel(item.source.value)}` },
-            { title: "被覆盖来源", render: (_: unknown, item: NonNullable<RunReport["resolution"]>["variable_sources"][number]) => item.overridden_sources.length === 0 ? "无" : item.overridden_sources.map((source) => `${source.level === "environment" ? "环境" : "项目"}第 ${source.revision} 版：${sourceValueLabel(source.value)}`).join("；") },
+            { title: "实际来源", render: (_: unknown, item: NonNullable<RunReport["resolution"]>["variable_sources"][number]) => `${frozenSourceLabel(item.source)}：${sourceValueLabel(item.source.value)}` },
+            { title: "被覆盖来源", render: (_: unknown, item: NonNullable<RunReport["resolution"]>["variable_sources"][number]) => item.overridden_sources.length === 0 ? "无" : item.overridden_sources.map((source) => `${frozenSourceLabel(source)}：${sourceValueLabel(source.value)}`).join("；") },
           ]}
         />
+        </>
       )}
 
       <Collapse items={[{ key: "evidence", label: "脱敏后的请求与响应证据", children: <>
@@ -293,7 +307,11 @@ export function RunPanel({
         key: typeof crypto !== "undefined" && typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
         payload: { environment_id: environmentId, case_version_id: version.id, resolution_context: preview.resolution_context },
         version,
-        provenance: { ...provenance, contextFingerprint: preview.context_fingerprint },
+        provenance: {
+          ...provenance,
+          contextFingerprint: preview.context_fingerprint,
+          targetRef: preview.schema_version === 2 ? preview.target_ref : null,
+        },
       };
       keepOperation = await submitPending(pending, "initial");
     } catch (cause) {

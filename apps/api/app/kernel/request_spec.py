@@ -45,6 +45,10 @@ class RequestSpecError(ValueError):
     """请求定义非法，属于配置错误，发送前即拒绝。"""
 
 
+class ServiceSpecError(RequestSpecError):
+    """命名服务字段非法；与普通请求结构错误使用不同公开码。"""
+
+
 @dataclass
 class PreparedRequest:
     method: str
@@ -263,6 +267,8 @@ def validate_request(spec: dict[str, Any]) -> dict[str, Any]:
         "imported_origin",
         "auth_required",
         "schema_version",
+        "service_contract",
+        "service_key",
     }
 
     extra = set(spec) - allowed
@@ -276,6 +282,26 @@ def validate_request(spec: dict[str, Any]) -> dict[str, Any]:
         or schema_version != 2
     ):
         raise RequestSpecError(f"不支持的请求协议版本：{schema_version!r}")
+
+    has_service_contract = "service_contract" in spec
+    has_service_key = "service_key" in spec
+    if has_service_contract != has_service_key:
+        raise ServiceSpecError("命名服务请求必须同时包含 service_contract 与 service_key")
+    service_key: str | None = None
+    if has_service_contract:
+        service_contract = spec.get("service_contract")
+        service_key = spec.get("service_key")
+        if (
+            not isinstance(service_contract, int)
+            or isinstance(service_contract, bool)
+            or service_contract != 1
+        ):
+            raise ServiceSpecError("service_contract 必须是严格整数 1")
+        if (
+            not isinstance(service_key, str)
+            or re.fullmatch(r"svc_[0-9a-f]{32}", service_key) is None
+        ):
+            raise ServiceSpecError("service_key 不是合法的命名服务稳定标识")
 
     method = _text(spec.get("method", "GET"), "method").upper()
     if method not in _METHODS:
@@ -326,6 +352,9 @@ def validate_request(spec: dict[str, Any]) -> dict[str, Any]:
     }
     if schema_version == 2:
         normalized["schema_version"] = 2
+    if service_key is not None:
+        normalized["service_contract"] = 1
+        normalized["service_key"] = service_key
     imported = spec.get("imported_origin")
     if imported is not None:
         normalized["imported_origin"] = _text(imported, "imported_origin")
@@ -759,6 +788,7 @@ __all__ = [
     "PreparedRequest",
     "BindingEvent",
     "RequestSpecError",
+    "ServiceSpecError",
     "VariableResolutionError",
     "encode_query",
     "join_url",

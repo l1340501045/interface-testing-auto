@@ -18,6 +18,10 @@ const INITIAL_RUN_REJECTIONS = new Map<string, number>([
   ["client_contract_required", 409],
   ["resolution_context_changed", 409],
   ["config_inconsistent", 409],
+  ["service_invalid", 400],
+  ["service_unavailable", 409],
+  ["mapping_missing", 409],
+  ["service_contract_required", 409],
 ]);
 
 export function isInitialRunRejection(cause: unknown): cause is ApiError {

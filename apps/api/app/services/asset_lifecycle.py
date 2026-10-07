@@ -12,7 +12,12 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..api import deps
-from ..api.request_contract import is_v2, require_v2_capability
+from ..api.request_contract import (
+    is_named_service,
+    is_v2,
+    require_service_capability,
+    require_v2_capability,
+)
 from ..api.schemas import (
     AssetOperationCreate,
     AssetOperationOut,
@@ -514,6 +519,7 @@ def _rejected(session: Session, scope: deps.ProjectScope, key: str, action: str,
 def execute_operation(
     session: Session, scope: deps.ProjectScope, payload: AssetOperationCreate, key: str,
     request_contract: str | None = None,
+    service_contract: str | None = None,
 ) -> tuple[AssetOperationOut, bool, bool]:
     key = key.strip()
     if not _KEY.fullmatch(key):
@@ -553,6 +559,9 @@ def execute_operation(
             operation = _rejected(session, scope, key, payload.action, request_hash, "asset_state_conflict", "归档用例不能复制")
         else:
             require_v2_capability(request_contract, needed=is_v2(source.request))
+            require_service_capability(
+                service_contract, needed=is_named_service(source.request)
+            )
             try:
                 request = validate_request(copy.deepcopy(source.request))
                 assertions = validate_assertions(copy.deepcopy(source.assertions), request)
@@ -579,7 +588,8 @@ def execute_operation(
                         name = payload.name if payload.name is not None else f"{source.name[:197]} 副本"
                         copied = Case(
                             workspace_id=scope.workspace_id, project_id=scope.project_id,
-                            folder_id=folder_id, name=name, request=request, assertions=assertions,
+                            folder_id=folder_id, service_id=source.service_id,
+                            name=name, request=request, assertions=assertions,
                         )
                         session.add(copied)
                         session.flush()

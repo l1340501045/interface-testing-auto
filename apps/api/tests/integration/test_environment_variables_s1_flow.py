@@ -124,7 +124,7 @@ def test_config_writes_require_fresh_revision_and_append_environment_snapshot(
                 (environment["id"],),
             )
             row = cursor.fetchone()
-            assert row[:3] == (2, 2, 1)
+            assert row[:3] == (2, 2, 2)
             assert row[3]["variables"]["地区.代码"]["text"] == "cn"
             assert str(row[4]) == str(account["user_id"])
             cursor.execute(
@@ -237,7 +237,8 @@ def test_preview_and_first_admission_share_binding_and_idempotency_semantics(
     assert expired_context.json()["code"] == "resolution_context_changed"
     assert _counts(project["id"]) == (1, 1)
 
-    assert _run_once(project["pool_id"], worker_id="it-s1-resolution-worker") == "completed_unchecked"
+    outcome = _run_once(project["pool_id"], worker_id="it-s1-resolution-worker")
+    assert outcome == "completed_unchecked", get_report(client, account, project, run_id)
     report = get_report(client, account, project, run_id)
     assert report["resolution"]["context_fingerprint"] == resolved["context_fingerprint"]
     assert report["context"]["resolution"]["guard"] == "ordinary_binding_enforced_v1"

@@ -14,11 +14,11 @@
  * 地址预览只是预览：变量未解析、认证未注入，它可能不等于最终实际地址，因此含变量时
  * 明确标注，不冒充最终目标。
  */
-import { useRef, type ReactNode } from "react";
+import { useMemo, useRef, type ReactNode } from "react";
 import { Alert, Button, Checkbox, Collapse, Descriptions, Input, Select, Space } from "antd";
 import type { InputRef } from "antd";
 
-import type { DebugPreflight, Environment, PreflightIssue, ResolutionIssue, ResolutionLocation } from "../api/types";
+import type { DebugPreflight, Environment, PreflightIssue, ProjectService, ResolutionIssue, ResolutionLocation } from "../api/types";
 import type { AuthorizationView } from "./useDebugRun";
 import { Hint } from "../components/Feedback";
 import { METHODS, type VariablePickerState } from "../cases/RequestParts";
@@ -91,8 +91,27 @@ function locateResolutionIssue(issue: PreflightIssue, onLocate: (location: Resol
   if (isResolutionIssue(issue) && issue.location !== null) onLocate(issue.location);
 }
 
+export function serviceAvailabilityLabel(value: import("../api/types").ServiceAvailability): string {
+  switch (value) {
+    case "ready": return "映射已配置";
+    case "mapping_missing": return "尚未配置地址";
+    case "environment_archived": return "环境已停用";
+    case "service_archived": return "服务已停用";
+    case "mapping_disabled": return "当前环境中的服务地址已暂停";
+    case "config_inconsistent": return "服务配置不一致";
+  }
+}
+
 export function SendBar({
   request,
+  services = [],
+  servicesLoading = false,
+  servicesError = null,
+  servicesLoaded = false,
+  onReloadServices = () => undefined,
+  onRequestServices = () => undefined,
+  interactive = true,
+  servicesRequested = services.length > 0,
   environments,
   selectedEnvironmentId,
   onSelectEnvironment,
@@ -124,6 +143,15 @@ export function SendBar({
   onLocateIssue,
 }: {
   request: RawRequest;
+  services?: ProjectService[];
+  servicesLoading?: boolean;
+  servicesError?: string | null;
+  servicesLoaded?: boolean;
+  onReloadServices?: () => void;
+  onRequestServices?: () => void;
+  /** 隐藏的保活标签不挂载下拉弹层控制器；业务选择仍保存在父草稿。 */
+  interactive?: boolean;
+  servicesRequested?: boolean;
   environments: Environment[];
   selectedEnvironmentId: string | null;
   onSelectEnvironment: (environmentId: string) => void;
@@ -179,8 +207,28 @@ export function SendBar({
   const methodId = idPrefix ? `${idPrefix}-method` : "request-method";
   const pathId = idPrefix ? `${idPrefix}-path` : "request-path";
   const environmentId = idPrefix ? `${idPrefix}-environment` : "send-environment";
+  const serviceId = idPrefix ? `${idPrefix}-service` : "send-service";
   const environment = environments.find((item) => item.id === selectedEnvironmentId) ?? null;
-  const preview = environment === null ? null : addressPreview(environment.base_url, request);
+  const selectedServiceKey = request.service_contract === 1 && request.service_key ? request.service_key : "default";
+  const selectedService = services.find((item) => item.service_key === selectedServiceKey) ?? null;
+  const showServiceSelect = selectedServiceKey !== "default" || servicesRequested || services.length > 0;
+  const serviceOptions = useMemo(() => [
+    ...services.map((item) => ({
+      value: item.service_key,
+      label: `${item.name}${item.status === "archived" ? "（已停用）" : ""}`,
+      disabled: item.status === "archived" && item.service_key !== selectedServiceKey,
+    })),
+    ...(selectedService === null
+      ? [{ value: selectedServiceKey, label: servicesLoading
+        ? `${selectedServiceKey === "default" ? "默认服务" : "原服务"}（正在确认目录）`
+        : servicesError
+          ? `${selectedServiceKey === "default" ? "默认服务" : `原服务 ${selectedServiceKey}`}（目录加载失败）`
+          : !servicesLoaded
+            ? `${selectedServiceKey === "default" ? "默认服务" : `原服务 ${selectedServiceKey}`}（目录尚未确认）`
+            : selectedServiceKey === "default" ? "默认服务（已失效）" : `原服务 ${selectedServiceKey}（已失效）`, disabled: false }]
+      : []),
+  ], [selectedService, selectedServiceKey, services, servicesError, servicesLoaded, servicesLoading]);
+  const preview = environment === null || selectedServiceKey !== "default" ? null : addressPreview(environment.base_url, request);
   const pathRef = useRef<InputRef>(null);
   const pathSelectionRef = useRef({ start: request.path.length, end: request.path.length, ownerRevision: variableOwnerRevision });
   function capturePathSelection() {
@@ -199,7 +247,9 @@ export function SendBar({
       pathRef.current?.input?.setSelectionRange(inserted.cursor, inserted.cursor);
     });
   }
-  const methods = METHODS.includes(request.method) ? METHODS : [request.method, ...METHODS];
+  const methods = useMemo(() => METHODS.includes(request.method) ? METHODS : [request.method, ...METHODS], [request.method]);
+  const methodOptions = useMemo(() => methods.map((method) => ({ value: method, label: method })), [methods]);
+  const environmentOptions = useMemo(() => [{ value: "", label: "请选择环境" }, ...environments.map((item) => ({ value: item.id, label: `${item.name}（${item.kind === "production" ? "生产" : "测试"}）` }))], [environments]);
   const hasVariables =
     VARIABLE_PATTERN.test(request.path) ||
     request.query_params.some((row) => row.enabled !== false && VARIABLE_PATTERN.test(row.value));
@@ -252,7 +302,7 @@ export function SendBar({
             aria-label="方法"
             data-selected-value={request.method}
             onChange={(value: string) => onPatch({ method: value })}
-            options={methods.map((method) => ({ value: method, label: method }))}
+            options={methodOptions}
           />
         </span>
         <span className="param grow">
@@ -271,6 +321,22 @@ export function SendBar({
           />
           {variablePicker?.context ? <VariablePicker label="路径" location="path" context={variablePicker.context} loading={variablePicker.loading} error={variablePicker.error} disabled={readOnly} ownerRevision={variableOwnerRevision} onInsert={insertPath} /> : null}
         </span>
+        {interactive ? <span className="param">
+          <label htmlFor={serviceId}>服务</label>
+          {showServiceSelect ? <Select
+            id={serviceId}
+            value={selectedServiceKey}
+            disabled={readOnly}
+            loading={servicesLoading}
+            aria-label="请求服务"
+            data-selected-value={selectedServiceKey}
+            onOpenChange={(nextOpen) => { if (nextOpen) onRequestServices(); }}
+            onChange={(value: string) => onPatch(value === "default"
+              ? { service_contract: undefined, service_key: undefined }
+              : { service_contract: 1, service_key: value })}
+            options={serviceOptions}
+          /> : <Button htmlType="button" id={serviceId} aria-label="请求服务" onClick={onRequestServices}>默认服务</Button>}
+        </span> : null}
         <span className="param">
           <label htmlFor={environmentId}>执行环境</label>
           <Select
@@ -280,7 +346,7 @@ export function SendBar({
             aria-label="执行环境"
             data-selected-value={selectedEnvironmentId ?? ""}
             onChange={(value: string) => onSelectEnvironment(value)}
-            options={[{ value: "", label: "请选择环境" }, ...environments.map((item) => ({ value: item.id, label: `${item.name}（${item.kind === "production" ? "生产" : "测试"}）` }))]}
+            options={environmentOptions}
           />
         </span>
         <SendAction
@@ -295,6 +361,13 @@ export function SendBar({
         />
       </div>
 
+      {servicesError ? (
+        <Hint>服务目录加载失败（{servicesError}）。当前选择已保留，不会自动切回默认服务。<Button htmlType="button" type="link" onClick={onReloadServices}>重试加载</Button></Hint>
+      ) : null}
+      {selectedService?.status === "archived" || (servicesLoaded && selectedService === null && !servicesLoading && servicesError === null) ? (
+        <Hint>当前请求原服务已停用或不可见；选择仍保留，请恢复服务或明确改选其它服务。</Hint>
+      ) : null}
+
       <p className="caption address-preview">
         {invalidEnvironment
           ? "实际目标：环境地址不合法，暂时无法确定（请先在环境设置里修正该环境的地址）。"
@@ -308,11 +381,16 @@ export function SendBar({
                   ? "实际目标：尚未选择执行环境"
                   : "实际目标：尚未取得权威解析结果"}
       </p>
+      {preflight?.resolution?.schema_version === 2 ? (
+        <p className="caption" aria-label={`当前服务：${preflight.resolution.selected_target.service_name} · ${serviceAvailabilityLabel(preflight.resolution.selected_target.availability)}`}>
+          当前服务：{preflight.resolution.selected_target.service_name}
+          · {serviceAvailabilityLabel(preflight.resolution.selected_target.availability)}
+        </p>
+      ) : null}
       {preview !== null ? <p className="caption">配置预览：{preview}{hasVariables ? "（含变量，不能作为实际目标）" : ""}</p> : null}
       {request.imported_origin && environment !== null ? (
         <Hint>
-          导入来源为 {request.imported_origin}，与会选择的环境地址不一定相同；实际目标
-          始终由所选环境决定。
+          导入来源为 {request.imported_origin}，与会选择的环境地址不一定相同；实际目标始终由所选环境与服务共同决定。
         </Hint>
       ) : null}
 
@@ -468,6 +546,7 @@ function AuthorizationPrompt({
       <h3>本次授权确认</h3>
       <Descriptions size="small" column={1} items={[
         { key: "request", label: "请求", children: <code>{authorization.method} {authorization.path}</code> },
+        { key: "service", label: "服务", children: authorization.serviceName },
         { key: "environment", label: "环境", children: authorization.environmentLabel },
         { key: "identity", label: "身份", children: "当前环境登录态（按该环境配置的身份注入，不在此另选）" },
         { key: "principal", label: "被授权人", children: "当前登录账号本人" },

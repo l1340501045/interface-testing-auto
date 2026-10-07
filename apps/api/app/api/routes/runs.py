@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from ...config import Settings
 from ...db import get_db
 from ...kernel.assertion_spec import AssertionSpecError, validate_assertions
-from ...kernel.request_spec import RequestSpecError, validate_request
+from ...kernel.request_spec import RequestSpecError, ServiceSpecError, validate_request
 from ...models import AssertionResult, Environment, Run, RunStepAttempt
 from ...services.debug_context import (
     binding_is_current,
@@ -26,7 +26,7 @@ from ...services.debug_context import (
     read_resolution_proof,
     strip_guard_semantics,
 )
-from ...services.debug_preflight import inspect_auth_metadata, preflight
+from ...services.debug_preflight import PreflightIssue, inspect_auth_metadata, preflight
 from ...services.folder_graph import begin_consistent_read
 from ...services.permissions import can, require
 from ...services.resolution import (
@@ -47,9 +47,19 @@ from ...services.run_coordinator import (
 from ...services.run_coordinator import (
     debug_snapshot_digest as compute_debug_snapshot_digest,
 )
+from ...services.service_targets import (
+    ServiceTargetError,
+    inspect_selected_target,
+)
 from .. import deps
 from ..errors import ApiError, bad_request, conflict, forbidden, not_found
-from ..request_contract import has_row_locator, is_v2, require_v2_capability
+from ..request_contract import (
+    has_row_locator,
+    is_named_service,
+    is_v2,
+    require_service_capability,
+    require_v2_capability,
+)
 from ..schemas import (
     AssertionResultOut,
     DebugPreflightOut,
@@ -173,6 +183,7 @@ def start_run(
     response: Response,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     request_contract: str | None = Header(default=None, alias="X-Request-Contract"),
+    service_contract: str | None = Header(default=None, alias="X-Service-Contract"),
     scope: deps.ProjectScope = _EXECUTE_SCOPE,
     settings: Settings = Depends(deps.get_settings_dep),
     session: Session = Depends(get_db),
@@ -185,6 +196,9 @@ def start_run(
         require_v2_capability(
             request_contract, needed=is_v2(payload.debug_snapshot.request)
         )
+    # 这里只校验头本身的字面能力；named首次准入必须在幂等原结果查询之后，
+    # 否则同key/body去掉能力头的合法回放会被挡在原Run之前。
+    require_service_capability(service_contract, needed=False)
     try:
         run = create_run(
             session,
@@ -197,6 +211,7 @@ def start_run(
                 idempotency_key=idempotency_key,
                 source_case_id=payload.source_case_id,
                 resolution_context=payload.resolution_context,
+                service_capability=service_contract == "1",
             ),
         )
     except RunRejected as error:
@@ -207,7 +222,13 @@ def start_run(
             raise not_found("环境或用例版本不存在") from error
         if error.code == "idempotency_result_unavailable":
             raise ApiError(409, error.code, error.message) from error
-        if error.code in {"resolution_context_changed", "config_inconsistent"}:
+        if error.code in {
+            "resolution_context_changed",
+            "config_inconsistent",
+            "service_unavailable",
+            "mapping_missing",
+            "service_contract_required",
+        }:
             raise conflict(error.code, error.message) from error
         raise bad_request(error.code, error.message) from error
     response.headers["Location"] = (
@@ -223,6 +244,7 @@ def start_run(
 def debug_snapshot_digest(
     payload: DebugSnapshot,
     request_contract: str | None = Header(default=None, alias="X-Request-Contract"),
+    service_contract: str | None = Header(default=None, alias="X-Service-Contract"),
     scope: deps.ProjectScope = _EXECUTE_SCOPE,
 ) -> DebugSnapshotDigestOut:
     """计算调试快照摘要，供身份管理员据此签发一次性授权。
@@ -232,6 +254,7 @@ def debug_snapshot_digest(
     不构成权限提升——签发授权仍需要 `manage_secrets` 管理角色。
     """
     require_v2_capability(request_contract, needed=is_v2(payload.request))
+    require_service_capability(service_contract, needed=is_named_service(payload.request))
     try:
         digest = digest_for_debug_snapshot(
             RunRequest(environment_id=uuid.uuid4(), debug_snapshot=payload.model_dump())
@@ -248,6 +271,7 @@ def debug_snapshot_digest(
 def debug_preflight(
     payload: DebugPreflightRequest,
     request_contract: str | None = Header(default=None, alias="X-Request-Contract"),
+    service_contract: str | None = Header(default=None, alias="X-Service-Contract"),
     scope: deps.ProjectScope = _EXECUTE_SCOPE,
     settings: Settings = Depends(deps.get_settings_dep),
     session: Session = Depends(get_db),
@@ -263,6 +287,16 @@ def debug_preflight(
     require_v2_capability(
         request_contract, needed=is_v2(payload.debug_snapshot.request)
     )
+    require_service_capability(
+        service_contract, needed=is_named_service(payload.debug_snapshot.request)
+    )
+    try:
+        validate_request(payload.debug_snapshot.request)
+    except ServiceSpecError as error:
+        raise bad_request("service_invalid", str(error)) from error
+    except RequestSpecError:
+        # 原普通请求结构错误继续由旧preflight 200问题信封表达。
+        pass
     if payload.source_case_id is not None:
         try:
             _require_case_available(session, scope, payload.source_case_id)
@@ -275,6 +309,25 @@ def debug_preflight(
                 auth=PreflightAuthOut(required=False, state="none", profile_id=None),
                 context=None,
             )
+    environment_for_target = session.scalar(
+        select(Environment).where(
+            Environment.id == payload.environment_id,
+            Environment.project_id == scope.project_id,
+            Environment.status == "active",
+        )
+    )
+    selected = None
+    selected_summary = None
+    target_error = None
+    if environment_for_target is not None:
+        try:
+            selected_summary, selected, target_error = inspect_selected_target(
+                session, environment_for_target, validate_request(payload.debug_snapshot.request)
+            )
+        except ServiceTargetError as error:
+            raise ApiError(error.status_code, error.code, error.message) from error
+        except RequestSpecError:
+            selected_summary, selected, target_error = None, None, None
     result = preflight(
         session,
         settings,
@@ -283,7 +336,15 @@ def debug_preflight(
         role=scope.role,
         environment_id=payload.environment_id,
         snapshot=payload.debug_snapshot.model_dump(),
+        base_url=selected.base_url if selected is not None else None,
     )
+    if target_error is not None:
+        result.ready = False
+        result.context = None
+        if not any(item.code == target_error.code for item in result.issues):
+            result.issues.append(
+                PreflightIssue(target_error.code, target_error.message, "configure_environment")
+            )
     resolution: dict | None = None
     resolution_issues: list[PreflightIssueOut] = []
     try:
@@ -294,10 +355,18 @@ def debug_preflight(
                 Environment.status == "active",
             )
         )
-        if environment is not None:
+        if environment is not None and not (
+            target_error is not None and target_error.global_basis
+        ):
             request = validate_request(payload.debug_snapshot.request)
             assertions = list(payload.debug_snapshot.assertions)
             validate_assertions(assertions, request)
+            schema = 2 if service_contract == "1" else 1
+            target_ref = (
+                selected.target_ref(environment.id)
+                if selected is not None and target_error is None
+                else None
+            )
             resolution_value = build_resolution(
                 session,
                 settings,
@@ -313,7 +382,24 @@ def debug_preflight(
                     "injection_slots": result.injection_slots,
                     "requires_worker_verification": result.requires_worker_verification,
                 },
+                base_url=selected.base_url if selected is not None else environment.base_url,
+                resolution_schema_version=schema,
+                target_ref=target_ref if schema == 2 else None,
+                selected_target=selected_summary if schema == 2 else None,
             )
+            if target_error is not None:
+                resolution_value["issues"].append(
+                    _resolution_issue(
+                        target_error.code, target_error.message, "configure_environment"
+                    )
+                )
+                resolution_value["ready"] = False
+                resolution_value["masked_target"] = None
+                resolution_value["resolution_context"] = None
+            if not result.ready:
+                # 旧信封的环境、池与策略结论同样属于完整resolution.ready；普通配置
+                # 仍可独立签发context，不能因总ready=false把S1普通并发依据抹掉。
+                resolution_value["ready"] = False
             resolution = public_resolution(resolution_value)
             resolution_issues = [
                 PreflightIssueOut(
@@ -372,6 +458,7 @@ def _resolution_issue(code: str, message: str, action: str = "edit_request") -> 
 def resolution_preview(
     payload: ResolutionPreviewRequest,
     request_contract: str | None = Header(default=None, alias="X-Request-Contract"),
+    service_contract: str | None = Header(default=None, alias="X-Service-Contract"),
     scope: deps.ProjectScope = _VIEW_SCOPE,
     settings: Settings = Depends(deps.get_settings_dep),
     session: Session = Depends(get_db),
@@ -398,14 +485,35 @@ def resolution_preview(
         target_type, case_version_id, debug_source_case_id, request, assertions = _load_source(
             session, scope, run_request
         )
-        resolved = resolve_pool(session, settings, environment)
-        _request, target_origin = resolve_target(request, environment, resolved.guard)
+        require_service_capability(service_contract, needed=is_named_service(request))
+        selected_summary, selected, target_error = inspect_selected_target(
+            session, environment, request
+        )
+        if target_error is not None and target_error.global_basis:
+            raise ApiError(
+                target_error.status_code, target_error.code, target_error.message
+            )
+        pool_issue = None
+        try:
+            resolved = resolve_pool(session, settings, environment)
+        except RunRejected as error:
+            if error.code not in {
+                "pool_not_granted", "pool_unavailable", "pool_rebound", "pool_config_invalid"
+            }:
+                raise
+            resolved = None
+            pool_issue = error
+        target_origin = None
+        if selected is not None and resolved is not None:
+            _request, target_origin = resolve_target(
+                request, environment, resolved.guard, base_url=selected.base_url
+            )
         digest = (
             compute_debug_snapshot_digest(request, assertions)
             if target_type == "debug_snapshot"
             else None
         )
-        if can(scope.role, "execute"):
+        if can(scope.role, "execute") and target_origin is not None:
             auth, auth_issues = inspect_auth_metadata(
                 session,
                 environment=environment,
@@ -419,11 +527,12 @@ def resolution_preview(
         else:
             auth = {
                 "required": bool(request.get("auth_required")),
-                "status": "unchecked",
+                "status": "unchecked" if not can(scope.role, "execute") else "unavailable",
                 "injection_slots": [],
                 "requires_worker_verification": True,
             }
             auth_issues = []
+        schema = 2 if service_contract == "1" else 1
         value = build_resolution(
             session,
             settings,
@@ -434,7 +543,30 @@ def resolution_preview(
             source_kind=target_type,
             source_id=case_version_id or debug_source_case_id,
             auth=auth,
+            base_url=selected.base_url if selected is not None else environment.base_url,
+            resolution_schema_version=schema,
+            target_ref=(
+                selected.target_ref(environment.id)
+                if schema == 2 and selected is not None and target_error is None
+                else None
+            ),
+            selected_target=selected_summary if schema == 2 else None,
         )
+        if target_error is not None:
+            value["issues"].append(
+                _resolution_issue(
+                    target_error.code, target_error.message, "configure_environment"
+                )
+            )
+            value["ready"] = False
+            value["masked_target"] = None
+            value["resolution_context"] = None
+            value["target_ref"] = None
+        if pool_issue is not None:
+            value["issues"].append(
+                _resolution_issue(pool_issue.code, pool_issue.message, "configure_environment")
+            )
+            value["ready"] = False
         for issue in auth_issues:
             value["issues"].append(_resolution_issue(issue.code, issue.message, issue.action))
         if auth_issues:
@@ -442,6 +574,8 @@ def resolution_preview(
         return ResolutionPreviewOut(**public_resolution(value))
     except ResolutionError as error:
         raise conflict(error.code, error.message) from error
+    except ServiceTargetError as error:
+        raise ApiError(error.status_code, error.code, error.message) from error
     except RunRejected as error:
         if error.code in {"case_version_missing", "case_missing", "environment_missing"}:
             raise not_found("环境或用例版本不存在") from error
@@ -564,7 +698,14 @@ def _report_resolution(run: Run) -> RunFrozenResolutionOut | None:
     """只读冻结的 S1 来源白名单字段；坏旁路不影响旧报告基本读取。"""
     snapshot = run.snapshot if isinstance(run.snapshot, dict) else {}
     raw = snapshot.get("resolution")
-    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+    if not isinstance(raw, dict):
+        return None
+    schema_version = raw.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version not in (1, 2)
+    ):
         return None
     allowed = {
         "schema_version": raw.get("schema_version"),
@@ -572,6 +713,7 @@ def _report_resolution(run: Run) -> RunFrozenResolutionOut | None:
         "variable_sources": raw.get("variable_sources"),
         "bindings": raw.get("bindings"),
         "context_fingerprint": raw.get("context_fingerprint"),
+        "target_ref": raw.get("target_ref"),
     }
     try:
         return RunFrozenResolutionOut(**allowed)
@@ -586,6 +728,7 @@ def _report_resolution(run: Run) -> RunFrozenResolutionOut | None:
 def get_report(
     run_id: uuid.UUID,
     request_contract: str | None = Header(default=None, alias="X-Request-Contract"),
+    service_contract: str | None = Header(default=None, alias="X-Service-Contract"),
     scope: deps.ProjectScope = _VIEW_SCOPE,
     settings: Settings = Depends(deps.get_settings_dep),
     session: Session = Depends(get_db),
@@ -593,6 +736,18 @@ def get_report(
     """脱敏报告：请求与响应证据来自最后一次尝试，秘密已被遮蔽。"""
     run = _get_run(session, scope, run_id)
     snapshot = run.snapshot or {}
+    raw_resolution = snapshot.get("resolution")
+    raw_schema_version = (
+        raw_resolution.get("schema_version") if isinstance(raw_resolution, dict) else None
+    )
+    schema2 = (
+        isinstance(raw_schema_version, int)
+        and not isinstance(raw_schema_version, bool)
+        and raw_schema_version == 2
+    )
+    # 命名能力来自受理时写入的权威Run列；损坏target_ref不能把named伪装成default。
+    named_target = run.service_id is not None
+    require_service_capability(service_contract, needed=named_target)
     require_v2_capability(
         request_contract,
         needed=has_row_locator(snapshot.get("assertions")),
@@ -616,6 +771,12 @@ def get_report(
         if latest is not None
         else []
     )
+    context = _report_context(run, latest, settings)
+    frozen_resolution = _report_resolution(run)
+    if schema2 and service_contract != "1":
+        frozen_resolution = None
+        if context is not None:
+            context.resolution = None
     return RunReportOut(
         run=_run_out(run),
         steps=_run_steps_out(run, attempts),
@@ -635,8 +796,8 @@ def get_report(
         ],
         request=strip_guard_semantics(latest.request) if latest is not None else None,
         response=latest.response if latest is not None else None,
-        context=_report_context(run, latest, settings),
-        resolution=_report_resolution(run),
+        context=context,
+        resolution=frozen_resolution,
     )
 
 

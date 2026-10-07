@@ -10,6 +10,10 @@ describe("首次受理拒绝必须同时匹配 status 与 code", () => {
     [400, "credential_slot_conflict"],
     [409, "resolution_context_changed"],
     [409, "config_inconsistent"],
+    [400, "service_invalid"],
+    [409, "service_unavailable"],
+    [409, "mapping_missing"],
+    [409, "service_contract_required"],
   ])("识别 %s/%s 为受理前确定拒绝", (status, code) => {
     expect(isInitialRunRejection(new ApiError(status, code, "拒绝", null))).toBe(true);
   });

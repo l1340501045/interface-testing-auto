@@ -87,6 +87,8 @@ interface Operation {
   sourceCaseId: string | undefined;
   /** 发送时所选环境的名称：确认面板显示它，而不是当前选择。 */
   environmentLabel: string;
+  /** 本次发送预检返回的所选服务名称；不从之后变化的目录补读。 */
+  serviceName: string | null;
   /** 预检确认可用且本次用途尚未授权时的身份坐标；只有一次预检能写入它。 */
   profileId: string | null;
   /** 本次权威解析返回的不透明依据；unknown 确认继续复用这一份。 */
@@ -135,6 +137,8 @@ export interface AuthorizationView {
   environmentLabel: string;
   method: string;
   path: string;
+  serviceName: string;
+  serviceKey: string;
   profileId: string | null;
   principalId: string;
   ttlMinutes: number;
@@ -626,6 +630,7 @@ export function useDebugRun(
         submission,
         sourceCaseId,
         environmentLabel,
+        serviceName: null,
         profileId: null,
         resolutionContext: null,
       };
@@ -659,6 +664,9 @@ export function useDebugRun(
         return;
       }
       acceptCheckPreview(op, result);
+      op.serviceName = result.resolution?.schema_version === 2
+        ? result.resolution.selected_target.service_name
+        : result.resolution === null || result.resolution === undefined ? null : "默认服务";
       const resolutionContext = result.resolution?.resolution_context ?? null;
       if (result.resolution === null || result.resolution === undefined || result.resolution.ordinary_resolution !== "ready" || resolutionContext === null) {
         toIdle();
@@ -1014,6 +1022,11 @@ export function useDebugRun(
           environmentLabel: state.op.environmentLabel,
           method: state.op.submission.request.method,
           path: state.op.submission.request.path,
+          serviceName: state.op.serviceName
+            ?? (state.op.submission.request.service_contract === 1 ? "所选服务" : "默认服务"),
+          serviceKey: state.op.submission.request.service_contract === 1 && state.op.submission.request.service_key
+            ? state.op.submission.request.service_key
+            : "default",
           profileId: state.op.profileId,
           principalId: state.op.owner.principalId,
           ttlMinutes: AUTHORIZATION_TTL_MINUTES,

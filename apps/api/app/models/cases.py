@@ -52,6 +52,7 @@ class Case(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UniqueConstraint("workspace_id", "project_id", "id", name="uq_cases_ws_project_id"),
         project_fk("fk_cases_project"),
         project_object_fk(["folder_id"], "folders", "fk_cases_folder", ondelete="SET NULL"),
+        project_object_fk(["service_id"], "project_services", "fk_cases_service", ondelete="RESTRICT"),
         project_object_fk(
             ["archive_operation_id"],
             "asset_operations",
@@ -65,6 +66,7 @@ class Case(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, comment="工作空间范围")
     project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, comment="所属项目")
     folder_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, comment="所属目录")
+    service_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, comment="命名服务引用；默认及历史用例为空")
     name: Mapped[str] = mapped_column(String(200), nullable=False, comment="用例名称")
     request: Mapped[dict] = mapped_column(JSONB, nullable=False, comment="可视化请求定义（方法、服务路径、重复查询参数、请求头、正文）")
     assertions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default="[]", comment="草稿断言配置数组")
@@ -84,6 +86,7 @@ class CaseVersion(Base):
         UniqueConstraint("workspace_id", "project_id", "case_id", "version", name="uq_case_versions_version"),
         project_fk("fk_case_versions_project"),
         project_object_fk(["case_id"], "cases", "fk_case_versions_case", ondelete="CASCADE"),
+        project_object_fk(["service_id"], "project_services", "fk_case_versions_service", ondelete="RESTRICT"),
         CheckConstraint(
             "side_effect IN ('read','write','unknown')", name="side_effect"
         ),
@@ -96,6 +99,7 @@ class CaseVersion(Base):
     workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, comment="工作空间范围")
     project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, comment="所属项目")
     case_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, comment="源用例")
+    service_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, comment="该版本命名服务引用；默认及历史版本为空")
     version: Mapped[int] = mapped_column(Integer, nullable=False, comment="版本号，用例内递增")
     request: Mapped[dict] = mapped_column(JSONB, nullable=False, comment="请求定义不可变快照")
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1", comment="协议版本")

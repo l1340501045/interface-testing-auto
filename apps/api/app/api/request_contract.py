@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .errors import conflict
@@ -38,4 +39,31 @@ def require_v2_capability(contract: str | None, *, needed: bool) -> None:
         )
 
 
-__all__ = ["has_row_locator", "is_v2", "require_v2_capability"]
+def is_named_service(request: Any) -> bool:
+    return (
+        isinstance(request, dict)
+        and request.get("service_contract") == 1
+        and not isinstance(request.get("service_contract"), bool)
+        and isinstance(request.get("service_key"), str)
+        and re.fullmatch(r"svc_[0-9a-f]{32}", request["service_key"]) is not None
+    )
+
+
+def require_service_capability(contract: str | None, *, needed: bool) -> bool:
+    """返回客户端是否声明服务能力；named内容缺声明时拒绝。"""
+    supported = contract == "1"
+    if (contract is not None and not supported) or (needed and not supported):
+        raise conflict(
+            "service_contract_required",
+            "这份内容使用命名服务，请刷新页面后再读取或修改，避免把目标错误降为默认服务。",
+        )
+    return supported
+
+
+__all__ = [
+    "has_row_locator",
+    "is_named_service",
+    "is_v2",
+    "require_service_capability",
+    "require_v2_capability",
+]

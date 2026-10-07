@@ -7,6 +7,9 @@ import pytest
 from app.kernel.request_spec import prepare, validate_request
 from app.kernel.variables import VariableResolutionError, build_resolver, variable_references
 from app.services.debug_context import (
+    RESOLUTION_GUARD,
+    RESOLUTION_GUARD_KEY,
+    TARGET_RESOLUTION_GUARD,
     build_resolution_proof,
     read_resolution_proof,
     stamp_resolution_proof,
@@ -64,6 +67,25 @@ def test_resolution_proof_requires_new_snapshot_and_exact_worker_stamp() -> None
         )
         is None
     )
+    wrong_schema1_guard = {**evidence, RESOLUTION_GUARD_KEY: TARGET_RESOLUTION_GUARD}
+    assert read_resolution_proof(
+        wrong_schema1_guard,
+        snapshot,
+        key,
+        workspace_id=workspace_id,
+        project_id=project_id,
+        principal_id=principal_id,
+    ) is None
+    for damaged_guard in ([], {}, "unknown_guard_v1"):
+        damaged = {**evidence, RESOLUTION_GUARD_KEY: damaged_guard}
+        assert read_resolution_proof(
+            damaged,
+            snapshot,
+            key,
+            workspace_id=workspace_id,
+            project_id=project_id,
+            principal_id=principal_id,
+        ) is None
     assert build_resolution_proof(
         key,
         workspace_id=workspace_id,
@@ -71,6 +93,82 @@ def test_resolution_proof_requires_new_snapshot_and_exact_worker_stamp() -> None
         principal_id=principal_id,
         snapshot={"request": {}, "variables": {}},
     ) is None
+
+    schema2 = {
+        **snapshot,
+        "environment": {
+            "id": str(uuid.uuid4()),
+            "name": "测试",
+            "kind": "test",
+            "base_url": "http://echo:8080/base",
+        },
+        "request": {
+            "method": "GET",
+            "path": "/{{id}}",
+            "query_params": [],
+            "headers": [],
+            "body_type": "none",
+            "body": "",
+            "service_contract": 1,
+            "service_key": "svc_11111111111111111111111111111111",
+        },
+        "resolution": {
+            "schema_version": 2,
+            "context_fingerprint": "target-context-hmac",
+            "target_ref": {
+                "kind": "service",
+                "service_id": str(uuid.uuid4()),
+                "service_key": "svc_11111111111111111111111111111111",
+                "service_rev": 1,
+                "mapping_id": str(uuid.uuid4()),
+                "mapping_rev": 1,
+                "mapping_version_id": str(uuid.uuid4()),
+                "mapping_version": 1,
+                "environment_id": str(uuid.uuid4()),
+            },
+        },
+    }
+    target_proof = build_resolution_proof(
+        key,
+        workspace_id=workspace_id,
+        project_id=project_id,
+        principal_id=principal_id,
+        snapshot=schema2,
+    )
+    assert target_proof is not None
+    assert target_proof["guard"] == "selected_target_binding_enforced_v1"
+    assert target_proof["target_fingerprint"]
+    target_evidence = stamp_resolution_proof({}, target_proof)
+    read = read_resolution_proof(
+        target_evidence,
+        schema2,
+        key,
+        workspace_id=workspace_id,
+        project_id=project_id,
+        principal_id=principal_id,
+    )
+    assert read is not None
+    assert read["schema_version"] == 2
+    assert read["target_fingerprint"] == target_proof["target_fingerprint"]
+    wrong_schema2_guard = {**target_evidence, RESOLUTION_GUARD_KEY: RESOLUTION_GUARD}
+    assert read_resolution_proof(
+        wrong_schema2_guard,
+        schema2,
+        key,
+        workspace_id=workspace_id,
+        project_id=project_id,
+        principal_id=principal_id,
+    ) is None
+    for damaged_guard in ([], {}, "unknown_guard_v1"):
+        damaged = {**target_evidence, RESOLUTION_GUARD_KEY: damaged_guard}
+        assert read_resolution_proof(
+            damaged,
+            schema2,
+            key,
+            workspace_id=workspace_id,
+            project_id=project_id,
+            principal_id=principal_id,
+        ) is None
 
 
 def test_prepare_binding_events_have_stable_global_occurrence_indices() -> None:

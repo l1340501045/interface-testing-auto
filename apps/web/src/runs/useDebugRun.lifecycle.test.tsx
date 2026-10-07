@@ -116,6 +116,27 @@ function readyWith(fingerprint: string, token: string) {
   };
 }
 
+function namedNeedsAuth(serviceName = "订单服务") {
+  const serviceKey = "svc_11111111111111111111111111111111";
+  const selectedTarget = {
+    kind: "service" as const, service_id: "service-orders", service_key: serviceKey, service_name: serviceName,
+    service_rev: 2, service_status: "active" as const, availability: "ready" as const,
+    mapping: { id: "mapping-orders", rev: 3, status: "active" as const, base_url: "http://orders", version: 3, version_id: "mapping-version-orders" },
+  };
+  return {
+    ...NEEDS_AUTH,
+    resolution: {
+      ...NEEDS_AUTH.resolution,
+      schema_version: 2 as const,
+      selected_target: selectedTarget,
+      target_ref: {
+        kind: "service" as const, service_id: "service-orders", service_key: serviceKey, service_rev: 2,
+        mapping_id: "mapping-orders", mapping_rev: 3, mapping_version_id: "mapping-version-orders", mapping_version: 3, environment_id: ENV_ID,
+      },
+    },
+  };
+}
+
 function runSummary(id: string, state = "queued") {
   return {
     id,
@@ -275,6 +296,24 @@ describe("R3-02 同帧二次确认授权", () => {
     expect(grants()).toHaveLength(1);
     expect(runs()).toHaveLength(1);
     expect(runs()[0]?.body).toMatchObject({ resolution_context: "resolution-context-1" });
+  });
+
+  it("named授权确认显示本次发送预检冻结的服务名，后续展示结果不能换名", async () => {
+    const serviceKey = "svc_11111111111111111111111111111111";
+    const named = { ...submission(), request: { ...REQUEST, service_contract: 1 as const, service_key: serviceKey } };
+    preflightSequence = [namedNeedsAuth("订单服务"), namedNeedsAuth("后来改名的服务")];
+    const { result, rerender } = mount();
+    rerender({ epoch: 0, principal: USER_ID, inputKey: submissionKey(named), editorKey: "instance-1", sourceCaseId: undefined });
+
+    await act(async () => { await result.current.start(named, "测试环境"); });
+    expect(result.current.phase).toBe("awaiting_authorization");
+    expect(result.current.authorizationView).toMatchObject({ serviceName: "订单服务", serviceKey });
+
+    await act(async () => { await result.current.runPreflight(named); });
+    expect(result.current.preflight?.resolution?.schema_version).toBe(2);
+    expect(result.current.authorizationView).toMatchObject({ serviceName: "订单服务", serviceKey });
+    expect(grants()).toEqual([]);
+    expect(runs()).toEqual([]);
   });
 
   it("授权请求挂起期间再次确认不新增授权，也不新增运行", async () => {

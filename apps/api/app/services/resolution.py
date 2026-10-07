@@ -88,13 +88,16 @@ def load_variable_state(session: Session, environment: Environment) -> VariableS
             EnvironmentConfigVersion.environment_id == environment.id,
         )
     )
-    if config_version is None or config_version.schema_version != 1:
+    if config_version is None or config_version.schema_version not in {1, 2}:
         raise ResolutionError(
             "config_inconsistent", "环境当前配置版本缺失或结构不受支持，请联系管理员修复。"
         )
     snapshot = config_version.snapshot if isinstance(config_version.snapshot, dict) else {}
     snapshot_variables = snapshot.get("variables")
-    if snapshot.get("schema_version") != 1 or snapshot_variables != (environment.variables or {}):
+    if (
+        snapshot.get("schema_version") != config_version.schema_version
+        or snapshot_variables != (environment.variables or {})
+    ):
         raise ResolutionError(
             "config_inconsistent", "环境当前配置版本与配置投影不一致，请联系管理员修复。"
         )
@@ -311,6 +314,10 @@ def build_resolution(
     source_kind: str,
     source_id: uuid.UUID | None,
     auth: dict | None = None,
+    base_url: str | None = None,
+    resolution_schema_version: int = 1,
+    target_ref: dict | None = None,
+    selected_target: dict | None = None,
 ) -> dict:
     key = settings.load_secret_key()
     state = load_variable_state(session, environment)
@@ -323,7 +330,7 @@ def build_resolution(
             [{"name": name, "value": value} for name, value in state.merged.items()]
         )
         prepared = prepare(
-            request, environment.base_url, resolver, binding_events=events
+            request, base_url or environment.base_url, resolver, binding_events=events
         )
     except VariableResolutionError as error:
         if not any(not event.defined for event in events):
@@ -413,40 +420,46 @@ def build_resolution(
         }
         for name in sorted(state.sources)
     ]
+    context_payload = {
+        "scope": {
+            "workspace_id": str(environment.workspace_id),
+            "project_id": str(environment.project_id),
+            "environment_id": str(environment.id),
+            "principal_id": str(principal_id),
+        },
+        "source_fingerprint": source_fingerprint,
+        "config_basis": state.basis,
+        "variable_sources": variable_sources,
+        "bindings": bindings,
+    }
+    if resolution_schema_version == 2:
+        context_payload["target_ref"] = target_ref
     context_fingerprint = _hmac_hex(
         key,
         _CONTEXT_FINGERPRINT_PURPOSE,
-        {
-            "scope": {
-                "workspace_id": str(environment.workspace_id),
-                "project_id": str(environment.project_id),
-                "environment_id": str(environment.id),
-                "principal_id": str(principal_id),
-            },
-            "source_fingerprint": source_fingerprint,
-            "config_basis": state.basis,
-            "variable_sources": variable_sources,
-            "bindings": bindings,
-        },
+        context_payload,
     )
     if ordinary_ready:
+        token_payload = {
+            "kind": "resolution",
+            "schema_version": resolution_schema_version,
+            "workspace_id": str(environment.workspace_id),
+            "project_id": str(environment.project_id),
+            "environment_id": str(environment.id),
+            "principal_id": str(principal_id),
+            "source_fingerprint": source_fingerprint,
+            "config_basis": state.basis,
+            "context_fingerprint": context_fingerprint,
+            "expires_at": int((datetime.now(UTC) + _CONTEXT_TTL).timestamp()),
+        }
+        if resolution_schema_version == 2:
+            token_payload["target_ref"] = target_ref
         resolution_context = _sign_context(
             key,
-            {
-                "kind": "resolution",
-                "schema_version": 1,
-                "workspace_id": str(environment.workspace_id),
-                "project_id": str(environment.project_id),
-                "environment_id": str(environment.id),
-                "principal_id": str(principal_id),
-                "source_fingerprint": source_fingerprint,
-                "config_basis": state.basis,
-                "context_fingerprint": context_fingerprint,
-                "expires_at": int((datetime.now(UTC) + _CONTEXT_TTL).timestamp()),
-            },
+            token_payload,
         )
     return {
-        "schema_version": 1,
+        "schema_version": resolution_schema_version,
         "scope": {
             "workspace_id": str(environment.workspace_id),
             "project_id": str(environment.project_id),
@@ -462,13 +475,15 @@ def build_resolution(
         "context_fingerprint": context_fingerprint,
         "resolution_context": resolution_context,
         "_snapshot": {
-            "schema_version": 1,
+            "schema_version": resolution_schema_version,
             "config_basis": state.basis,
             "variable_sources": variable_sources,
             "bindings": bindings,
             "context_fingerprint": context_fingerprint,
+            **({"target_ref": target_ref} if resolution_schema_version == 2 else {}),
         },
         "_merged_variables": state.merged,
+        **({"selected_target": selected_target, "target_ref": target_ref} if resolution_schema_version == 2 else {}),
     }
 
 
@@ -483,6 +498,8 @@ def verify_resolution_context(
     source_kind: str,
     source_id: uuid.UUID | None,
     basis: dict,
+    resolution_schema_version: int = 1,
+    target_ref: dict | None = None,
 ) -> str:
     """校验解析依据并返回受理时应写入快照的 context fingerprint。"""
     key = settings.load_secret_key()
@@ -512,7 +529,7 @@ def verify_resolution_context(
     )
     expected_fields = {
         "kind": "resolution",
-        "schema_version": 1,
+        "schema_version": resolution_schema_version,
         "workspace_id": str(environment.workspace_id),
         "project_id": str(environment.project_id),
         "environment_id": str(environment.id),
@@ -520,6 +537,8 @@ def verify_resolution_context(
         "source_fingerprint": expected_source,
         "config_basis": basis,
     }
+    if resolution_schema_version == 2:
+        expected_fields["target_ref"] = target_ref
     if any(payload.get(name) != value for name, value in expected_fields.items()):
         raise ResolutionError("resolution_context_changed", "配置或请求已变化，请重新预览后发送。")
     expires_at = payload.get("expires_at")

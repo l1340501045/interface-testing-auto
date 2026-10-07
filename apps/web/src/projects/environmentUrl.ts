@@ -131,6 +131,7 @@ function splitAuthority(authority: string): { host: string; port: string } | str
  */
 export function validateEnvironmentUrl(raw: string): string | null {
   const text = trimSpaces(raw);
+  if ([...text].length > 500) return "环境地址最多 500 个字符。";
   if (!text.includes(SEPARATOR)) {
     return `环境地址必须以 http:// 或 https:// 开头，不能只写主机名或“主机:端口”。例如 ${EXAMPLE}。`;
   }

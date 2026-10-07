@@ -24,6 +24,7 @@ import { LeaveGuardProvider, useLeaveAggregate, useLeaveReport } from "./hooks/l
 import type { LeaveState } from "./hooks/leaveGuard";
 import { PAGE_LABEL, pageFromHash, pageHash, type AppPage } from "./navigation";
 import { EnvironmentPanel } from "./projects/EnvironmentPanel";
+import { ServiceConfigPanel } from "./projects/ServiceConfigPanel";
 import { useEnvironments, useProjects } from "./projects/useProjects";
 import { RunCenter } from "./runs/RunCenter";
 import { LoginPage } from "./session/LoginPage";
@@ -348,6 +349,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
   }, [revealAdminBlock]);
   /** 环境面板的折叠状态由外壳持有，纠错入口可直接展开；无环境时同样强制展开。 */
   const [environmentOpen, setEnvironmentOpen] = useState(false);
+  const [serviceConfigVisible, setServiceConfigVisible] = useState(false);
   /** 打开环境设置时同步展开环境块，保证地址编辑入口立即可见。 */
   const openEnvironmentPanel = useCallback((sourceTabId?: string, sourceEnvironmentId?: string | null) => {
     setSettingsSourceTabId(sourceTabId ?? null);
@@ -1239,6 +1241,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
               }}>返回接口工作台</Button>
             </header>
             <div className="settings-grid">
+              <div className="admin-stack">
               <EnvironmentPanel
                 key={`environment:${scope}`}
                 workspaceId={workspaceId}
@@ -1254,6 +1257,17 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
                 open={environmentOpen || environmentList.length === 0}
                 onOpenChange={setEnvironmentOpen}
               />
+              {serviceConfigVisible ? <ServiceConfigPanel
+                  key={`services:${scope}`}
+                  workspaceId={workspaceId}
+                  projectId={projectId ?? ""}
+                  environmentId={settingsEnvironmentId}
+                  canEdit={canEdit(currentProject?.role ?? null)}
+                  onChanged={onEnvironmentsChanged}
+                  active={page === "environments"}
+                  initialOpen
+                /> : <Button htmlType="button" onClick={() => setServiceConfigVisible(true)}>管理服务目录与环境映射</Button>}
+              </div>
               <AdminPanel
                 key={`admin:${scope}`}
                 onExecutionConfigChanged={onExecutionConfigChanged}

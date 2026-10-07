@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import re
 import uuid
 
 from fastapi import APIRouter, Depends, Header, Response
@@ -19,9 +20,12 @@ from ...kernel.valueliteral import ValueLiteral, ValueLiteralError
 from ...models import (
     Environment,
     EnvironmentConfigVersion,
+    EnvironmentServiceMapping,
+    EnvironmentServiceVersion,
     Folder,
     Project,
     ProjectConfigVersion,
+    ProjectService,
     RunnerPool,
     RunnerPoolProjectGrant,
     WorkspaceMembership,
@@ -35,8 +39,16 @@ from ...services.folder_graph import (
 )
 from ...services.permissions import require
 from ...services.resolution import ResolutionError, variable_context
+from ...services.service_targets import (
+    ServiceTargetError,
+    append_environment_schema2,
+    append_mapping_version,
+    ensure_default_service,
+    inspect_selected_target,
+)
 from .. import deps
 from ..errors import ApiError, bad_request, conflict, not_found
+from ..request_contract import require_service_capability
 from ..schemas import (
     EnvironmentCreate,
     EnvironmentOut,
@@ -233,6 +245,7 @@ def create_project(
     session.add(project)
     session.flush()
     pool = _ensure_default_pool(session, settings, workspace_id, project.id, principal.user_id)
+    ensure_default_service(session, workspace_id=workspace_id, project_id=project.id)
     deps.commit(session)
     return ProjectOut(
         id=project.id,
@@ -379,6 +392,10 @@ def create_environment(
     variables = _validate_variables(list((payload.variables or {}).items()))
     environment_id = uuid.uuid4()
     config_version_id = uuid.uuid4()
+    mapping_id, mapping_version_id = uuid.uuid4(), uuid.uuid4()
+    default_service = ensure_default_service(
+        session, workspace_id=scope.workspace_id, project_id=scope.project_id
+    )
     environment = Environment(
         id=environment_id,
         workspace_id=scope.workspace_id,
@@ -390,17 +407,48 @@ def create_environment(
         variables=variables,
         current_config_version_id=config_version_id,
     )
+    mapping = EnvironmentServiceMapping(
+        id=mapping_id,
+        workspace_id=scope.workspace_id,
+        project_id=scope.project_id,
+        environment_id=environment_id,
+        service_id=default_service.id,
+        rev=1,
+        status="active",
+        current_version_id=mapping_version_id,
+    )
+    mapping_version = EnvironmentServiceVersion(
+        id=mapping_version_id,
+        workspace_id=scope.workspace_id,
+        project_id=scope.project_id,
+        environment_id=environment_id,
+        service_id=default_service.id,
+        mapping_id=mapping_id,
+        version=1,
+        base_url=base_url,
+        status="active",
+        created_by=scope.principal.user_id,
+    )
     config_version = EnvironmentConfigVersion(
         id=config_version_id,
         workspace_id=scope.workspace_id,
         project_id=scope.project_id,
         environment_id=environment_id,
         version=1,
-        schema_version=1,
-        snapshot={"schema_version": 1, "variables": dict(variables)},
+        schema_version=2,
+        snapshot={
+            "schema_version": 2,
+            "variables": dict(variables),
+            "service_versions": {
+                str(default_service.id): {
+                    "mapping_id": str(mapping_id),
+                    "mapping_version_id": str(mapping_version_id),
+                }
+            },
+        },
         created_by=scope.principal.user_id,
     )
-    session.add_all([environment, config_version])
+    session.add_all([environment, mapping, mapping_version, config_version])
     deps.commit(session)
     return _environment_out(session, environment)
 
@@ -433,17 +481,40 @@ def update_environment(
     base_url = _checked_base_url(payload.base_url) if payload.base_url is not None else None
     if payload.name is not None:
         environment.name = payload.name
-    if base_url is not None:
-        environment.base_url = base_url
+    default_mapping = session.scalar(
+        select(EnvironmentServiceMapping)
+        .where(EnvironmentServiceMapping.environment_id == environment.id)
+        .join(
+            ProjectService,
+            ProjectService.id == EnvironmentServiceMapping.service_id,
+        )
+        .where(ProjectService.is_default.is_(True))
+        .with_for_update()
+    )
+    if default_mapping is None:
+        raise conflict("config_inconsistent", "默认服务映射缺失")
+    current_default = session.get(EnvironmentServiceVersion, default_mapping.current_version_id)
     if payload.variables is not None:
         # 环境级普通变量与项目级走同一校验：非法字面量与秘密都不能从这条入口进来。
         environment.variables = _validate_variables(list(payload.variables.items()))
     if payload.status is not None:
         environment.status = payload.status
+    if base_url is not None or payload.status is not None:
+        if current_default is None:
+            raise conflict("config_inconsistent", "默认服务映射当前版本缺失")
+        try:
+            version = append_mapping_version(
+                session,
+                default_mapping,
+                base_url=base_url or current_default.base_url,
+                status="archived" if environment.status == "archived" else "active",
+                created_by=scope.principal.user_id,
+            )
+        except ServiceTargetError as error:
+            raise ApiError(error.status_code, error.code, error.message) from error
+        environment.base_url = version.base_url
     environment.rev += 1
-    _append_environment_config_version(
-        session, environment, created_by=scope.principal.user_id
-    )
+    append_environment_schema2(session, environment, created_by=scope.principal.user_id)
     deps.commit(session)
     return _environment_out(session, environment)
 
@@ -637,6 +708,8 @@ def get_variables(
 )
 def get_variable_context(
     environment_id: uuid.UUID,
+    service_key: str | None = None,
+    service_contract: str | None = Header(default=None, alias="X-Service-Contract"),
     scope: deps.ProjectScope = _VIEW_SCOPE,
     session: Session = Depends(get_db),
 ) -> VariableContextOut:
@@ -650,6 +723,12 @@ def get_variable_context(
     )
     if environment is None:
         raise not_found("环境不存在或已归档")
+    request: dict = {}
+    if service_key is not None:
+        if re.fullmatch(r"svc_[0-9a-f]{32}", service_key) is None:
+            raise bad_request("service_invalid", "service_key不是合法命名服务标识")
+        request = {"service_contract": 1, "service_key": service_key}
+    capable = require_service_capability(service_contract, needed=service_key is not None)
     try:
         value = variable_context(
             session,
@@ -657,8 +736,20 @@ def get_variable_context(
             project_id=scope.project_id,
             environment=environment,
         )
+        summary, _selected, target_error = inspect_selected_target(
+            session, environment, request
+        )
+        if target_error is not None and target_error.global_basis:
+            raise ApiError(
+                target_error.status_code, target_error.code, target_error.message
+            )
+        if capable:
+            value["schema_version"] = 2
+            value["selected_target"] = summary
     except ResolutionError as error:
         raise conflict(error.code, error.message) from error
+    except ServiceTargetError as error:
+        raise ApiError(error.status_code, error.code, error.message) from error
     return VariableContextOut(**value)
 
 

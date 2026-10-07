@@ -6,7 +6,7 @@ import type { AvailableVariableSource, VariableContext, VariableContextItem, Var
 import { ErrorText, Hint, Loading } from "../components/Feedback";
 
 function sourceLabel(item: VariableSource): string {
-  return item.level === "environment" ? `环境配置第 ${item.revision} 版` : `项目变量第 ${item.revision} 版`;
+  return item.level === "environment" ? `环境修订 ${item.revision}` : `项目变量第 ${item.revision} 版`;
 }
 
 function literalLabel(value: ValueLiteral): string {

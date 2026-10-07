@@ -44,4 +44,16 @@ describe("API 客户端主体代际", () => {
     expect(unauthorized).not.toHaveBeenCalled();
     unsubscribe();
   });
+
+  it("新客户端同时声明行能力2与服务能力1", async () => {
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => ({
+      ok: true, status: 200, headers: new Headers(), text: async () => "{}",
+      requestHeaders: init?.headers,
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    await apiSend("/capabilities", "POST", {}, (raw) => raw);
+    const headers = fetchMock.mock.calls[0]?.[1]?.headers as Record<string, string>;
+    expect(headers["X-Request-Contract"]).toBe("2");
+    expect(headers["X-Service-Contract"]).toBe("1");
+  });
 });

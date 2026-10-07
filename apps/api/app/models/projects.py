@@ -136,7 +136,7 @@ class EnvironmentConfigVersion(Base):
     )
     schema_version: Mapped[int] = mapped_column(
         SmallInteger, nullable=False, default=1, server_default="1",
-        comment="配置快照结构版本；S1固定为1",
+        comment="配置快照结构版本；S1为1，多服务目标为2",
     )
     snapshot: Mapped[dict] = mapped_column(
         JSONB, nullable=False, comment="普通环境配置快照；不含解密身份值"
